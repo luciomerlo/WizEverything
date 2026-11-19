@@ -77,7 +77,7 @@ pub struct DupProgress {
     pub cancel: AtomicBool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct DupOptions {
     pub root: u32,
     pub min_size: u64,
@@ -85,6 +85,8 @@ pub struct DupOptions {
     /// Advanced mode: confirm by content (hashes). Quick mode only matches the
     /// index (name + size, folder signatures) and never reads a file.
     pub verify: bool,
+    /// Folders (node ids) whose content is never examined.
+    pub exclude: std::collections::HashSet<u32>,
 }
 
 struct Cand {
@@ -334,11 +336,17 @@ impl Work {
 
 /// Folder signatures computed bottom-up from the index (no disk access):
 /// a folder's signature hashes the sorted (name, size | sub-signature) of its children.
-fn folder_candidates(tree: &Tree, root: u32, min_size: u64, cancel: &AtomicBool) -> Vec<FolderCand> {
+fn folder_candidates(
+    tree: &Tree,
+    root: u32,
+    min_size: u64,
+    exclude: &std::collections::HashSet<u32>,
+    cancel: &AtomicBool,
+) -> Vec<FolderCand> {
     let mut dirs = Vec::new();
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
-        if tree.nodes[id as usize].is_dir() {
+        if tree.nodes[id as usize].is_dir() && !exclude.contains(&id) {
             dirs.push(id);
             stack.extend_from_slice(tree.children(id));
         }
@@ -443,7 +451,7 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
     // 1. Candidates from the in-memory index (no disk access).
     p.stage.store(0, Ordering::Relaxed);
     let mut by_key: HashMap<(u64, String), Vec<u32>> = HashMap::new();
-    for (k, id) in tree.files_under(opt.root).into_iter().enumerate() {
+    for (k, id) in tree.files_under_skipping(opt.root, &opt.exclude).into_iter().enumerate() {
         if k % 65_536 == 0 && p.cancel.load(Ordering::Relaxed) {
             return;
         }
@@ -466,7 +474,7 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
     if p.cancel.load(Ordering::Relaxed) {
         return;
     }
-    work.extend(folder_candidates(&tree, opt.root, opt.min_size, &p.cancel).into_iter().map(Work::Folders));
+    work.extend(folder_candidates(&tree, opt.root, opt.min_size, &opt.exclude, &p.cancel).into_iter().map(Work::Folders));
     drop(tree);
     // Biggest potential savings first, so the most useful results show up early.
     work.sort_by_key(|w| std::cmp::Reverse(w.potential()));

@@ -646,6 +646,23 @@ impl Tree {
         v.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// All files of a subtree except those inside skip folders.
+    pub fn files_under_skipping(&self, root: u32, skip: &HashSet<u32>) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut stack = vec![root];
+        while let Some(id) = stack.pop() {
+            if skip.contains(&id) {
+                continue;
+            }
+            if self.nodes[id as usize].is_dir() {
+                stack.extend_from_slice(self.children(id));
+            } else {
+                out.push(id);
+            }
+        }
+        out
+    }
+
     /// All files of a subtree (for the real-size worker).
     pub fn files_under(&self, root: u32) -> Vec<u32> {
         let mut out = Vec::new();

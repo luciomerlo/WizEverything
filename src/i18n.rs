@@ -53,6 +53,8 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// Drives left out of the "All" view (e.g. "H:").
     pub excluded_drives: Vec<String>,
+    /// Folders the duplicate finder never looks into (full paths).
+    pub dup_exclude: Vec<String>,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
@@ -76,6 +78,7 @@ impl Settings {
             rings: false,
             close_to_tray: true,
             excluded_drives: Vec::new(),
+            dup_exclude: Vec::new(),
         };
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -89,6 +92,8 @@ impl Settings {
                 ("show_exts", v) => s.show_exts = v != "0",
                 ("close_to_tray", v) => s.close_to_tray = v != "0",
                 ("chart", v) => s.rings = v == "rings",
+                // One line per folder: dup_exclude=C:\path
+                ("dup_exclude", v) if !v.is_empty() => s.dup_exclude.push(v.to_string()),
                 ("excluded_drives", v) => {
                     s.excluded_drives = v.split(',').map(str::trim).filter(|d| !d.is_empty()).map(String::from).collect()
                 }
@@ -112,7 +117,7 @@ impl Settings {
             if self.rings { "rings" } else { "treemap" },
             self.close_to_tray as u8,
             self.excluded_drives.join(","),
-        )
+        ) + &self.dup_exclude.iter().map(|d| format!("dup_exclude={d}\n")).collect::<String>()
     }
 
     pub fn save(&self) {

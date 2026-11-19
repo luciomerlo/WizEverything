@@ -359,8 +359,8 @@ fn short(path: &str) -> String {
 #[test]
 fn dups_same_name_confirms_by_full_hash_and_skips_hardlinks() {
     let (_tmp, tree, root) = dup_fixture();
-    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true };
-    let all = dup::find(Arc::new(tree), opt, Arc::new(DupProgress::default()));
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() };
+    let all = dup::find(Arc::new(tree), opt.clone(), Arc::new(DupProgress::default()));
     let groups: Vec<_> = all.iter().filter(|g| !g.folder).collect();
     assert_eq!(groups.len(), 1, "one file group");
     let mut files: Vec<String> = groups[0].files.iter().map(|f| short(&f.path)).collect();
@@ -377,8 +377,8 @@ fn dups_same_name_confirms_by_full_hash_and_skips_hardlinks() {
 #[test]
 fn dups_size_only_finds_renamed_copies() {
     let (_tmp, tree, root) = dup_fixture();
-    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true };
-    let all = dup::find(Arc::new(tree), opt, Arc::new(DupProgress::default()));
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default() };
+    let all = dup::find(Arc::new(tree), opt.clone(), Arc::new(DupProgress::default()));
     let groups: Vec<_> = all.iter().filter(|g| !g.folder).collect();
     assert_eq!(groups.len(), 1);
     let files: Vec<String> = groups[0].files.iter().map(|f| short(&f.path)).collect();
@@ -390,18 +390,18 @@ fn dups_size_only_finds_renamed_copies() {
 fn dups_min_size_and_cancel() {
     let (_tmp, tree, root) = dup_fixture();
     let tree = Arc::new(tree);
-    let big = DupOptions { root, min_size: 300_000, same_name: false, verify: true };
+    let big = DupOptions { root, min_size: 300_000, same_name: false, verify: true, exclude: Default::default() };
     assert!(dup::find(tree.clone(), big, Arc::new(DupProgress::default())).is_empty());
     let p = Arc::new(DupProgress::default());
     p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true };
-    assert!(dup::find(tree, opt, p).is_empty(), "cancelled search returns nothing");
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default() };
+    assert!(dup::find(tree, opt.clone(), p).is_empty(), "cancelled search returns nothing");
 }
 
 #[test]
 fn dups_csv_export() {
     let (_tmp, tree, root) = dup_fixture();
-    let groups = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true }, Arc::new(DupProgress::default()));
+    let groups = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() }, Arc::new(DupProgress::default()));
     let path = std::env::temp_dir().join(format!("wiz_dups_{}.csv", std::process::id()));
     dup::write_csv(&groups, &path).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
@@ -415,7 +415,7 @@ fn dups_csv_export() {
 #[test]
 fn dups_finds_identical_folders_and_partitions_mismatches() {
     let (_tmp, tree, root) = dup_fixture();
-    let all = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true }, Arc::new(DupProgress::default()));
+    let all = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() }, Arc::new(DupProgress::default()));
     let folders: Vec<_> = all.iter().filter(|g| g.folder).collect();
     // d1, d2, d3, d5 share the same signature (same.bin, 200000 bytes) but d3's
     // content differs: it must be split off, not sink the whole group.
@@ -435,7 +435,7 @@ fn dups_stream_groups_as_found() {
     let (_tmp, tree, root) = dup_fixture();
     let seen = std::sync::Mutex::new(0usize);
     let p = DupProgress::default();
-    dup::find_streaming(Arc::new(tree), DupOptions { root, min_size: 1, same_name: false, verify: true }, &p, &|_| {
+    dup::find_streaming(Arc::new(tree), DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default() }, &p, &|_| {
         *seen.lock().unwrap() += 1;
     });
     assert!(*seen.lock().unwrap() >= 2, "file + folder groups were streamed");
@@ -575,8 +575,8 @@ fn mcp_tools_answer_from_the_index() {
 #[test]
 fn dups_quick_mode_uses_only_the_index() {
     let (_tmp, tree, root) = dup_fixture();
-    let opt = DupOptions { root, min_size: 1, same_name: false, verify: false };
-    let groups = dup::find(Arc::new(tree), opt, Arc::new(DupProgress::default()));
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: false, exclude: Default::default() };
+    let groups = dup::find(Arc::new(tree), opt.clone(), Arc::new(DupProgress::default()));
     let files: Vec<_> = groups.iter().filter(|g| !g.folder).collect();
     // Quick mode always matches by name + size: d1, d2, d3 and d5 all have same.bin
     // (d3's content differs, which only the advanced mode can tell).
@@ -598,13 +598,13 @@ fn init_cache() {
 fn hash_cache_second_search_reads_nothing() {
     let (tmp, tree, root) = dup_fixture();
     let tree = Arc::new(tree);
-    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true };
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() };
     let first = Arc::new(DupProgress::default());
-    let g1 = dup::find(tree.clone(), opt, first.clone());
+    let g1 = dup::find(tree.clone(), opt.clone(), first.clone());
     assert!(first.bytes_read.load(std::sync::atomic::Ordering::Relaxed) > 0);
 
     let second = Arc::new(DupProgress::default());
-    let g2 = dup::find(tree.clone(), opt, second.clone());
+    let g2 = dup::find(tree.clone(), opt.clone(), second.clone());
     assert_eq!(g1.len(), g2.len(), "same result from the cache");
     assert_eq!(second.bytes_read.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing read from disk");
     assert!(second.cache_hits.load(std::sync::atomic::Ordering::Relaxed) > 0);
@@ -616,7 +616,7 @@ fn hash_cache_second_search_reads_nothing() {
     data[0] ^= 0xFF;
     std::fs::write(&path, &data).unwrap();
     let third = Arc::new(DupProgress::default());
-    let g3 = dup::find(tree, opt, third.clone());
+    let g3 = dup::find(tree, opt.clone(), third.clone());
     assert!(third.bytes_read.load(std::sync::atomic::Ordering::Relaxed) > 0, "changed file read again");
     let files: Vec<_> = g3.iter().filter(|g| !g.folder).collect();
     assert!(files.iter().all(|g| g.files.iter().all(|f| !f.path.ends_with("d2\\same.bin"))), "d2 no longer a duplicate");
@@ -627,9 +627,29 @@ fn hash_cache_persists_to_disk() {
     init_cache();
     let path = crate::hashcache::default_path();
     let (tmp, tree, root) = dup_fixture();
-    let _ = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true }, Arc::new(DupProgress::default()));
+    let _ = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() }, Arc::new(DupProgress::default()));
     let bytes = std::fs::read(&path).expect("cache file written");
     assert!(bytes.starts_with(b"WZHC01"));
     let needle = tmp.0.to_string_lossy().to_lowercase();
     assert!(String::from_utf8_lossy(&bytes).contains(&needle), "entries for the fixture were saved");
+}
+#[test]
+fn dups_skip_excluded_folders() {
+    let (_tmp, tree, root) = dup_fixture();
+    let d2 = tree.find_path(&format!("{}\\d2", tree.full_path(root))).unwrap();
+    let mut exclude = std::collections::HashSet::new();
+    exclude.insert(d2);
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude };
+    let groups = dup::find(Arc::new(tree), opt.clone(), Arc::new(DupProgress::default()));
+    // Without d2, the only same-name match left is d1/d5 (hard links: one file) → nothing.
+    assert!(groups.iter().all(|g| g.files.iter().all(|f| !f.path.contains("\\d2"))), "d2 never examined");
+    assert!(groups.iter().filter(|g| !g.folder).all(|g| g.files.len() >= 2));
+}
+
+#[test]
+fn settings_keep_dup_exclusions() {
+    let mut s = crate::i18n::Settings::parse("", Lang::Es);
+    s.dup_exclude = vec!["C:\\Windows".into(), "H:\\Mi unidad\\Backups".into()];
+    let back = crate::i18n::Settings::parse(&s.to_text(), Lang::Es);
+    assert_eq!(back.dup_exclude, ["C:\\Windows", "H:\\Mi unidad\\Backups"]);
 }

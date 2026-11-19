@@ -3,6 +3,12 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.6.0] - 2026-11-19
+
+### Added
+- Duplicates: excluded folders, kept between sessions (`dup_exclude=` lines in settings.ini). Edit them as a list (one path per line), tick them in the tree with "Pick in tree", or right-click a folder → Exclude from duplicates / Include again. Excluded subtrees are never walked, which also speeds up the search. Paths not found in the index are flagged.
+- MCP `find_duplicates` applies the app's saved exclusions and accepts an `exclude` list.
+
 ## [0.5.0] - 2026-11-19
 
 ### Added

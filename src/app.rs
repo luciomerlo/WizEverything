@@ -71,6 +71,11 @@ struct Dups {
     views: [DupView; 2],
     recycle_rx: Option<Receiver<(Vec<String>, Result<bool, String>)>>,
     export_rx: Option<Receiver<Result<String, String>>>,
+    /// Excluded-folders editor open, its text (one path per line), and the
+    /// "pick in tree" mode that shows checkboxes on folders.
+    show_excl: bool,
+    excl_text: String,
+    pick: bool,
 }
 
 impl Default for Dups {
@@ -91,6 +96,9 @@ impl Default for Dups {
             views: Default::default(),
             recycle_rx: None,
             export_rx: None,
+            show_excl: false,
+            excl_text: String::new(),
+            pick: false,
         }
     }
 }
@@ -1264,6 +1272,16 @@ impl App {
     }
 
     fn tree_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tree: &Tree) {
+        if self.dups.pick {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(tr("⊘ Tildá las carpetas que la búsqueda de duplicados debe ignorar.", "⊘ Tick the folders the duplicate search must ignore.")).strong());
+                if ui.button(tr("Listo", "Done")).clicked() {
+                    self.dups.pick = false;
+                    self.tab = Tab::Dups;
+                }
+            });
+        }
+        let mut toggle_excl: Option<String> = None;
         let row_h = 20.0;
         let mut table = TableBuilder::new(ui)
             .striped(true)
@@ -1326,6 +1344,21 @@ impl App {
                         } else {
                             ui.add_space(14.0);
                         }
+                        if self.dups.pick && n.is_dir() && id != ROOT {
+                            let path = tree.full_path(id);
+                            match self.dup_excluded(&path) {
+                                Some(false) => {
+                                    // Inside an excluded folder: shown ticked, not editable here.
+                                    ui.add_enabled(false, egui::Checkbox::without_text(&mut true));
+                                }
+                                state => {
+                                    let mut on = state == Some(true);
+                                    if ui.checkbox(&mut on, "").on_hover_text(tr("Excluir de duplicados", "Exclude from duplicates")).changed() {
+                                        toggle_excl = Some(path);
+                                    }
+                                }
+                            }
+                        }
                         if id == ROOT || n.parent == ROOT {
                             drive_icon(ui);
                         } else if n.is_dir() {
@@ -1373,6 +1406,9 @@ impl App {
                     }
                 });
             });
+        if let Some(p) = toggle_excl {
+            self.toggle_dup_exclude(&p);
+        }
         if sort != self.tree_sort {
             self.tree_sort = sort;
             self.rows_dirty = true;
@@ -1398,6 +1434,15 @@ impl App {
     fn run_action(&mut self, ctx: &egui::Context, a: MenuAction) {
         match a {
             MenuAction::Menu(id) => self.open_menu(ctx, MenuTarget::Node(id)),
+            MenuAction::ToggleExclude(path) => {
+                self.toggle_dup_exclude(&path);
+                let msg = if self.dup_excluded(&path) == Some(true) {
+                    tr("Excluida de duplicados:", "Excluded from duplicates:")
+                } else {
+                    tr("Incluida de nuevo en duplicados:", "Included in duplicates again:")
+                };
+                self.set_info(format!("{msg} {path}"));
+            }
             MenuAction::Reveal(path) => {
                 if let Some(tree) = self.tree.clone()
                     && let Some(id) = tree.find_path(&path)
@@ -1418,11 +1463,16 @@ impl App {
     fn menu_ui(&mut self, ctx: &egui::Context) {
         let Some((target, pos)) = self.ctx_menu.clone() else { return };
         let tree = self.tree.clone();
+        let path = match &target {
+            MenuTarget::Node(id) => tree.as_ref().map(|t| t.full_path(*id)).unwrap_or_default(),
+            MenuTarget::Path(p) => p.clone(),
+        };
+        let excluded = self.dup_excluded(&path);
         let area = egui::Area::new(egui::Id::unique("wiz_ctx_menu"))
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .constrain(true)
-            .show(ctx, |ui| egui::Frame::popup(ui.style()).show(ui, |ui| context_menu(ui, tree.as_deref(), &target)).inner);
+            .show(ctx, |ui| egui::Frame::popup(ui.style()).show(ui, |ui| context_menu(ui, tree.as_deref(), &target, excluded)).inner);
         let (action, mut close) = area.inner;
         let clicked_outside = ctx.input(|i| i.pointer.any_pressed())
             && ctx.pointer_latest_pos().is_some_and(|p| !area.response.rect.contains(p));
@@ -1528,6 +1578,7 @@ impl App {
             min_size: (self.dups.min_mb * 1024.0 * 1024.0) as u64,
             same_name: self.dups.same_name,
             verify: self.dups.verify,
+            exclude: self.settings.dup_exclude.iter().filter_map(|p| tree.find_path(p)).collect(),
         };
         let prog = Arc::new(DupProgress::default());
         let p = prog.clone();
@@ -1559,6 +1610,32 @@ impl App {
         self.dups.marked.clear();
         self.dups.searched = true;
         self.dups.job = Some(DupJob { rx, done_rx, prog, started: Instant::now(), finished: None });
+    }
+
+    /// Is this folder (or one of its parents) excluded from the duplicate search?
+    fn dup_excluded(&self, path: &str) -> Option<bool> {
+        let lower = path.trim_end_matches('\\').to_lowercase();
+        let direct = self.settings.dup_exclude.iter().any(|e| e.trim_end_matches('\\').to_lowercase() == lower);
+        if direct {
+            return Some(true);
+        }
+        let inherited = self.settings.dup_exclude.iter().any(|e| {
+            let e = e.trim_end_matches('\\').to_lowercase();
+            lower.starts_with(&e) && lower[e.len()..].starts_with('\\')
+        });
+        inherited.then_some(false)
+    }
+
+    /// Add or remove a folder from the exclusions (saved immediately).
+    fn toggle_dup_exclude(&mut self, path: &str) {
+        let lower = path.trim_end_matches('\\').to_lowercase();
+        let before = self.settings.dup_exclude.len();
+        self.settings.dup_exclude.retain(|e| e.trim_end_matches('\\').to_lowercase() != lower);
+        if self.settings.dup_exclude.len() == before {
+            self.settings.dup_exclude.push(path.trim_end_matches('\\').to_string());
+        }
+        self.dups.excl_text = self.settings.dup_exclude.join("\n");
+        self.settings.save();
     }
 
     fn dups_mark(&mut self, keep_oldest: bool) {
@@ -1649,6 +1726,48 @@ impl App {
                 }
             }
         });
+
+        // --- excluded folders: typed one per line, or ticked in the tree
+        ui.horizontal(|ui| {
+            let n = self.settings.dup_exclude.len();
+            if ui
+                .selectable_label(self.dups.show_excl, format!("⊘ {} ({n})", tr("Carpetas excluidas", "Excluded folders")))
+                .on_hover_text(tr("Carpetas que la búsqueda nunca revisa. Se guardan entre sesiones.", "Folders the search never looks into. Kept between sessions."))
+                .clicked()
+            {
+                self.dups.show_excl = !self.dups.show_excl;
+                self.dups.excl_text = self.settings.dup_exclude.join("\n");
+            }
+            if ui
+                .toggle_value(&mut self.dups.pick, tr("Marcar en el árbol", "Pick in tree"))
+                .on_hover_text(tr("Muestra tildes junto a cada carpeta del árbol para excluirla", "Shows a checkbox next to every folder in the tree to exclude it"))
+                .clicked()
+                && self.dups.pick
+            {
+                self.tab = Tab::Tree;
+            }
+        });
+        if self.dups.show_excl {
+            ui.label(RichText::new(tr("Una ruta por renglón. También: clic derecho en una carpeta → Excluir de duplicados.", "One path per line. Also: right-click a folder → Exclude from duplicates.")).weak());
+            let edit = ui.add(
+                egui::TextEdit::multiline(&mut self.dups.excl_text)
+                    .desired_rows(4)
+                    .desired_width(f32::INFINITY)
+                    .hint_text("C:\\Windows\nC:\\Program Files\nH:\\Mi unidad\\Backups"),
+            );
+            if edit.changed() {
+                self.settings.dup_exclude =
+                    self.dups.excl_text.lines().map(|l| l.trim().trim_end_matches('\\').to_string()).filter(|l| !l.is_empty()).collect();
+                self.settings.save();
+            }
+            let missing: Vec<&String> = self.settings.dup_exclude.iter().filter(|p| tree.find_path(p).is_none()).collect();
+            if !missing.is_empty() {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!("{} {}", tr("No están en el índice:", "Not in the index:"), missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" · ")),
+                );
+            }
+        }
 
         // --- progress
         if let Some(job) = &self.dups.job {
@@ -2376,10 +2495,13 @@ impl App {
 enum MenuAction {
     Menu(u32),
     Reveal(String),
+    ToggleExclude(String),
 }
 
 /// Right-click menu body. Returns an action for the app, and whether to close.
-fn context_menu(ui: &mut egui::Ui, tree: Option<&Tree>, target: &MenuTarget) -> (Option<MenuAction>, bool) {
+/// excluded: the folder's state in the duplicate exclusions (None = not excluded,
+/// Some(true) = excluded itself, Some(false) = inside an excluded folder).
+fn context_menu(ui: &mut egui::Ui, tree: Option<&Tree>, target: &MenuTarget, excluded: Option<bool>) -> (Option<MenuAction>, bool) {
     let (path, from_tree) = match target {
         MenuTarget::Node(id) => (tree.map(|t| t.full_path(*id)).unwrap_or_default(), true),
         MenuTarget::Path(p) => (p.clone(), false),
@@ -2404,6 +2526,21 @@ fn context_menu(ui: &mut egui::Ui, tree: Option<&Tree>, target: &MenuTarget) -> 
     if ui.button(tr("Copiar nombre", "Copy name")).clicked() {
         ui.ctx().copy_text(name.clone());
         close = true;
+    }
+    let is_dir = match target {
+        MenuTarget::Node(id) => tree.is_some_and(|t| t.nodes[*id as usize].is_dir() && *id != ROOT),
+        MenuTarget::Path(p) => std::path::Path::new(p).is_dir(),
+    };
+    if is_dir && excluded != Some(false) {
+        let label = if excluded == Some(true) {
+            tr("Volver a incluir en duplicados", "Include in duplicates again")
+        } else {
+            tr("Excluir de duplicados", "Exclude from duplicates")
+        };
+        if ui.button(format!("⊘ {label}")).clicked() {
+            action = Some(MenuAction::ToggleExclude(path.clone()));
+            close = true;
+        }
     }
     if !from_tree && ui.button(tr("Mostrar en el árbol", "Show in tree")).clicked() {
         action = Some(MenuAction::Reveal(path.clone()));
