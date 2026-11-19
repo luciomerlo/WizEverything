@@ -1070,6 +1070,7 @@ impl eframe::App for App {
             }
         });
         self.menu_ui(&ctx);
+        self.groq_key_dialog(&ctx);
         // Sorting / expanding marks the rows dirty during this frame: draw the
         // result right away instead of waiting for the next mouse move.
         if self.rows_dirty {
@@ -1777,20 +1778,48 @@ impl App {
                     self.ai.model = None;
                 }
             });
-        } else {
-            ui.add(egui::TextEdit::singleline(&mut self.ai.key_input).password(true).hint_text("gsk_…").desired_width(220.0));
+        } else if ui.button(tr("Cargar clave de Groq…", "Enter Groq key…")).clicked() {
+            // Menus close on any click inside, so the key is typed in its own dialog.
+            self.ai.key_editing = true;
+            self.ai.key_input.clear();
+            ui.close();
+        }
+    }
+
+    /// Dialog to type the Groq key (masked); saved encrypted with DPAPI.
+    fn groq_key_dialog(&mut self, ctx: &egui::Context) {
+        if !self.ai.key_editing {
+            return;
+        }
+        let resp = egui::Modal::new(egui::Id::unique("groq_key")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading(tr("Clave de Groq", "Groq key"));
+            ui.label(tr("Se guarda cifrada con tu usuario de Windows (DPAPI).", "Stored encrypted with your Windows user (DPAPI)."));
+            let edit = ui.add(egui::TextEdit::singleline(&mut self.ai.key_input).password(true).hint_text("gsk_…").desired_width(f32::INFINITY));
+            edit.request_focus();
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            ui.hyperlink_to(tr("Obtener una clave en console.groq.com", "Get a key at console.groq.com"), "https://console.groq.com/keys");
+            ui.add_space(6.0);
+            let mut close = false;
             ui.horizontal(|ui| {
-                if ui.small_button(tr("Guardar", "Save")).clicked()
+                let ok = !self.ai.key_input.trim().is_empty();
+                if (ui.add_enabled(ok, egui::Button::new(tr("Guardar", "Save"))).clicked() || (enter && ok))
                     && let Some(enc) = crate::ai::protect(self.ai.key_input.trim())
                 {
                     self.settings.groq_key_enc = enc;
                     self.settings.save();
-                    self.ai.key_input.clear();
-                    self.ai.key_editing = false;
                     self.ai.model = None;
+                    close = true;
                 }
-                ui.hyperlink_to(tr("Obtener clave", "Get a key"), "https://console.groq.com/keys");
+                if ui.button(tr("Cancelar", "Cancel")).clicked() {
+                    close = true;
+                }
             });
+            close
+        });
+        if resp.inner || resp.should_close() {
+            self.ai.key_editing = false;
+            self.ai.key_input.clear();
         }
     }
 

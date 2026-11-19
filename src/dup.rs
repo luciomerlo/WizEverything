@@ -197,6 +197,8 @@ fn classify(size: u64, paths: &[&str], p: &DupProgress, credit: bool) -> Vec<Vec
 
     // Progressive comparison, hashing the whole content on the way.
     let mut classes = vec![live];
+    // Files read to the end (duplicate or not): their full hash is worth keeping.
+    let mut finished: Vec<(usize, u128)> = Vec::new();
     let (mut offset, mut block) = (0u64, FIRST_BLOCK);
     let mut buf = vec![0u8; FIRST_BLOCK];
     while offset < size && !classes.is_empty() {
@@ -216,6 +218,9 @@ fn classify(size: u64, paths: &[&str], p: &DupProgress, credit: bool) -> Vec<Vec
                     p.bytes_read.fetch_add(want as u64, Ordering::Relaxed);
                     add(want as u64);
                     r.hash.update(&buf[..want]);
+                    if offset + want as u64 == size {
+                        finished.push((i, r.hash.digest128()));
+                    }
                     split.entry(xxh3_64(&buf[..want])).or_default().push(i);
                 } else {
                     readers[i] = None; // vanished / shrank
@@ -234,11 +239,10 @@ fn classify(size: u64, paths: &[&str], p: &DupProgress, credit: bool) -> Vec<Vec
         offset += want as u64;
         block = (block * 4).min(MAX_BLOCK);
     }
-    // Everything still in a class was read to the end: remember its hash.
     let mut c = hashcache::global().lock().unwrap();
-    for &i in classes.iter().flatten() {
-        if let (Some(r), Some(k)) = (readers[i].as_ref(), keys[i]) {
-            c.put(paths[i], k, r.hash.digest128());
+    for (i, h) in finished {
+        if let Some(k) = keys[i] {
+            c.put(paths[i], k, h);
         }
     }
     classes
