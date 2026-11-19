@@ -9,6 +9,7 @@ use egui_extras::{Column, TableBuilder};
 
 use crate::tree::{self, Progress, ROOT, Tree};
 use crate::treemap::{self, Layout};
+use crate::i18n::{self, Lang, Settings, Theme, tr};
 use crate::{autostart, everything};
 
 pub enum TrayCmd {
@@ -60,7 +61,10 @@ fn sort_header(ui: &mut egui::Ui, label: &str, col: Col, sort: &mut Sort) -> boo
     };
     let resp = ui
         .add(egui::Button::new(RichText::new(format!("{label}{arrow}")).strong()).frame(false))
-        .on_hover_text("Clic: ordenar · 2º clic: invertir · 3er clic: quitar orden");
+        .on_hover_text(tr(
+            "Clic: ordenar · 2º clic: invertir · 3er clic: quitar orden",
+            "Click: sort · 2nd click: reverse · 3rd click: clear sort",
+        ));
     if resp.clicked() {
         *sort = match *sort {
             Some((c, asc)) if c == col => {
@@ -135,19 +139,45 @@ pub struct App {
     files_sort: Sort,
     ext_sort: Sort,
 
-    show_tree: bool,
-    show_exts: bool,
+    settings: Settings,
 
     autostart: bool,
     tray_rx: Receiver<TrayCmd>,
     has_tray: bool,
     visible: bool,
-    pub tray_autostart_item: Option<tray_icon::menu::CheckMenuItem>,
+    pub tray_items: Option<TrayItems>,
+}
+
+/// Tray menu entries, kept so their labels can follow the UI language.
+pub struct TrayItems {
+    pub open: tray_icon::menu::MenuItem,
+    pub refresh: tray_icon::menu::MenuItem,
+    pub auto: tray_icon::menu::CheckMenuItem,
+    pub quit: tray_icon::menu::MenuItem,
+}
+
+impl TrayItems {
+    pub fn relabel(&self) {
+        self.open.set_text(tr("Abrir", "Open"));
+        self.refresh.set_text(tr("Actualizar", "Refresh"));
+        self.auto.set_text(tr("Iniciar con Windows", "Start with Windows"));
+        self.quit.set_text(tr("Salir", "Quit"));
+    }
+}
+
+fn apply_theme(ctx: &egui::Context, t: Theme) {
+    ctx.set_theme(match t {
+        Theme::System => egui::ThemePreference::System,
+        Theme::Light => egui::ThemePreference::Light,
+        Theme::Dark => egui::ThemePreference::Dark,
+    });
 }
 
 impl App {
-    pub fn new(ctx: &egui::Context, tray_rx: Receiver<TrayCmd>, has_tray: bool, start_hidden: bool) -> Self {
+    pub fn new(ctx: &egui::Context, tray_rx: Receiver<TrayCmd>, has_tray: bool, start_hidden: bool, settings: Settings) -> Self {
         setup_fonts(ctx);
+        i18n::set_lang(settings.lang);
+        apply_theme(ctx, settings.theme);
         let mut style = (*ctx.global_style()).clone();
         style.spacing.item_spacing = egui::vec2(6.0, 3.0);
         ctx.set_global_style(style);
@@ -176,13 +206,12 @@ impl App {
             tree_sort: None,
             files_sort: None,
             ext_sort: None,
-            show_tree: true,
-            show_exts: true,
+            settings,
             autostart: autostart::is_enabled(),
             tray_rx,
             has_tray,
             visible: !start_hidden,
-            tray_autostart_item: None,
+            tray_items: None,
         };
         app.start_load(ctx);
         app
@@ -333,8 +362,8 @@ impl App {
             Ok(()) => self.autostart = want,
             Err(e) => self.error = Some(e),
         }
-        if let Some(item) = &self.tray_autostart_item {
-            item.set_checked(self.autostart);
+        if let Some(items) = &self.tray_items {
+            items.auto.set_checked(self.autostart);
         }
     }
 }
@@ -378,9 +407,9 @@ impl eframe::App for App {
         };
 
         let h = ui.available_height();
-        if !self.show_tree {
+        if !self.settings.show_tree {
             // Sin árbol: el treemap ocupa el centro (y las extensiones, si están, a la derecha).
-            if self.show_exts {
+            if self.settings.show_exts {
                 egui::Panel::right("exts")
                     .resizable(true)
                     .default_size(360.0)
@@ -395,7 +424,7 @@ impl eframe::App for App {
             .min_size(80.0)
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.treemap_ui(ui, &tree));
-        if self.show_exts {
+        if self.settings.show_exts {
             egui::Panel::right("exts")
                 .resizable(true)
                 .default_size(360.0)
@@ -403,13 +432,14 @@ impl eframe::App for App {
         }
         egui::CentralPanel::default_margins().show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Tree, "Vista de árbol");
-                ui.selectable_value(&mut self.tab, Tab::Files, "Vista de archivos");
-                if self.tab == Tab::Tree && self.tree_sort.is_some() && ui.small_button("✖ quitar orden").clicked() {
+                ui.selectable_value(&mut self.tab, Tab::Tree, tr("Vista de árbol", "Tree view"));
+                ui.selectable_value(&mut self.tab, Tab::Files, tr("Vista de archivos", "File view"));
+                let clear = tr("✖ quitar orden", "✖ clear sort");
+                if self.tab == Tab::Tree && self.tree_sort.is_some() && ui.small_button(clear).clicked() {
                     self.tree_sort = None;
                     self.rows_dirty = true;
                 }
-                if self.tab == Tab::Files && self.files_sort.is_some() && ui.small_button("✖ quitar orden").clicked() {
+                if self.tab == Tab::Files && self.files_sort.is_some() && ui.small_button(clear).clicked() {
                     self.files_sort = None;
                 }
             });
@@ -428,12 +458,16 @@ impl App {
     fn toolbar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tree: Option<&Tree>) {
         ui.horizontal(|ui| {
             let busy = self.loading.is_some();
-            if ui.add_enabled(!busy, egui::Button::new("⟳ Actualizar")).on_hover_text("F5 — vuelve a leer el índice de Everything").clicked() {
+            if ui
+                .add_enabled(!busy, egui::Button::new(tr("⟳ Actualizar", "⟳ Refresh")))
+                .on_hover_text(tr("F5 — vuelve a leer el índice de Everything", "F5 — re-read the Everything index"))
+                .clicked()
+            {
                 self.start_load(ctx);
             }
             if let Some(tree) = tree {
                 ui.separator();
-                ui.label("Unidad:");
+                ui.label(tr("Unidad:", "Drive:"));
                 let drives: Vec<u32> = tree.nodes[ROOT as usize].children.clone();
                 let drive = tree.ancestors(self.view_root).get(1).copied().unwrap_or(ROOT);
                 let label = |id: u32| {
@@ -442,10 +476,10 @@ impl App {
                 };
                 let mut chosen = None;
                 egui::ComboBox::from_id_salt("drive")
-                    .selected_text(if drive == ROOT { "Todas".to_string() } else { label(drive) })
+                    .selected_text(if drive == ROOT { tr("Todas", "All").to_string() } else { label(drive) })
                     .width(220.0)
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(drive == ROOT, format!("Todas  {}", fmt_size(tree.nodes[0].size))).clicked() {
+                        if ui.selectable_label(drive == ROOT, format!("{}  {}", tr("Todas", "All"), fmt_size(tree.nodes[0].size))).clicked() {
                             chosen = Some(ROOT);
                         }
                         for d in drives {
@@ -461,7 +495,7 @@ impl App {
                 }
                 if self.view_root != drive {
                     ui.separator();
-                    if ui.button("⬆ Subir").clicked() {
+                    if ui.button(tr("⬆ Subir", "⬆ Up")).clicked() {
                         let p = tree.nodes[self.view_root as usize].parent;
                         self.set_root(p);
                     }
@@ -470,15 +504,60 @@ impl App {
             }
             ui.with_layout(ELayout::right_to_left(Align::Center), |ui| {
                 let mut a = self.autostart;
-                if ui.checkbox(&mut a, "Iniciar con Windows").changed() {
+                if ui.checkbox(&mut a, tr("Iniciar con Windows", "Start with Windows")).changed() {
                     self.toggle_autostart();
                 }
                 ui.separator();
-                ui.toggle_value(&mut self.show_exts, "Extensiones")
-                    .on_hover_text("Mostrar u ocultar el panel de tipos de archivo");
-                ui.toggle_value(&mut self.show_tree, "Árbol")
-                    .on_hover_text("Mostrar u ocultar la vista de árbol / archivos");
-                ui.label("Paneles:");
+
+                // Idioma
+                let mut lang = self.settings.lang;
+                egui::ComboBox::from_id_salt("lang")
+                    .selected_text(if lang == Lang::Es { "Español" } else { "English" })
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut lang, Lang::Es, "Español");
+                        ui.selectable_value(&mut lang, Lang::En, "English");
+                    });
+                if lang != self.settings.lang {
+                    self.settings.lang = lang;
+                    i18n::set_lang(lang);
+                    if let Some(items) = &self.tray_items {
+                        items.relabel();
+                    }
+                    self.settings.save();
+                }
+
+                // Tema
+                let mut theme = self.settings.theme;
+                let theme_label = |t: Theme| match t {
+                    Theme::System => tr("Sistema", "System"),
+                    Theme::Light => tr("☀ Claro", "☀ Light"),
+                    Theme::Dark => tr("☾ Oscuro", "☾ Dark"),
+                };
+                egui::ComboBox::from_id_salt("theme")
+                    .selected_text(theme_label(theme))
+                    .width(90.0)
+                    .show_ui(ui, |ui| {
+                        for t in [Theme::System, Theme::Light, Theme::Dark] {
+                            ui.selectable_value(&mut theme, t, theme_label(t));
+                        }
+                    });
+                if theme != self.settings.theme {
+                    self.settings.theme = theme;
+                    apply_theme(ctx, theme);
+                    self.settings.save();
+                }
+                ui.separator();
+
+                let (t0, e0) = (self.settings.show_tree, self.settings.show_exts);
+                ui.toggle_value(&mut self.settings.show_exts, tr("Extensiones", "Extensions"))
+                    .on_hover_text(tr("Mostrar u ocultar el panel de tipos de archivo", "Show or hide the file types panel"));
+                ui.toggle_value(&mut self.settings.show_tree, tr("Árbol", "Tree"))
+                    .on_hover_text(tr("Mostrar u ocultar la vista de árbol / archivos", "Show or hide the tree / file view"));
+                ui.label(tr("Paneles:", "Panels:"));
+                if (t0, e0) != (self.settings.show_tree, self.settings.show_exts) {
+                    self.settings.save();
+                }
             });
         });
     }
@@ -488,11 +567,12 @@ impl App {
             if let Some(l) = &self.loading {
                 ui.spinner();
                 if l.progress.waiting.load(Ordering::Relaxed) {
-                    ui.label("Esperando a que Everything esté listo…");
+                    ui.label(tr("Esperando a que Everything esté listo…", "Waiting for Everything to be ready…"));
                 } else {
                     let (d, t) = (l.progress.done.load(Ordering::Relaxed), l.progress.total.load(Ordering::Relaxed));
                     ui.label(format!(
-                        "Leyendo índice de Everything… {} / {}  ({:.1} s)",
+                        "{} {} / {}  ({:.1} s)",
+                        tr("Leyendo índice de Everything…", "Reading Everything index…"),
                         fmt_int(d as u64),
                         fmt_int(t as u64),
                         l.started.elapsed().as_secs_f32()
@@ -510,18 +590,23 @@ impl App {
                     && let Some((total, free)) = tree::disk_space(&tree.nodes[d as usize].name)
                 {
                     ui.label(format!(
-                        "{}  Usado {} de {} · Libre {}",
+                        "{}  {} {} {} {} · {} {}",
                         tree.full_path(d),
+                        tr("Usado", "Used"),
                         fmt_size(total - free),
+                        tr("de", "of"),
                         fmt_size(total),
+                        tr("Libre", "Free"),
                         fmt_size(free)
                     ));
                     ui.separator();
                 }
                 ui.label(format!(
-                    "{} elementos · cargado en {:.1} s · hace {}",
+                    "{} {} · {} {} s · {}",
                     fmt_int(tree.nodes.len() as u64 - 1),
-                    tree.load_ms as f32 / 1000.0,
+                    tr("elementos", "items"),
+                    tr("cargado en", "loaded in"),
+                    fmt_dec(tree.load_ms as f64 / 1000.0),
                     fmt_age(tree.built_at.elapsed())
                 ));
                 if let Some(h) = self.hovered {
@@ -564,14 +649,14 @@ impl App {
         table
             .header(22.0, |mut h| {
                 for (t, c) in [
-                    ("Carpeta", Col::Name),
-                    ("% del padre", Col::Pct),
-                    ("Tamaño", Col::Size),
-                    ("Asignado*", Col::Alloc),
-                    ("Elementos", Col::Items),
-                    ("Archivos", Col::Files),
-                    ("Carpetas", Col::Folders),
-                    ("Modificado", Col::Modified),
+                    (tr("Carpeta", "Folder"), Col::Name),
+                    (tr("% del padre", "% of parent"), Col::Pct),
+                    (tr("Tamaño", "Size"), Col::Size),
+                    (tr("Asignado*", "Allocated*"), Col::Alloc),
+                    (tr("Elementos", "Items"), Col::Items),
+                    (tr("Archivos", "Files"), Col::Files),
+                    (tr("Carpetas", "Folders"), Col::Folders),
+                    (tr("Modificado", "Modified"), Col::Modified),
                 ] {
                     h.col(|ui| {
                         sort_header(ui, t, c, &mut sort);
@@ -601,7 +686,7 @@ impl App {
                             file_icon(ui, tree.exts[n.ext as usize].color);
                         }
                         let name = if id == self.view_root { tree.full_path(id) } else { n.name.to_string() };
-                        let name = if id == ROOT { "Este equipo".to_string() } else { name };
+                        let name = if id == ROOT { tr("Este equipo", "This PC").to_string() } else { name };
                         ui.label(name);
                     });
                     row.col(|ui| {
@@ -615,7 +700,7 @@ impl App {
                     });
                     row.col(|ui| right(ui, fmt_size(n.size)));
                     row.col(|ui| right(ui, fmt_size(n.alloc)));
-                    row.col(|ui| right(ui, fmt_int((n.files + n.folders) as u64)));
+                    row.col(|ui| right(ui, if n.is_dir { fmt_int((n.files + n.folders) as u64) } else { String::new() }));
                     row.col(|ui| right(ui, if n.is_dir { fmt_int(n.files as u64) } else { String::new() }));
                     row.col(|ui| right(ui, if n.is_dir { fmt_int(n.folders as u64) } else { String::new() }));
                     row.col(|ui| {
@@ -655,9 +740,9 @@ impl App {
 
     fn files_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
         ui.horizontal(|ui| {
-            ui.label("Filtrar:");
+            ui.label(tr("Filtrar:", "Filter:"));
             ui.text_edit_singleline(&mut self.file_filter);
-            ui.label(RichText::new("los 1000 archivos más grandes de la vista").weak());
+            ui.label(RichText::new(tr("los 1000 archivos más grandes de la vista", "the 1000 largest files in view")).weak());
         });
         let key = (self.view_root, Arc::as_ptr(self.tree.as_ref().unwrap()) as usize, self.file_filter.clone(), self.files_sort);
         if key != self.files_key {
@@ -691,11 +776,11 @@ impl App {
             .column(Column::remainder().clip(true))
             .header(22.0, |mut h| {
                 for (t, c) in [
-                    ("Nombre", Col::Name),
-                    ("Tamaño", Col::Size),
-                    ("Asignado*", Col::Alloc),
-                    ("Modificado", Col::Modified),
-                    ("Carpeta", Col::Path),
+                    (tr("Nombre", "Name"), Col::Name),
+                    (tr("Tamaño", "Size"), Col::Size),
+                    (tr("Asignado*", "Allocated*"), Col::Alloc),
+                    (tr("Modificado", "Modified"), Col::Modified),
+                    (tr("Carpeta", "Folder"), Col::Path),
                 ] {
                     h.col(|ui| {
                         sort_header(ui, t, c, &mut sort);
@@ -759,11 +844,11 @@ impl App {
         let mut sort = self.ext_sort;
         let total = tree.nodes[self.view_root as usize].size.max(1) as f32;
         ui.horizontal(|ui| {
-            ui.strong("Tipos de archivo");
-            if self.highlight_ext.is_some() && ui.small_button("✖ quitar resaltado").clicked() {
+            ui.strong(tr("Tipos de archivo", "File types"));
+            if self.highlight_ext.is_some() && ui.small_button(tr("✖ quitar resaltado", "✖ clear highlight")).clicked() {
                 self.highlight_ext = None;
             }
-            if self.ext_sort.is_some() && ui.small_button("✖ quitar orden").clicked() {
+            if self.ext_sort.is_some() && ui.small_button(tr("✖ quitar orden", "✖ clear sort")).clicked() {
                 self.ext_sort = None;
                 sort = None;
             }
@@ -779,7 +864,12 @@ impl App {
             .column(Column::initial(80.0))
             .column(Column::remainder())
             .header(22.0, |mut h| {
-                for (t, c) in [("Extensión", Col::Name), ("%", Col::Pct), ("Tamaño", Col::Size), ("Archivos", Col::Count)] {
+                for (t, c) in [
+                    (tr("Extensión", "Extension"), Col::Name),
+                    ("%", Col::Pct),
+                    (tr("Tamaño", "Size"), Col::Size),
+                    (tr("Archivos", "Files"), Col::Count),
+                ] {
                     h.col(|ui| {
                         sort_header(ui, t, c, &mut sort);
                     });
@@ -793,7 +883,7 @@ impl App {
                         swatch(ui, tree.exts[e as usize].color);
                         ui.label(tree.ext_label(e));
                     });
-                    row.col(|ui| right(ui, format!("{:.1} %", size as f32 / total * 100.0).replace('.', ",")));
+                    row.col(|ui| right(ui, format!("{} %", fmt_dec(size as f64 / total as f64 * 100.0))));
                     row.col(|ui| right(ui, fmt_size(size)));
                     row.col(|ui| right(ui, fmt_int(count)));
                     if row.response().clicked() {
@@ -870,7 +960,7 @@ impl App {
                     resp.clone().on_hover_ui_at_pointer(|ui| {
                         ui.strong(&*n.name);
                         ui.label(tree.full_path(n.parent));
-                        ui.label(format!("{}  ·  {}", fmt_size(n.size), if n.is_dir { "carpeta".into() } else { tree.ext_label(n.ext).to_string() }));
+                        ui.label(format!("{}  ·  {}", fmt_size(n.size), if n.is_dir { tr("carpeta", "folder").into() } else { tree.ext_label(n.ext).to_string() }));
                     });
                 }
             }
@@ -993,20 +1083,20 @@ fn context_menu(ui: &mut egui::Ui, tree: &Tree, id: u32) -> Option<u32> {
     let mut zoom = None;
     ui.label(RichText::new(&*n.name).strong());
     ui.separator();
-    if ui.button("Abrir").clicked() {
+    if ui.button(tr("Abrir", "Open")).clicked() {
         shell_open(&path, None);
         ui.close();
     }
-    if ui.button("Mostrar en el Explorador").clicked() {
+    if ui.button(tr("Mostrar en el Explorador", "Show in Explorer")).clicked() {
         shell_open("explorer.exe", Some(&format!("/select,\"{path}\"")));
         ui.close();
     }
-    if ui.button("Copiar ruta").clicked() {
+    if ui.button(tr("Copiar ruta", "Copy path")).clicked() {
         ui.ctx().copy_text(path.clone());
         ui.close();
     }
     let dir = if n.is_dir { id } else { n.parent };
-    if ui.button("Hacer zoom en esta carpeta").clicked() {
+    if ui.button(tr("Hacer zoom en esta carpeta", "Zoom into this folder")).clicked() {
         zoom = Some(dir);
         ui.close();
     }
@@ -1079,7 +1169,7 @@ fn pct_bar(ui: &mut egui::Ui, pct: f32) {
     p.text(
         r.center(),
         egui::Align2::CENTER_CENTER,
-        format!("{:.1} %", pct * 100.0).replace('.', ","),
+        format!("{} %", fmt_dec(pct as f64 * 100.0)),
         egui::FontId::proportional(11.0),
         ui.visuals().strong_text_color(),
     );
@@ -1096,15 +1186,23 @@ pub fn fmt_size(b: u64) -> String {
         v /= 1024.0;
         i += 1;
     }
-    format!("{:.1} {}", v, U[i]).replace('.', ",")
+    format!("{} {}", fmt_dec(v), U[i])
+}
+
+/// Un decimal con el separador del idioma actual.
+pub fn fmt_dec(v: f64) -> String {
+    let s = format!("{v:.1}");
+    let (dec, _) = i18n::seps();
+    if dec == '.' { s } else { s.replace('.', &dec.to_string()) }
 }
 
 pub fn fmt_int(n: u64) -> String {
+    let (_, thousands) = i18n::seps();
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, c) in s.chars().enumerate() {
         if i > 0 && (s.len() - i) % 3 == 0 {
-            out.push('.');
+            out.push(thousands);
         }
         out.push(c);
     }
@@ -1113,13 +1211,14 @@ pub fn fmt_int(n: u64) -> String {
 
 fn fmt_age(d: Duration) -> String {
     let s = d.as_secs();
-    if s < 60 {
+    let amount = if s < 60 {
         format!("{s} s")
     } else if s < 3600 {
         format!("{} min", s / 60)
     } else {
         format!("{} h", s / 3600)
-    }
+    };
+    if i18n::lang() == Lang::Es { format!("hace {amount}") } else { format!("{amount} ago") }
 }
 
 fn fmt_date(ft: u64) -> String {
@@ -1135,6 +1234,10 @@ fn fmt_date(ft: u64) -> String {
         if FileTimeToSystemTime(&f, &mut utc) == 0 || SystemTimeToTzSpecificLocalTime(std::ptr::null(), &utc, &mut loc) == 0 {
             return String::new();
         }
-        format!("{:02}/{:02}/{:04} {:02}:{:02}", loc.wDay, loc.wMonth, loc.wYear, loc.wHour, loc.wMinute)
+        if i18n::lang() == Lang::Es {
+            format!("{:02}/{:02}/{:04} {:02}:{:02}", loc.wDay, loc.wMonth, loc.wYear, loc.wHour, loc.wMinute)
+        } else {
+            format!("{:04}-{:02}-{:02} {:02}:{:02}", loc.wYear, loc.wMonth, loc.wDay, loc.wHour, loc.wMinute)
+        }
     }
 }

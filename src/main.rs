@@ -3,6 +3,7 @@
 mod app;
 mod autostart;
 mod everything;
+mod i18n;
 mod tree;
 mod treemap;
 
@@ -73,6 +74,8 @@ fn main() -> eframe::Result {
     if activate_existing_instance() {
         return Ok(());
     }
+    let settings = i18n::Settings::load();
+    i18n::set_lang(settings.lang);
 
     let native = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -92,10 +95,11 @@ fn main() -> eframe::Result {
 
             // Bandeja del sistema
             let menu = Menu::new();
-            let open = MenuItem::new("Abrir", true, None);
-            let refresh = MenuItem::new("Actualizar", true, None);
-            let auto = CheckMenuItem::new("Iniciar con Windows", true, autostart::is_enabled(), None);
-            let quit = MenuItem::new("Salir", true, None);
+            use i18n::tr;
+            let open = MenuItem::new(tr("Abrir", "Open"), true, None);
+            let refresh = MenuItem::new(tr("Actualizar", "Refresh"), true, None);
+            let auto = CheckMenuItem::new(tr("Iniciar con Windows", "Start with Windows"), true, autostart::is_enabled(), None);
+            let quit = MenuItem::new(tr("Salir", "Quit"), true, None);
             let _ = menu.append_items(&[&open, &refresh, &PredefinedMenuItem::separator(), &auto, &PredefinedMenuItem::separator(), &quit]);
             let tray = TrayIconBuilder::new()
                 .with_tooltip(TITLE)
@@ -139,8 +143,8 @@ fn main() -> eframe::Result {
                 }
             }));
 
-            let mut app = app::App::new(&cc.egui_ctx, rx, has_tray, background);
-            app.tray_autostart_item = Some(auto);
+            let mut app = app::App::new(&cc.egui_ctx, rx, has_tray, background, settings);
+            app.tray_items = Some(app::TrayItems { open, refresh, auto, quit });
             Ok(Box::new(app))
         }),
     )

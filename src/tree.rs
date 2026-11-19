@@ -137,7 +137,7 @@ pub fn load(progress: Arc<Progress>) -> Result<Tree, String> {
         ext_names: Vec::new(),
         last_dir: (String::from("\0"), 0),
     };
-    b.new_node("Este equipo", u32::MAX, true);
+    b.new_node("", u32::MAX, true); // raíz virtual ("Este equipo" / "This PC" en la UI)
 
     let mut path = String::new();
     let mut name = String::new();
@@ -299,7 +299,7 @@ impl Tree {
 
     pub fn ext_label(&self, id: u32) -> &str {
         let e = &self.exts[id as usize].name;
-        if e.is_empty() { "(sin extensión)" } else { e }
+        if e.is_empty() { crate::i18n::tr("(sin extensión)", "(no extension)") } else { e }
     }
 
     /// Color representativo de una carpeta: el del archivo más grande que contiene.

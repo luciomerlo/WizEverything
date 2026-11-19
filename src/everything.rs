@@ -10,6 +10,8 @@ use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use crate::i18n::tr;
+
 const IPC_CLASS: &str = "EVERYTHING_TASKBAR_NOTIFICATION";
 const COPYDATA_QUERY2W: usize = 18;
 const IPC_IS_DB_LOADED: usize = 401;
@@ -112,7 +114,7 @@ impl ReplyWindow {
                 null_mut(),
             );
             if hwnd.is_null() {
-                return Err("No se pudo crear la ventana IPC".into());
+                return Err(tr("No se pudo crear la ventana IPC", "Could not create the IPC window").into());
             }
             Ok(Self(hwnd))
         }
@@ -128,7 +130,7 @@ impl Drop for ReplyWindow {
 fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32) -> Result<Vec<u8>, String> {
     let target = everything_hwnd();
     if target.is_null() {
-        return Err("Everything no está en ejecución".into());
+        return Err(tr("Everything no está en ejecución", "Everything is not running").into());
     }
     let request = REQ_NAME | REQ_PATH | REQ_SIZE | REQ_DATE_MODIFIED;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
@@ -146,7 +148,7 @@ fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32) -> Resul
     REPLY.with(|r| *r.borrow_mut() = None);
     let ok = unsafe { SendMessageW(target, WM_COPYDATA, reply.0 as usize, &cds as *const _ as isize) };
     if ok == 0 {
-        return Err("Everything rechazó la consulta IPC".into());
+        return Err(tr("Everything rechazó la consulta IPC", "Everything rejected the IPC query").into());
     }
     let start = Instant::now();
     loop {
@@ -161,7 +163,7 @@ fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32) -> Resul
             }
         }
         if start.elapsed() > Duration::from_secs(120) {
-            return Err("Tiempo de espera agotado esperando a Everything".into());
+            return Err(tr("Tiempo de espera agotado esperando a Everything", "Timed out waiting for Everything").into());
         }
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -203,7 +205,7 @@ pub fn for_each_item(
     loop {
         let data = query_page(&reply, search, offset, PAGE)?;
         if data.len() < 20 {
-            return Err("Respuesta IPC inválida".into());
+            return Err(tr("Respuesta IPC inválida", "Invalid IPC reply").into());
         }
         let total = rd_u32(&data, 0);
         let num = rd_u32(&data, 4);

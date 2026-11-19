@@ -5,6 +5,7 @@ use std::ptr::null_mut;
 use windows_sys::Win32::System::Registry::*;
 
 use crate::everything::wide;
+use crate::i18n::tr;
 
 const KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const VALUE: &str = "WizEverything";
@@ -37,7 +38,7 @@ pub fn is_enabled() -> bool {
 }
 
 pub fn set(enabled: bool) -> Result<(), String> {
-    let h = open(true).ok_or("No se pudo abrir la clave Run")?;
+    let h = open(true).ok_or(tr("No se pudo abrir la clave Run", "Could not open the Run registry key"))?;
     let v = wide(VALUE);
     let r = if enabled {
         let data = wide(&command());
@@ -46,5 +47,5 @@ pub fn set(enabled: bool) -> Result<(), String> {
         unsafe { RegDeleteValueW(h, v.as_ptr()) }
     };
     unsafe { RegCloseKey(h) };
-    if r == 0 || (!enabled && r == 2) { Ok(()) } else { Err(format!("Error de registro {r}")) }
+    if r == 0 || (!enabled && r == 2) { Ok(()) } else { Err(format!("{} {r}", tr("Error de registro", "Registry error"))) }
 }
