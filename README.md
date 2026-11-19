@@ -60,4 +60,4 @@ Stored in `%APPDATA%\WizEverything\settings.ini` (language, theme, visible panel
 
 ## License
 
-Not yet specified.
+[MIT](LICENSE)
