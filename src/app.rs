@@ -407,23 +407,17 @@ impl eframe::App for App {
         };
 
         let h = ui.available_height();
-        if !self.settings.show_tree {
-            // Sin árbol: el treemap ocupa el centro (y las extensiones, si están, a la derecha).
-            if self.settings.show_exts {
-                egui::Panel::right("exts")
-                    .resizable(true)
-                    .default_size(360.0)
-                    .show(ui, |ui| self.ext_ui(ui, &tree));
-            }
-            egui::CentralPanel::no_frame().show(ui, |ui| self.treemap_ui(ui, &tree));
-            return;
+        if self.settings.show_treemap {
+            egui::Panel::bottom("treemap")
+                .resizable(true)
+                .default_size(h * 0.55)
+                .min_size(80.0)
+                .frame(egui::Frame::NONE)
+                .show(ui, |ui| self.treemap_ui(ui, &tree));
+        } else {
+            // Sin treemap: liberar la textura y no mostrar hover viejo.
+            self.hovered = None;
         }
-        egui::Panel::bottom("treemap")
-            .resizable(true)
-            .default_size(h * 0.55)
-            .min_size(80.0)
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.treemap_ui(ui, &tree));
         if self.settings.show_exts {
             egui::Panel::right("exts")
                 .resizable(true)
@@ -549,13 +543,13 @@ impl App {
                 }
                 ui.separator();
 
-                let (t0, e0) = (self.settings.show_tree, self.settings.show_exts);
+                let (t0, e0) = (self.settings.show_treemap, self.settings.show_exts);
                 ui.toggle_value(&mut self.settings.show_exts, tr("Extensiones", "Extensions"))
                     .on_hover_text(tr("Mostrar u ocultar el panel de tipos de archivo", "Show or hide the file types panel"));
-                ui.toggle_value(&mut self.settings.show_tree, tr("Árbol", "Tree"))
-                    .on_hover_text(tr("Mostrar u ocultar la vista de árbol / archivos", "Show or hide the tree / file view"));
+                ui.toggle_value(&mut self.settings.show_treemap, "Treemap")
+                    .on_hover_text(tr("Mostrar u ocultar el mapa de bloques", "Show or hide the treemap"));
                 ui.label(tr("Paneles:", "Panels:"));
-                if (t0, e0) != (self.settings.show_tree, self.settings.show_exts) {
+                if (t0, e0) != (self.settings.show_treemap, self.settings.show_exts) {
                     self.settings.save();
                 }
             });

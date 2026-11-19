@@ -13,6 +13,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - README and CHANGELOG.
 
 ### Changed
+- The panel toggle now hides the **treemap** (the tree view stays); setting renamed to `show_treemap`.
 - "Items" column is left empty for files instead of showing 0.
 
 ## [0.1.0] - 2026-11-19

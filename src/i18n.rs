@@ -1,4 +1,4 @@
-//! Minimal runtime i18n (Spanish / English) and persisted user settings.
+﻿//! Minimal runtime i18n (Spanish / English) and persisted user settings.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -45,7 +45,7 @@ pub enum Theme {
 pub struct Settings {
     pub lang: Lang,
     pub theme: Theme,
-    pub show_tree: bool,
+    pub show_treemap: bool,
     pub show_exts: bool,
 }
 
@@ -56,7 +56,7 @@ fn settings_path() -> Option<std::path::PathBuf> {
 
 impl Settings {
     pub fn load() -> Self {
-        let mut s = Settings { lang: system_lang(), theme: Theme::System, show_tree: true, show_exts: true };
+        let mut s = Settings { lang: system_lang(), theme: Theme::System, show_treemap: true, show_exts: true };
         let Some(text) = settings_path().and_then(|p| std::fs::read_to_string(p).ok()) else { return s };
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -66,7 +66,7 @@ impl Settings {
                 ("theme", "light") => s.theme = Theme::Light,
                 ("theme", "dark") => s.theme = Theme::Dark,
                 ("theme", "system") => s.theme = Theme::System,
-                ("show_tree", v) => s.show_tree = v != "0",
+                ("show_treemap", v) => s.show_treemap = v != "0",
                 ("show_exts", v) => s.show_exts = v != "0",
                 _ => {}
             }
@@ -80,14 +80,14 @@ impl Settings {
             let _ = std::fs::create_dir_all(dir);
         }
         let text = format!(
-            "lang={}\ntheme={}\nshow_tree={}\nshow_exts={}\n",
+            "lang={}\ntheme={}\nshow_treemap={}\nshow_exts={}\n",
             if self.lang == Lang::Es { "es" } else { "en" },
             match self.theme {
                 Theme::System => "system",
                 Theme::Light => "light",
                 Theme::Dark => "dark",
             },
-            self.show_tree as u8,
+            self.show_treemap as u8,
             self.show_exts as u8,
         );
         let _ = std::fs::write(path, text);

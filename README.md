@@ -14,7 +14,7 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 - **File types panel**: per-extension totals with WizTree-like colors; click one to highlight it in the treemap.
 - **Treemap**: squarified layout with cushion shading, hover tooltips, click to select, and zoom into folders.
 - **Sortable columns** in every table: click to sort, click again to reverse, a third click clears the sort.
-- **Panel toggles**: hide the tree or the file types panel to give the treemap more room.
+- **Panel toggles**: hide the treemap or the file types panel to give the tree view more room.
 - **Context menu**: open, show in Explorer, copy path, zoom into folder.
 - **Light / dark / system theme** and **English / Spanish** UI (defaults to the Windows UI language).
 - **System tray** icon, single instance, and an optional **Start with Windows** entry
