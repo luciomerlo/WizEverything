@@ -530,7 +530,7 @@ fn live_full_load() {
 // ------------------------------------------------------------------ MCP
 
 fn mcp_server() -> crate::mcp::Server {
-    crate::mcp::Server::new(Box::new(|| Ok(sample())))
+    crate::mcp::Server::new(Box::new(|| Ok(Arc::new(sample()))))
 }
 
 fn call(s: &mut crate::mcp::Server, name: &str, args: serde_json::Value) -> serde_json::Value {

@@ -16,17 +16,17 @@ const PROTOCOL: &str = "2025-06-18";
 
 pub struct Server {
     tree: Option<Arc<Tree>>,
-    loader: Box<dyn Fn() -> Result<Tree, String>>,
+    loader: Box<dyn Fn() -> Result<Arc<Tree>, String> + Send>,
 }
 
 impl Server {
-    pub fn new(loader: Box<dyn Fn() -> Result<Tree, String>>) -> Self {
+    pub fn new(loader: Box<dyn Fn() -> Result<Arc<Tree>, String> + Send>) -> Self {
         Self { tree: None, loader }
     }
 
     fn tree(&mut self) -> Result<Arc<Tree>, String> {
         if self.tree.is_none() {
-            self.tree = Some(Arc::new((self.loader)()?));
+            self.tree = Some((self.loader)()?);
         }
         Ok(self.tree.clone().expect("loaded"))
     }
@@ -47,7 +47,7 @@ impl Server {
             "tools/call" => {
                 let name = msg.pointer("/params/name").and_then(Value::as_str).unwrap_or("");
                 let args = msg.pointer("/params/arguments").cloned().unwrap_or(json!({}));
-                Ok(match self.call(name, &args) {
+                Ok(match self.call_tool(name, &args) {
                     Ok(v) => json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default() }] }),
                     Err(e) => json!({ "content": [{ "type": "text", "text": e }], "isError": true }),
                 })
@@ -60,7 +60,8 @@ impl Server {
         })
     }
 
-    fn call(&mut self, name: &str, a: &Value) -> Result<Value, String> {
+    /// Run one tool (also used by the Groq assistant).
+    pub fn call_tool(&mut self, name: &str, a: &Value) -> Result<Value, String> {
         if name == "refresh" {
             self.tree = None;
             let t = self.tree()?;
@@ -188,7 +189,7 @@ impl Server {
 }
 
 /// Every tool is read-only: nothing here deletes, moves or writes files.
-fn tools() -> Value {
+pub fn tools() -> Value {
     let ro = json!({ "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false });
     let path = json!({ "type": "string", "description": "Folder or drive, e.g. C:\\ or C:\\Users. Omit for all drives." });
     let limit = json!({ "type": "integer", "description": "Max items to return (default 25)." });
@@ -216,7 +217,7 @@ fn tools() -> Value {
 
 /// Serve MCP on stdin/stdout until stdin closes.
 pub fn serve() {
-    let mut server = Server::new(Box::new(|| tree::load(Arc::new(Progress::default()), &[])));
+    let mut server = Server::new(Box::new(|| tree::load(Arc::new(Progress::default()), &[]).map(Arc::new)));
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {

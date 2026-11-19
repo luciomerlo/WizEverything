@@ -33,6 +33,44 @@ enum Tab {
     Tree,
     Files,
     Dups,
+    Ai,
+}
+
+struct AiAnswer {
+    question: String,
+    model: String,
+    answer: Option<Result<String, String>>,
+}
+
+enum AiMsg {
+    Model(Result<String, String>),
+    Answer(usize, Result<String, String>),
+}
+
+/// Natural-language questions (Groq).
+#[derive(Default)]
+struct Ai {
+    question: String,
+    answers: Vec<AiAnswer>,
+    /// Best model with quota, chosen once per session (shown next to the button).
+    model: Option<String>,
+    picking: bool,
+    rx: Option<Receiver<AiMsg>>,
+    key_input: String,
+    key_editing: bool,
+}
+
+/// Folders that rarely hold user duplicates worth deleting (system, programs, app data).
+pub(crate) fn suggested_exclusions() -> Vec<String> {
+    let sys = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+    let mut v: Vec<String> = ["Windows", "Program Files", "Program Files (x86)", "ProgramData", "$Recycle.Bin", "System Volume Information", "Recovery"]
+        .iter()
+        .map(|d| format!("{sys}\\{d}"))
+        .collect();
+    if let Ok(home) = std::env::var("USERPROFILE") {
+        v.push(format!("{home}\\AppData"));
+    }
+    v
 }
 
 struct DupJob {
@@ -364,6 +402,7 @@ pub struct App {
     exclusion_dirty: bool,
     dups: Dups,
     ctx_menu: Option<(MenuTarget, egui::Pos2)>,
+    ai: Ai,
     highlight_cache: Option<(u32, u64, Arc<treemap::Highlight>)>,
 
     view_root: u32,
@@ -408,6 +447,12 @@ pub struct App {
 impl App {
     pub fn new(ctx: &egui::Context, tray_rx: Receiver<TrayCmd>, has_tray: bool, start_hidden: bool, settings: Settings) -> Self {
         setup_fonts(ctx);
+        let mut settings = settings;
+        if !settings.dup_exclude_init {
+            settings.dup_exclude = suggested_exclusions();
+            settings.dup_exclude_init = true;
+            settings.save();
+        }
         i18n::set_lang(settings.lang);
         apply_theme(ctx, settings.theme);
         let mut style = (*ctx.global_style()).clone();
@@ -437,6 +482,7 @@ impl App {
             exclusion_dirty: false,
             dups: Dups::default(),
             ctx_menu: None,
+            ai: Ai::default(),
             highlight_cache: None,
             view_root: ROOT,
             selected: None,
@@ -963,6 +1009,7 @@ impl eframe::App for App {
         let tree = self.tree.clone();
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &ctx, tree.as_deref()));
+        egui::Panel::top("ask").show(ui, |ui| self.ask_bar(ui, &ctx));
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, tree.as_deref()));
 
         let Some(tree) = tree else {
@@ -1002,6 +1049,9 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Tree, tr("Vista de árbol", "Tree view"));
                 ui.selectable_value(&mut self.tab, Tab::Files, tr("Vista de archivos", "File view"));
                 ui.selectable_value(&mut self.tab, Tab::Dups, tr("Duplicados", "Duplicates"));
+                if !self.ai.answers.is_empty() {
+                    ui.selectable_value(&mut self.tab, Tab::Ai, tr("Respuestas IA", "AI answers"));
+                }
                 let clear = tr("✖ quitar orden", "✖ clear sort");
                 if self.tab == Tab::Tree && self.tree_sort.is_some() && ui.small_button(clear).clicked() {
                     self.tree_sort = None;
@@ -1016,6 +1066,7 @@ impl eframe::App for App {
                 Tab::Tree => self.tree_ui(ui, &ctx, &tree),
                 Tab::Files => self.files_ui(ui, &ctx, &tree),
                 Tab::Dups => self.dups_ui(ui, &ctx, &tree),
+                Tab::Ai => self.ai_ui(ui),
             }
         });
         self.menu_ui(&ctx);
@@ -1165,6 +1216,7 @@ impl App {
             {
                 self.settings.save();
             }
+            self.groq_options(ui);
             // Drives counted in "All"
             if let Some(tree) = tree {
                 ui.separator();
@@ -1571,6 +1623,177 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------ AI questions (Groq)
+
+    fn groq_key(&self) -> Option<String> {
+        crate::ai::unprotect(&self.settings.groq_key_enc).filter(|k| !k.is_empty())
+    }
+
+    fn ask_ai(&mut self, ctx: &egui::Context) {
+        let (Some(key), Some(tree)) = (self.groq_key(), self.tree.clone()) else { return };
+        let question = self.ai.question.trim().to_string();
+        if question.is_empty() || self.ai.rx.is_some() {
+            return;
+        }
+        let idx = self.ai.answers.len();
+        self.ai.answers.push(AiAnswer { question: question.clone(), model: self.ai.model.clone().unwrap_or_default(), answer: None });
+        self.tab = Tab::Ai;
+        let known = self.ai.model.clone();
+        self.ai.picking = known.is_none();
+        let spanish = i18n::lang() == Lang::Es;
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let groq = crate::ai::Groq::new(key);
+            let pick = |tx: &std::sync::mpsc::Sender<AiMsg>| {
+                let r = crate::ai::pick_model(&groq);
+                let _ = tx.send(AiMsg::Model(r.clone()));
+                r
+            };
+            let mut server = crate::mcp::Server::new(Box::new(move || Ok(tree.clone())));
+            let r = (|| {
+                let model = match known { Some(m) => m, None => pick(&tx)? };
+                match crate::ai::ask(&groq, &model, &question, &mut server, spanish) {
+                    // Out of quota on this model: choose again and retry once.
+                    Err(e) if e.contains("Rate limited") => crate::ai::ask(&groq, &pick(&tx)?, &question, &mut server, spanish),
+                    other => other,
+                }
+            })();
+            let _ = tx.send(AiMsg::Answer(idx, r));
+            ctx.request_repaint();
+        });
+        self.ai.rx = Some(rx);
+    }
+
+    fn poll_ai(&mut self) {
+        let Some(rx) = &self.ai.rx else { return };
+        let mut done = false;
+        for msg in rx.try_iter() {
+            match msg {
+                AiMsg::Model(r) => {
+                    self.ai.picking = false;
+                    if let Ok(m) = r {
+                        self.ai.model = Some(m);
+                    }
+                }
+                AiMsg::Answer(i, r) => {
+                    if let Some(a) = self.ai.answers.get_mut(i) {
+                        a.model = self.ai.model.clone().unwrap_or_default();
+                        a.answer = Some(r);
+                    }
+                    done = true;
+                }
+            }
+        }
+        if done {
+            self.ai.rx = None;
+            self.ai.picking = false;
+        }
+    }
+
+    /// Question bar under the toolbar; the chosen model is shown next to the button.
+    fn ask_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        self.poll_ai();
+        let has_key = !self.settings.groq_key_enc.is_empty();
+        ui.horizontal(|ui| {
+            ui.label(tr("Preguntar:", "Ask:"));
+            let w = (ui.available_width() - 330.0).max(160.0);
+            let edit = ui.add(
+                egui::TextEdit::singleline(&mut self.ai.question)
+                    .desired_width(w)
+                    .hint_text(tr("¿Qué carpetas ocupan más en C:? ¿Cuántos GB de video tengo?", "Which folders use the most space on C:? How many GB of video do I have?")),
+            );
+            let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+            let busy = self.ai.rx.is_some();
+            let can = has_key && !busy && self.tree.is_some() && !self.ai.question.trim().is_empty();
+            if ui.add_enabled(can, egui::Button::new(tr("Buscar", "Search"))).clicked() || (enter && can) {
+                self.ask_ai(ctx);
+            }
+            if busy {
+                ui.spinner();
+            }
+            let note = if !has_key {
+                tr("(cargá la clave de Groq en ⚙ Opciones)", "(add your Groq key in ⚙ Options)").to_string()
+            } else if self.ai.picking {
+                tr("(eligiendo modelo…)", "(choosing model…)").to_string()
+            } else {
+                format!("({})", self.ai.model.as_deref().unwrap_or(tr("modelo automático", "automatic model")))
+            };
+            ui.label(RichText::new(note).weak());
+        });
+    }
+
+    fn ai_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong(tr("Respuestas IA", "AI answers"));
+            if self.ai.rx.is_none() && ui.small_button(tr("✖ Limpiar", "✖ Clear")).clicked() {
+                self.ai.answers.clear();
+                self.tab = Tab::Tree;
+            }
+        });
+        ui.label(RichText::new(tr(
+            "Responde con datos de tu índice usando herramientas de solo lectura; envía rutas y nombres de archivo a Groq.",
+            "Answers from your index with read-only tools; paths and file names are sent to Groq.",
+        )).weak());
+        ui.separator();
+        egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for a in self.ai.answers.iter().rev() {
+                ui.label(RichText::new(&a.question).strong());
+                match &a.answer {
+                    None => {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(tr("Pensando…", "Thinking…"));
+                        });
+                    }
+                    Some(Ok(text)) => {
+                        ui.add(egui::Label::new(text.as_str()).selectable(true).wrap());
+                        if !a.model.is_empty() {
+                            ui.label(RichText::new(format!("— {}", a.model)).weak().small());
+                        }
+                    }
+                    Some(Err(e)) => {
+                        ui.colored_label(ui.visuals().error_fg_color, e);
+                    }
+                }
+                ui.separator();
+            }
+        });
+    }
+
+    fn groq_options(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        ui.label(RichText::new(tr("Preguntas con IA (Groq)", "AI questions (Groq)")).strong());
+        if !self.settings.groq_key_enc.is_empty() && !self.ai.key_editing {
+            ui.label(format!("{} ••••••••••••  {}", tr("Clave:", "Key:"), tr("(cifrada con Windows)", "(encrypted by Windows)")));
+            ui.horizontal(|ui| {
+                if ui.small_button(tr("Cambiar", "Change")).clicked() {
+                    self.ai.key_editing = true;
+                    self.ai.key_input.clear();
+                }
+                if ui.small_button(tr("Borrar", "Remove")).clicked() {
+                    self.settings.groq_key_enc.clear();
+                    self.settings.save();
+                    self.ai.model = None;
+                }
+            });
+        } else {
+            ui.add(egui::TextEdit::singleline(&mut self.ai.key_input).password(true).hint_text("gsk_…").desired_width(220.0));
+            ui.horizontal(|ui| {
+                if ui.small_button(tr("Guardar", "Save")).clicked()
+                    && let Some(enc) = crate::ai::protect(self.ai.key_input.trim())
+                {
+                    self.settings.groq_key_enc = enc;
+                    self.settings.save();
+                    self.ai.key_input.clear();
+                    self.ai.key_editing = false;
+                    self.ai.model = None;
+                }
+                ui.hyperlink_to(tr("Obtener clave", "Get a key"), "https://console.groq.com/keys");
+            });
+        }
+    }
+
     fn start_dups(&mut self, ctx: &egui::Context) {
         let Some(tree) = self.tree.clone() else { return };
         let opt = DupOptions {
@@ -1748,6 +1971,22 @@ impl App {
             }
         });
         if self.dups.show_excl {
+            ui.horizontal(|ui| {
+                if ui.small_button(tr("✖ Vaciar", "✖ Clear")).on_hover_text(tr("Quita todas las carpetas excluidas", "Remove every excluded folder")).clicked() {
+                    self.settings.dup_exclude.clear();
+                    self.dups.excl_text.clear();
+                    self.settings.save();
+                }
+                if ui
+                    .small_button(tr("Sugeridas", "Suggested"))
+                    .on_hover_text(suggested_exclusions().join("\n"))
+                    .clicked()
+                {
+                    self.settings.dup_exclude = suggested_exclusions();
+                    self.dups.excl_text = self.settings.dup_exclude.join("\n");
+                    self.settings.save();
+                }
+            });
             ui.label(RichText::new(tr("Una ruta por renglón. También: clic derecho en una carpeta → Excluir de duplicados.", "One path per line. Also: right-click a folder → Exclude from duplicates.")).weak());
             let edit = ui.add(
                 egui::TextEdit::multiline(&mut self.dups.excl_text)

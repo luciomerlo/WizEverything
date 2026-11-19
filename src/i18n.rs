@@ -55,6 +55,10 @@ pub struct Settings {
     pub excluded_drives: Vec<String>,
     /// Folders the duplicate finder never looks into (full paths).
     pub dup_exclude: Vec<String>,
+    /// The suggested exclusions were applied once (so clearing the list sticks).
+    pub dup_exclude_init: bool,
+    /// Groq API key encrypted with DPAPI (hex); never stored in plain text.
+    pub groq_key_enc: String,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
@@ -79,6 +83,8 @@ impl Settings {
             close_to_tray: true,
             excluded_drives: Vec::new(),
             dup_exclude: Vec::new(),
+            dup_exclude_init: false,
+            groq_key_enc: String::new(),
         };
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -94,6 +100,8 @@ impl Settings {
                 ("chart", v) => s.rings = v == "rings",
                 // One line per folder: dup_exclude=C:\path
                 ("dup_exclude", v) if !v.is_empty() => s.dup_exclude.push(v.to_string()),
+                ("dup_exclude_init", v) => s.dup_exclude_init = v != "0",
+                ("groq_key", v) => s.groq_key_enc = v.to_string(),
                 ("excluded_drives", v) => {
                     s.excluded_drives = v.split(',').map(str::trim).filter(|d| !d.is_empty()).map(String::from).collect()
                 }
@@ -117,7 +125,8 @@ impl Settings {
             if self.rings { "rings" } else { "treemap" },
             self.close_to_tray as u8,
             self.excluded_drives.join(","),
-        ) + &self.dup_exclude.iter().map(|d| format!("dup_exclude={d}\n")).collect::<String>()
+        ) + &format!("dup_exclude_init={}\ngroq_key={}\n", self.dup_exclude_init as u8, self.groq_key_enc)
+            + &self.dup_exclude.iter().map(|d| format!("dup_exclude={d}\n")).collect::<String>()
     }
 
     pub fn save(&self) {
