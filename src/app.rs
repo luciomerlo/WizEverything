@@ -113,6 +113,93 @@ pub(crate) enum Col {
 /// `None` = default order (size descending, like WizTree).
 pub(crate) type Sort = Option<(Col, bool)>;
 
+/// File type categories for the "File types" panel. "Others" catches the rest.
+/// (Spanish name, English name, extensions.) Extensions without a dot are matched
+/// lowercase; the empty string is "no extension".
+const CATEGORIES: &[(&str, &str, &[&str])] = &[
+    ("Video", "Video", &[
+        "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "3gp", "ts", "m2ts", "mts", "vob",
+        "mxf", "divx", "rm", "rmvb", "ogv", "f4v", "asf", "m2v",
+    ]),
+    ("Audio", "Audio", &[
+        "mp3", "wav", "flac", "aac", "ogg", "m4a", "wma", "aif", "aiff", "opus", "mid", "midi", "ape", "alac", "mka",
+        "caf", "dsf", "dff", "m4b", "amr",
+    ]),
+    ("Imágenes", "Images", &[
+        "jpg", "jpeg", "png", "gif", "bmp", "tif", "tiff", "webp", "heic", "heif", "avif", "jxl", "raw", "cr2", "cr3",
+        "nef", "arw", "dng", "orf", "rw2", "raf", "ico", "svg", "emf", "wmf", "jfif",
+    ]),
+    ("Documentos", "Documents", &[
+        "pdf", "doc", "docx", "docm", "dot", "dotx", "odt", "rtf", "txt", "md", "epub", "mobi", "azw3", "pages",
+        "xps", "oxps", "tex", "gdoc", "one", "pub", "vsd", "vsdx", "djvu",
+    ]),
+    ("Planillas", "Spreadsheets", &["xls", "xlsx", "xlsm", "xlsb", "xlt", "xltx", "ods", "csv", "tsv", "numbers", "gsheet"]),
+    ("Presentaciones", "Presentations", &["ppt", "pptx", "pptm", "pps", "ppsx", "pot", "potx", "odp", "key", "gslides"]),
+    ("Correo", "Mail", &["pst", "ost", "msg", "eml", "mbox", "emlx", "ics", "vcf"]),
+    ("Comprimidos", "Archives", &[
+        "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "zst", "cab", "tgz", "tbz2", "txz", "lz", "lzma", "lz4", "arj",
+        "sit", "sitx",
+    ]),
+    ("Imágenes de disco y VMs", "Disk images & VMs", &[
+        "iso", "img", "vhd", "vhdx", "avhdx", "vmdk", "vdi", "wim", "esd", "dmg", "qcow2", "ova", "ovf", "vmem", "vmsn",
+        "hdd", "sav",
+    ]),
+    ("Programas y sistema", "Programs & system", &[
+        "exe", "dll", "sys", "msi", "msp", "msix", "appx", "appxbundle", "msixbundle", "apk", "drv", "ocx", "cpl",
+        "mui", "cat", "efi", "pak", "bin", "dat", "inf", "ini", "reg", "lnk", "url", "manifest", "config", "xbf",
+        "pri", "nls", "tlb", "bat", "cmd", "ps1", "vbs", "scr", "com", "ax", "winmd", "nupkg",
+    ]),
+    ("Código y desarrollo", "Code & development", &[
+        "rs", "js", "mjs", "cjs", "ts", "tsx", "jsx", "vue", "svelte", "py", "pyi", "pyx", "ipynb", "java", "kt",
+        "swift", "dart", "scala", "go", "rb", "php", "lua", "r", "pl", "sh", "c", "cc", "cpp", "h", "hpp", "cs",
+        "html", "htm", "css", "scss", "sass", "less", "json", "xml", "yml", "yaml", "toml", "lock", "sql", "gradle",
+        "cmake", "mk", "sln", "csproj", "vcxproj", "props", "targets", "rlib", "rmeta", "pdb", "o", "obj", "lib",
+        "a", "so", "dylib", "ilk", "exp", "class", "jar", "wasm", "map", "pyc", "pyd", "node", "d", "pack", "idx",
+        "rev", "tsbuildinfo",
+    ]),
+    ("Bases de datos", "Databases", &[
+        "db", "sqlite", "sqlite3", "db3", "mdb", "accdb", "ldf", "mdf", "ndf", "dbo", "wal", "shm", "ldb", "sst",
+        "frm", "ibd", "myd", "myi", "realm", "kdbx",
+    ]),
+    ("Fuentes", "Fonts", &["ttf", "otf", "ttc", "woff", "woff2", "fon", "eot", "pfb"]),
+    ("Diseño y 3D", "Design & 3D", &[
+        "psd", "psb", "ai", "eps", "indd", "xcf", "kra", "sketch", "fig", "xd", "cdr", "afphoto", "afdesign", "stl",
+        "3mf", "fbx", "blend", "gcode", "step", "stp", "iges", "dwg", "dxf", "skp", "max", "c4d", "glb", "gltf", "usdz",
+    ]),
+    ("Logs y temporales", "Logs & temporary", &[
+        "log", "tmp", "temp", "bak", "old", "dmp", "mdmp", "etl", "evtx", "cache", "crdownload", "part", "partial",
+        "download", "swp", "~", "blf", "regtrans-ms",
+    ]),
+    ("Sin extensión", "No extension", &[""]),
+    ("Otros", "Others", &[]),
+];
+
+/// highlight_ext values with this bit set mean a whole category (low bits = index).
+const CAT_FLAG: u32 = 0x8000_0000;
+
+fn category_of(ext: &str) -> usize {
+    CATEGORIES.iter().position(|(_, _, exts)| exts.contains(&ext)).unwrap_or(CATEGORIES.len() - 1)
+}
+
+fn category_name(c: usize) -> &'static str {
+    let (es, en, _) = CATEGORIES[c];
+    tr(es, en)
+}
+
+/// True if path or one of its parent folders is in marked.
+fn under_marked(marked: &HashSet<String>, path: &str) -> bool {
+    let mut p = path;
+    loop {
+        if marked.contains(p) {
+            return true;
+        }
+        match p.rfind('\\') {
+            Some(i) if i > 2 => p = &p[..i],
+            _ => return false,
+        }
+    }
+}
+
 fn natural_asc(c: Col) -> bool {
     matches!(c, Col::Name | Col::Path)
 }
@@ -242,6 +329,9 @@ pub struct App {
     loading: Option<Loading>,
     error: Option<String>,
     info: Option<(String, Instant)>,
+    error_at: Instant,
+    /// Drive free-space cache: (drive, when, (total, free)).
+    disk_cache: Option<(u32, Instant, Option<(u64, u64)>)>,
 
     // incremental sync
     sync_rx: Option<Receiver<(u64, String, Result<Vec<Change>, String>)>>,
@@ -259,6 +349,7 @@ pub struct App {
     exclusion_dirty: bool,
     dups: Dups,
     ctx_menu: Option<(MenuTarget, egui::Pos2)>,
+    highlight_cache: Option<(u32, u64, Arc<treemap::Highlight>)>,
 
     view_root: u32,
     selected: Option<u32>,
@@ -275,6 +366,9 @@ pub struct App {
 
     ext_rows: Vec<(u32, u64, u64)>,
     ext_key: (u32, u64, Sort),
+    /// Categories in display order: (category, size, files).
+    ext_cats: Vec<(usize, u64, u64)>,
+    ext_open: HashSet<usize>,
     highlight_ext: Option<u32>,
 
     tab: Tab,
@@ -303,6 +397,9 @@ impl App {
         apply_theme(ctx, settings.theme);
         let mut style = (*ctx.global_style()).clone();
         style.spacing.item_spacing = egui::vec2(6.0, 3.0);
+        // Selectable labels swallow clicks (incl. right-click) before the table
+        // row sees them; rows must get them for selection and the context menu.
+        style.interaction.selectable_labels = false;
         ctx.set_global_style(style);
         let mut app = Self {
             tree: None,
@@ -311,6 +408,8 @@ impl App {
             loading: None,
             error: None,
             info: None,
+            error_at: Instant::now(),
+            disk_cache: None,
             sync_rx: None,
             pending_changes: None,
             sync_stamp: String::new(),
@@ -323,6 +422,7 @@ impl App {
             exclusion_dirty: false,
             dups: Dups::default(),
             ctx_menu: None,
+            highlight_cache: None,
             view_root: ROOT,
             selected: None,
             expanded: HashSet::new(),
@@ -336,6 +436,8 @@ impl App {
             hovered: None,
             ext_rows: Vec::new(),
             ext_key: (u32::MAX, u64::MAX, None),
+            ext_cats: Vec::new(),
+            ext_open: HashSet::new(),
             highlight_ext: None,
             tab: Tab::Tree,
             file_filter: String::new(),
@@ -354,6 +456,11 @@ impl App {
         };
         app.start_load(ctx);
         app
+    }
+
+    fn set_error(&mut self, e: String) {
+        self.error = Some(e);
+        self.error_at = Instant::now();
     }
 
     fn set_info(&mut self, s: String) {
@@ -404,7 +511,7 @@ impl App {
         let Ok(res) = l.rx.try_recv() else { return };
         self.loading = None;
         match res {
-            Err(e) => self.error = Some(e),
+            Err(e) => self.set_error(e),
             Ok(new) => {
                 self.error = None;
                 self.sync_stamp = new.sync_stamp.clone();
@@ -419,12 +526,24 @@ impl App {
                     self.selected = sel_path.and_then(|p| new.find_path(&p));
                     self.expanded = exp.iter().filter_map(|p| new.find_path(p)).collect();
                     self.expanded.insert(self.view_root);
+                    // Extension ids are reassigned on every load: re-resolve by name.
+                    self.highlight_ext = self.highlight_ext.and_then(|e| {
+                        if e & CAT_FLAG != 0 { Some(e) } else { old.exts.get(e as usize).and_then(|x| new.find_ext(&x.name)) }
+                    });
+                    // An open right-click menu keeps pointing at the same path.
+                    if let Some((MenuTarget::Node(id), pos)) = self.ctx_menu.clone() {
+                        self.ctx_menu = ((id as usize) < old.nodes.len()).then(|| (MenuTarget::Path(old.full_path(id)), pos));
+                    }
                 } else {
                     self.view_root = default_drive(&new);
                     self.expanded.insert(self.view_root);
                 }
                 self.tree = Some(new);
                 self.epoch += 1;
+                self.hovered = None;
+                self.real_queue = None;
+                self.highlight_cache = None;
+                self.disk_cache = None;
                 self.revision += 1;
                 self.real_done.clear();
                 self.pending_changes = None;
@@ -548,7 +667,7 @@ impl App {
             match r {
                 Ok(ch) if epoch == self.epoch => self.pending_changes = Some((epoch, stamp, ch)),
                 Ok(_) => {}
-                Err(e) => self.error = Some(e),
+                Err(e) => self.set_error(e),
             }
         }
         if let Some(job) = &self.real_job
@@ -571,7 +690,7 @@ impl App {
             match r {
                 Ok((path, rows)) => self.set_info(format!("{} {} → {path}", fmt_int(rows), tr("filas exportadas", "rows exported"))),
                 Err(e) if e.is_empty() => {}
-                Err(e) => self.error = Some(e),
+                Err(e) => self.set_error(e),
             }
         }
 
@@ -591,9 +710,12 @@ impl App {
             && let Ok((paths, r)) = rx.try_recv()
         {
             self.dups.recycle_rx = None;
-            match r {
-                Err(e) => self.error = Some(e),
-                Ok(_) => {
+            if let Err(e) = &r {
+                self.set_error(e.clone());
+            }
+            // Even after an error some files may already be gone: always prune.
+            {
+                {
                     // Drop what is really gone; keep groups that still have duplicates.
                     let gone: HashSet<&String> = paths.iter().filter(|p| !std::path::Path::new(p.as_str()).exists()).collect();
                     for g in &mut self.dups.groups {
@@ -615,7 +737,7 @@ impl App {
             match r {
                 Ok(p) => self.set_info(format!("{} → {p}", tr("Duplicados exportados", "Duplicates exported"))),
                 Err(e) if e.is_empty() => {}
-                Err(e) => self.error = Some(e),
+                Err(e) => self.set_error(e),
             }
         }
 
@@ -726,7 +848,7 @@ impl App {
         let want = !self.autostart;
         match autostart::set(want) {
             Ok(()) => self.autostart = want,
-            Err(e) => self.error = Some(e),
+            Err(e) => self.set_error(e),
         }
         if let Some(items) = &self.tray_items {
             items.auto.set_checked(self.autostart);
@@ -818,6 +940,8 @@ impl eframe::App for App {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // ui() only runs while the window is shown (also when another instance showed it).
+        self.visible = true;
         let ctx = ui.ctx().clone();
         let tree = self.tree.clone();
 
@@ -1088,9 +1212,15 @@ impl App {
                     ui.separator();
                 }
             if let Some(tree) = tree {
-                if let Some(d) = tree.drive_of(self.view_root)
-                    && let Some((total, free)) = tree::disk_space(tree.name(d))
-                {
+                let space = tree.drive_of(self.view_root).and_then(|d| {
+                    let fresh = matches!(self.disk_cache, Some((cd, at, _)) if cd == d && at.elapsed() < Duration::from_secs(10));
+                    if !fresh {
+                        self.disk_cache = Some((d, Instant::now(), tree::disk_space(tree.name(d))));
+                    }
+                    self.disk_cache.and_then(|c| c.2).map(|s| (d, s))
+                });
+                if let Some((d, (total, free))) = space {
+                    let free = free.min(total);
                     ui.label(format!(
                         "{}  {} {} {} {} · {} {}",
                         tree.full_path(d),
@@ -1131,14 +1261,14 @@ impl App {
             .resizable(true)
             .sense(Sense::click())
             .cell_layout(ELayout::left_to_right(Align::Center))
-            .column(Column::initial(340.0).at_least(120.0).clip(true))
-            .column(Column::initial(130.0).at_least(60.0))
-            .column(Column::initial(85.0))
-            .column(Column::initial(85.0))
-            .column(Column::initial(80.0))
-            .column(Column::initial(80.0))
-            .column(Column::initial(70.0))
-            .column(Column::remainder().at_least(110.0));
+            .column(Column::remainder().at_least(140.0).clip(true))
+            .column(Column::initial(110.0).range(50.0..=220.0).clip(true))
+            .column(Column::initial(80.0).range(55.0..=140.0).clip(true))
+            .column(Column::initial(80.0).range(55.0..=140.0).clip(true))
+            .column(Column::initial(76.0).range(50.0..=130.0).clip(true))
+            .column(Column::initial(76.0).range(50.0..=130.0).clip(true))
+            .column(Column::initial(66.0).range(45.0..=120.0).clip(true))
+            .column(Column::initial(112.0).range(70.0..=160.0).clip(true));
         if self.scroll_to_selected {
             if let Some(i) = self.selected.and_then(|s| self.rows.iter().position(|r| r.0 == s)) {
                 table = table.scroll_to_row(i, Some(Align::Center));
@@ -1246,6 +1376,10 @@ impl App {
         }
         if let Some(s) = select {
             self.selected = Some(s);
+            if self.view_root == ROOT && tree.nodes[s as usize].parent == ROOT {
+                self.set_root(ctx, s);
+                self.selected = Some(s);
+            }
         }
         if let Some(a) = action {
             self.run_action(ctx, a);
@@ -1255,8 +1389,6 @@ impl App {
     fn run_action(&mut self, ctx: &egui::Context, a: MenuAction) {
         match a {
             MenuAction::Menu(id) => self.open_menu(ctx, MenuTarget::Node(id)),
-            MenuAction::Zoom(id) => self.set_root(ctx, id),
-            MenuAction::RealSize(id) => self.start_real(ctx, id),
             MenuAction::Reveal(path) => {
                 if let Some(tree) = self.tree.clone()
                     && let Some(id) = tree.find_path(&path)
@@ -1327,11 +1459,11 @@ impl App {
             .resizable(true)
             .sense(Sense::click())
             .cell_layout(ELayout::left_to_right(Align::Center))
-            .column(Column::initial(260.0).clip(true))
-            .column(Column::initial(85.0))
-            .column(Column::initial(85.0))
-            .column(Column::initial(115.0))
-            .column(Column::remainder().clip(true))
+            .column(Column::initial(240.0).range(100.0..=600.0).clip(true))
+            .column(Column::initial(80.0).range(55.0..=140.0).clip(true))
+            .column(Column::initial(80.0).range(55.0..=140.0).clip(true))
+            .column(Column::initial(112.0).range(70.0..=160.0).clip(true))
+            .column(Column::remainder().at_least(100.0).clip(true))
             .header(22.0, |mut h| {
                 for (t, c) in [
                     (tr("Nombre", "Name"), Col::Name),
@@ -1421,21 +1553,30 @@ impl App {
 
     fn dups_mark(&mut self, keep_oldest: bool) {
         self.dups.marked.clear();
-        for g in &self.dups.groups {
-            let keep = if keep_oldest {
-                g.files.iter().enumerate().min_by_key(|(_, f)| f.modified)
+        let pick = |g: &DupGroup, avoid: &HashSet<String>| -> Option<usize> {
+            // Prefer a copy that is not inside an already-marked folder.
+            let ok: Vec<usize> = (0..g.files.len()).filter(|&i| !under_marked(avoid, &g.files[i].path)).collect();
+            let pool = if ok.is_empty() { (0..g.files.len()).collect() } else { ok };
+            if keep_oldest {
+                pool.into_iter().min_by_key(|&i| g.files[i].modified)
             } else {
-                g.files.iter().enumerate().max_by_key(|(_, f)| f.modified)
+                pool.into_iter().max_by_key(|&i| g.files[i].modified)
             }
-            .map(|(i, _)| i);
-            for (i, f) in g.files.iter().enumerate() {
-                if Some(i) != keep {
-                    self.dups.marked.insert(f.path.clone());
+        };
+        // Folders first, then files, so a file's surviving copy never sits in a marked folder.
+        for folders in [true, false] {
+            let mut add = Vec::new();
+            for g in self.dups.groups.iter().filter(|g| g.folder == folders) {
+                let keep = pick(g, &self.dups.marked);
+                for (i, f) in g.files.iter().enumerate() {
+                    if Some(i) != keep {
+                        add.push(f.path.clone());
+                    }
                 }
             }
+            self.dups.marked.extend(add);
         }
     }
-
     fn dups_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tree: &Tree) {
         // --- options
         ui.horizontal_wrapped(|ui| {
@@ -1555,7 +1696,12 @@ impl App {
 
         // --- confirmation
         if self.dups.confirm {
-            let all_marked = self.dups.groups.iter().filter(|g| g.files.iter().all(|f| self.dups.marked.contains(&f.path))).count();
+            let all_marked = self
+                .dups
+                .groups
+                .iter()
+                .filter(|g| g.files.iter().all(|f| under_marked(&self.dups.marked, &f.path)))
+                .count();
             let n = self.dups.marked.len();
             let resp = egui::Modal::new(egui::Id::unique("dup_confirm")).show(ctx, |ui| {
                 ui.set_max_width(440.0);
@@ -1771,14 +1917,33 @@ impl App {
                 self.ext_rows = tree.ext_stats(self.view_root);
             }
             let (col, asc) = self.ext_sort.unwrap_or((Col::Size, false));
-            self.ext_rows.sort_by(|a, b| {
+            let cmp_ext = |a: &(u32, u64, u64), b: &(u32, u64, u64)| {
                 let o = match col {
                     Col::Name => cmp_ci(tree.ext_label(a.0), tree.ext_label(b.0)),
                     Col::Count => a.2.cmp(&b.2),
                     _ => a.1.cmp(&b.1),
                 };
                 (if asc { o } else { o.reverse() }).then_with(|| b.1.cmp(&a.1))
+            };
+            self.ext_rows.sort_by(cmp_ext);
+            // Categories: totals, same order rule, "Others" always last.
+            let mut cats: Vec<(usize, u64, u64)> = (0..CATEGORIES.len()).map(|c| (c, 0, 0)).collect();
+            for &(e, size, count) in &self.ext_rows {
+                let c = category_of(&tree.exts[e as usize].name);
+                cats[c].1 += size;
+                cats[c].2 += count;
+            }
+            // Every category with files (Others included) follows the chosen order.
+            let mut ordered: Vec<(usize, u64, u64)> = cats.iter().copied().filter(|c| c.2 > 0).collect();
+            ordered.sort_by(|a, b| {
+                let o = match col {
+                    Col::Name => cmp_ci(category_name(a.0), category_name(b.0)),
+                    Col::Count => a.2.cmp(&b.2),
+                    _ => a.1.cmp(&b.1),
+                };
+                (if asc { o } else { o.reverse() }).then_with(|| b.1.cmp(&a.1))
             });
+            self.ext_cats = ordered;
             self.ext_key = key;
         }
         let mut sort = self.ext_sort;
@@ -1793,19 +1958,39 @@ impl App {
                 sort = None;
             }
         });
-        let mut toggle = None;
+
+        // Rows: a category, then its extensions when expanded.
+        enum Row {
+            Cat(usize, u64, u64),
+            Ext(u32, u64, u64),
+        }
+        let mut rows = Vec::new();
+        for &(c, size, count) in &self.ext_cats {
+            rows.push(Row::Cat(c, size, count));
+            if self.ext_open.contains(&c) {
+                for &(e, s, n) in &self.ext_rows {
+                    if category_of(&tree.exts[e as usize].name) == c {
+                        rows.push(Row::Ext(e, s, n));
+                    }
+                }
+            }
+        }
+        let mut toggle_ext = None;
+        let mut toggle_cat = None;
+        // Fixed, non-resizable numeric columns; the name takes whatever is left,
+        // so the table always fits the panel width.
         TableBuilder::new(ui)
             .striped(true)
-            .resizable(true)
+            .resizable(false)
             .sense(Sense::click())
             .cell_layout(ELayout::left_to_right(Align::Center))
-            .column(Column::initial(120.0).clip(true))
-            .column(Column::initial(55.0))
-            .column(Column::initial(80.0))
-            .column(Column::remainder())
+            .column(Column::remainder().at_least(70.0).clip(true))
+            .column(Column::exact(50.0).clip(true))
+            .column(Column::exact(68.0).clip(true))
+            .column(Column::exact(62.0).clip(true))
             .header(22.0, |mut h| {
                 for (t, c) in [
-                    (tr("Extensión", "Extension"), Col::Name),
+                    (tr("Tipo", "Type"), Col::Name),
                     ("%", Col::Pct),
                     (tr("Tamaño", "Size"), Col::Size),
                     (tr("Archivos", "Files"), Col::Count),
@@ -1816,26 +2001,54 @@ impl App {
                 }
             })
             .body(|body| {
-                body.rows(20.0, self.ext_rows.len(), |mut row| {
-                    let (e, size, count) = self.ext_rows[row.index()];
-                    row.set_selected(self.highlight_ext == Some(e));
-                    row.col(|ui| {
-                        swatch(ui, tree.exts[e as usize].color);
-                        ui.label(tree.ext_label(e));
-                    });
-                    row.col(|ui| right(ui, format!("{} %", fmt_dec(size as f64 / total * 100.0))));
-                    row.col(|ui| right(ui, fmt_size(size)));
-                    row.col(|ui| right(ui, fmt_int(count)));
-                    if row.response().clicked() {
-                        toggle = Some(e);
+                body.rows(20.0, rows.len(), |mut row| match rows[row.index()] {
+                    Row::Cat(c, size, count) => {
+                        let open = self.ext_open.contains(&c);
+                        row.set_selected(self.highlight_ext == Some(CAT_FLAG | c as u32));
+                        row.col(|ui| {
+                            ui.spacing_mut().item_spacing.x = 4.0;
+                            if toggle_arrow(ui, open).clicked() {
+                                toggle_cat = Some(c);
+                            }
+                            ui.label(RichText::new(category_name(c)).strong());
+                        });
+                        row.col(|ui| right(ui, format!("{} %", fmt_dec(size as f64 / total * 100.0))));
+                        row.col(|ui| right(ui, fmt_size(size)));
+                        row.col(|ui| right(ui, fmt_int(count)));
+                        if row.response().clicked() {
+                            toggle_cat = Some(c);
+                        }
+                    }
+                    Row::Ext(e, size, count) => {
+                        row.set_selected(self.highlight_ext == Some(e));
+                        row.col(|ui| {
+                            ui.add_space(18.0);
+                            swatch(ui, tree.exts[e as usize].color);
+                            ui.label(tree.ext_label(e));
+                        });
+                        row.col(|ui| right(ui, format!("{} %", fmt_dec(size as f64 / total * 100.0))));
+                        row.col(|ui| right(ui, fmt_size(size)));
+                        row.col(|ui| right(ui, fmt_int(count)));
+                        if row.response().clicked() {
+                            toggle_ext = Some(e);
+                        }
                     }
                 });
             });
         self.ext_sort = sort;
-        if let Some(e) = toggle {
+        if let Some(c) = toggle_cat {
+            if !self.ext_open.remove(&c) {
+                self.ext_open.insert(c);
+            }
+            // Clicking a category also paints the chart with all its extensions.
+            let code = CAT_FLAG | c as u32;
+            self.highlight_ext = if self.highlight_ext == Some(code) { None } else { Some(code) };
+        }
+        if let Some(e) = toggle_ext {
             self.highlight_ext = if self.highlight_ext == Some(e) { None } else { Some(e) };
         }
     }
+
 
     fn treemap_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
         let (rect, resp) = ui.allocate_exact_size(ui.available_size(), Sense::click());
@@ -1868,12 +2081,28 @@ impl App {
         }
         if rebuild {
             self.pending_size = None;
+            // Bytes of the highlighted extension per node (cached per extension + tree revision).
+            let hl = self.highlight_ext.map(|e| match &self.highlight_cache {
+                Some((ce, rev, h)) if *ce == e && *rev == self.revision => h.clone(),
+                _ => {
+                    let bytes = if e & CAT_FLAG != 0 {
+                        let c = (e & !CAT_FLAG) as usize;
+                        tree.ext_bytes_where(|x| category_of(&tree.exts[x as usize].name) == c)
+                    } else {
+                        tree.ext_bytes(e)
+                    };
+                    let h = Arc::new(treemap::Highlight { bytes });
+                    self.highlight_cache = Some((e, self.revision, h.clone()));
+                    h
+                }
+            });
             let layout = if rings {
                 let bg = ui.visuals().panel_fill;
-                let p = sunburst::Params { highlight_ext: self.highlight_ext, bg: [bg.r(), bg.g(), bg.b()] };
+                let p = sunburst::Params { highlight: hl.as_deref(), bg: [bg.r(), bg.g(), bg.b()] };
                 sunburst::build(tree, self.view_root, w, h, &p)
             } else {
-                treemap::build(tree, self.view_root, w, h, self.highlight_ext)
+                let line = if ui.visuals().dark_mode { [235, 235, 235] } else { [255, 255, 255] };
+                treemap::build(tree, self.view_root, w, h, hl.as_deref(), line)
             };
             let img = egui::ColorImage::from_rgba_unmultiplied([w, h], layout.pixels.as_flattened());
             match &mut self.texture {
@@ -1891,6 +2120,42 @@ impl App {
         let (kx, ky) = (rect.width() / layout.width as f32, rect.height() / layout.height as f32);
         let to_screen =
             |r: treemap::R| egui::Rect::from_min_size(rect.min + egui::vec2(r.x * kx, r.y * ky), egui::vec2(r.w * kx, r.h * ky));
+        // Treemap labels: group header tags (top-left) and "name (size)" cells (bottom-left).
+        for l in &layout.labels {
+            let sr = to_screen(l.r);
+            let n = &tree.nodes[l.id as usize];
+            // With an extension highlighted the chart is sized by that extension's bytes.
+            let shown = match &self.highlight_cache {
+                Some((e, _, h)) if self.highlight_ext == Some(*e) => h.bytes.get(l.id as usize).copied().unwrap_or(0),
+                _ => n.size,
+            };
+            let text = format!("{} ({})", tree.name(l.id), fmt_size(shown));
+            let job = |color: Color32, max_w: f32, size: f32| {
+                let mut job = egui::text::LayoutJob::single_section(
+                    text.clone(),
+                    egui::TextFormat::simple(egui::FontId::proportional(size), color),
+                );
+                job.wrap = egui::text::TextWrapping {
+                    max_width: max_w.max(1.0),
+                    max_rows: 1,
+                    break_anywhere: true,
+                    overflow_character: Some('…'),
+                };
+                job
+            };
+            if l.header {
+                let g = painter.layout_job(job(Color32::WHITE, sr.width() - 12.0, 12.5));
+                let bg = egui::Rect::from_min_size(sr.min + egui::vec2(1.0, 1.0), g.size() + egui::vec2(10.0, 6.0));
+                painter.rect_filled(bg.intersect(sr), 2.0, Color32::from_rgba_unmultiplied(30, 40, 55, 215));
+                painter.galley(bg.min + egui::vec2(5.0, 3.0), g, Color32::WHITE);
+            } else {
+                let g = painter.layout_job(job(Color32::from_black_alpha(215), sr.width() - 8.0, 11.5));
+                let pos = egui::pos2(sr.min.x + 4.0, sr.max.y - g.size().y - 3.0);
+                if pos.y > sr.min.y {
+                    painter.galley(pos, g, Color32::BLACK);
+                }
+            }
+        }
         // Ring chart: outline of an arc in screen space.
         let arc_shape = |id: u32, stroke: Stroke| -> Option<egui::Shape> {
             let (geom, arc) = (layout.geom?, *layout.arcs.get(&id)?);
@@ -1901,10 +2166,23 @@ impl App {
             // Center label: current folder and its size.
             let c = rect.min + egui::vec2(g[0] * kx, g[1] * ky);
             let n = &tree.nodes[layout.root as usize];
-            let name = if layout.root == ROOT { tr("Este equipo", "This PC").to_string() } else { tree.name(layout.root).to_string() };
+            let mut name = if layout.root == ROOT { tr("Este equipo", "This PC").to_string() } else { tree.name(layout.root).to_string() };
+            let mut size = n.size;
+            if let Some((e, _, h)) = &self.highlight_cache
+                && self.highlight_ext == Some(*e)
+            {
+                name = if *e & CAT_FLAG != 0 {
+                    category_name((*e & !CAT_FLAG) as usize).to_string()
+                } else if tree.exts.get(*e as usize).is_some_and(|x| x.name.is_empty()) {
+                    tree.ext_label(*e).to_string()
+                } else {
+                    format!(".{}", tree.ext_label(*e))
+                };
+                size = h.bytes.get(layout.root as usize).copied().unwrap_or(0);
+            }
             let dark = Color32::from_gray(30);
             painter.text(c - egui::vec2(0.0, 8.0), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(13.0), dark);
-            painter.text(c + egui::vec2(0.0, 9.0), egui::Align2::CENTER_CENTER, fmt_size(n.size), egui::FontId::proportional(12.0), dark);
+            painter.text(c + egui::vec2(0.0, 9.0), egui::Align2::CENTER_CENTER, fmt_size(size), egui::FontId::proportional(12.0), dark);
         }
 
         self.hovered = None;
@@ -1974,6 +2252,16 @@ impl App {
                 self.select(&ctx, tree, h, true);
             }
         }
+        // Treemap: double-click a folder cell to go into it.
+        if !ring_mode
+            && resp.double_clicked()
+            && let Some(h) = self.hovered
+            && tree.nodes[h as usize].is_dir()
+            && h != self.view_root
+        {
+            self.set_root(&ctx, h);
+            self.select(&ctx, tree, h, true);
+        }
         if let Some(h) = self.hovered
             && resp.secondary_clicked() {
                 self.open_menu(&ctx, MenuTarget::Node(h));
@@ -1985,40 +2273,28 @@ impl App {
 
 enum MenuAction {
     Menu(u32),
-    Zoom(u32),
-    RealSize(u32),
     Reveal(String),
 }
 
 /// Right-click menu body. Returns an action for the app, and whether to close.
 fn context_menu(ui: &mut egui::Ui, tree: Option<&Tree>, target: &MenuTarget) -> (Option<MenuAction>, bool) {
-    let (path, node) = match target {
-        MenuTarget::Node(id) => (tree.map(|t| t.full_path(*id)).unwrap_or_default(), tree.map(|t| (t, *id))),
-        MenuTarget::Path(p) => (p.clone(), None),
+    let (path, from_tree) = match target {
+        MenuTarget::Node(id) => (tree.map(|t| t.full_path(*id)).unwrap_or_default(), true),
+        MenuTarget::Path(p) => (p.clone(), false),
     };
     let name = path.trim_end_matches('\\').rsplit('\\').next().unwrap_or(&path).to_string();
-    let is_dir = match node {
-        Some((t, id)) => t.nodes[id as usize].is_dir(),
-        None => std::path::Path::new(&path).is_dir(),
-    };
     let mut action = None;
     let mut close = false;
-    ui.set_min_width(220.0);
+    ui.set_min_width(200.0);
     ui.label(RichText::new(&name).strong());
     ui.separator();
-    if ui.button(tr("Abrir", "Open")).clicked() {
-        shell_open(&path, None);
+    if ui.button(tr("Abrir", "Open")).on_hover_text(tr(
+        "Carpetas: se abren en el Explorador. Archivos: se muestran seleccionados en el Explorador.",
+        "Folders open in Explorer. Files are shown selected in Explorer.",
+    )).clicked() {
+        open_in_explorer(&path);
         close = true;
     }
-    if is_dir && ui.button(tr("Abrir en el Explorador", "Open in Explorer")).clicked() {
-        shell_open("explorer.exe", Some(&format!("\"{path}\"")));
-        close = true;
-    }
-    if ui.button(tr("Mostrar en el Explorador", "Show in Explorer")).clicked() {
-        shell_open("explorer.exe", Some(&format!("/select,\"{path}\"")));
-        close = true;
-    }
-    ui.separator();
     if ui.button(tr("Copiar ruta completa", "Copy full path")).clicked() {
         ui.ctx().copy_text(path.clone());
         close = true;
@@ -2027,29 +2303,20 @@ fn context_menu(ui: &mut egui::Ui, tree: Option<&Tree>, target: &MenuTarget) -> 
         ui.ctx().copy_text(name.clone());
         close = true;
     }
-    match node {
-        Some((t, id)) => {
-            ui.separator();
-            let n = &t.nodes[id as usize];
-            let dir = if n.is_dir() { id } else { n.parent };
-            if ui.button(tr("Hacer zoom en esta carpeta", "Zoom into this folder")).clicked() {
-                action = Some(MenuAction::Zoom(dir));
-                close = true;
-            }
-            if n.is_dir() && ui.button(tr("Calcular tamaño en disco real", "Compute real on-disk size")).clicked() {
-                action = Some(MenuAction::RealSize(id));
-                close = true;
-            }
-        }
-        None => {
-            ui.separator();
-            if ui.button(tr("Mostrar en el árbol", "Show in tree")).clicked() {
-                action = Some(MenuAction::Reveal(path.clone()));
-                close = true;
-            }
-        }
+    if !from_tree && ui.button(tr("Mostrar en el árbol", "Show in tree")).clicked() {
+        action = Some(MenuAction::Reveal(path.clone()));
+        close = true;
     }
     (action, close)
+}
+
+/// Folders open in Explorer; files are shown selected in their folder (never executed).
+fn open_in_explorer(path: &str) {
+    if std::path::Path::new(path).is_dir() {
+        shell_open("explorer.exe", Some(&format!("\"{path}\"")));
+    } else {
+        shell_open("explorer.exe", Some(&format!("/select,\"{path}\"")));
+    }
 }
 
 fn shell_open(file: &str, args: Option<&str>) {

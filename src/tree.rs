@@ -508,12 +508,18 @@ impl Tree {
         self.ancestors(id).get(1).copied()
     }
 
+    /// Extension id by name (ids change on every full load).
+    pub fn find_ext(&self, name: &str) -> Option<u32> {
+        self.ext_ids.get(name).copied()
+    }
+
     pub fn ext_label(&self, id: u32) -> &str {
         let e = &self.exts[id as usize].name;
         if e.is_empty() { tr("(sin extensión)", "(no extension)") } else { e }
     }
 
     /// Representative color of a folder: the color of its largest file.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn dominant_color(&self, mut id: u32) -> [u8; 3] {
         loop {
             let n = &self.nodes[id as usize];
@@ -548,6 +554,29 @@ impl Tree {
             };
         }
         Some(id)
+    }
+
+    /// Bytes of extension `ext` inside every node (a file's own size if it
+    /// matches; the sum for folders). One reverse pass: parents precede children.
+    pub fn ext_bytes(&self, ext: u32) -> Vec<u64> {
+        self.ext_bytes_where(|e| e == ext)
+    }
+
+    /// Like [Self::ext_bytes] for every extension accepted by pick.
+    pub fn ext_bytes_where(&self, pick: impl Fn(u32) -> bool) -> Vec<u64> {
+        let wanted: Vec<bool> = (0..self.exts.len() as u32).map(&pick).collect();
+        let mut v: Vec<u64> = self
+            .nodes
+            .iter()
+            .map(|n| if !n.is_dir() && wanted.get(n.ext as usize).copied().unwrap_or(false) { n.size } else { 0 })
+            .collect();
+        for id in (1..self.nodes.len()).rev() {
+            let p = self.nodes[id].parent as usize;
+            if v[id] > 0 && p < v.len() {
+                v[p] += v[id];
+            }
+        }
+        v
     }
 
     /// Per-extension totals (ext, size, count) restricted to a subtree.

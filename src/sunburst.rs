@@ -6,7 +6,7 @@
 use std::f32::consts::{PI, TAU};
 
 use crate::tree::Tree;
-use crate::treemap::Layout;
+use crate::treemap::{GROUP_COLORS, Layout};
 
 const LEVELS: usize = 7;
 
@@ -17,33 +17,12 @@ struct Arc {
     color: [u8; 3],
 }
 
-pub struct Params {
-    pub highlight_ext: Option<u32>,
+pub struct Params<'a> {
+    pub highlight: Option<&'a crate::treemap::Highlight>,
     pub bg: [u8; 3],
 }
 
-fn hsv(h: f32, s: f32, v: f32) -> [u8; 3] {
-    let h = h.rem_euclid(360.0);
-    let c = v * s;
-    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-    let m = v - c;
-    let (r, g, b) = match (h / 60.0) as u32 {
-        0 => (c, x, 0.0),
-        1 => (x, c, 0.0),
-        2 => (0.0, c, x),
-        3 => (0.0, x, c),
-        4 => (x, 0.0, c),
-        _ => (c, 0.0, x),
-    };
-    [((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8]
-}
-
-fn dim(c: [u8; 3]) -> [u8; 3] {
-    let g = ((c[0] as u32 + c[1] as u32 + c[2] as u32) / 3 / 3) as u8;
-    [g, g, g]
-}
-
-pub fn build(tree: &Tree, root: u32, width: usize, height: usize, p: &Params) -> Layout {
+pub fn build(tree: &Tree, root: u32, width: usize, height: usize, p: &Params<'_>) -> Layout {
     let mut pixels = vec![[p.bg[0], p.bg[1], p.bg[2], 255]; width * height];
     let mut owner = vec![u32::MAX; width * height];
     let (cx, cy) = (width as f32 / 2.0, height as f32 / 2.0);
@@ -53,35 +32,42 @@ pub fn build(tree: &Tree, root: u32, width: usize, height: usize, p: &Params) ->
 
     // Arcs per level, in angular order.
     let mut levels: Vec<Vec<Arc>> = (0..LEVELS).map(|_| Vec::new()).collect();
-    let mut stack = vec![(root, 0.0f32, TAU, 0usize, 0.0f32)];
-    while let Some((id, a0, a1, depth, hue)) = stack.pop() {
-        let total = tree.nodes[id as usize].size as f32;
+    // With an extension highlighted, arcs are sized by that extension's bytes
+    // only: the chart shows where those files are and how much they weigh.
+    let size_of = |id: u32| match p.highlight {
+        Some(h) => h.bytes.get(id as usize).copied().unwrap_or(0),
+        None => tree.nodes[id as usize].size,
+    };
+    let mut stack = vec![(root, 0.0f32, TAU, 0usize, 0usize)];
+    while let Some((id, a0, a1, depth, group)) = stack.pop() {
+        let total = size_of(id) as f32;
         if depth >= LEVELS || total <= 0.0 {
             continue;
         }
         let outer = r0 + ring * (depth + 1) as f32;
         let mut a = a0;
-        for &c in tree.children(id) {
+        for (i, &c) in tree.children(id).iter().enumerate() {
             let n = &tree.nodes[c as usize];
-            let span = (a1 - a0) * n.size as f32 / total;
+            let span = (a1 - a0) * size_of(c) as f32 / total;
             if span * outer < 0.6 {
+                if p.highlight.is_some() {
+                    a += span; // order is by total size, not by highlighted bytes
+                    continue;
+                }
                 break; // children are sorted by size: the rest are smaller still
             }
-            let mid = a + span / 2.0;
-            let h = if depth == 0 { mid.to_degrees() } else { hue };
-            let mut color = if n.is_dir() {
-                hsv(h, 0.62 - depth as f32 * 0.05, 0.92 - depth as f32 * 0.03)
-            } else {
-                tree.exts[n.ext as usize].color
-            };
-            if let Some(e) = p.highlight_ext
-                && (n.is_dir() || n.ext != e)
-            {
-                color = dim(color);
+            // Same palette as the treemap: one color per first-level group,
+            // getting lighter towards the outside.
+            let g = if depth == 0 { i % GROUP_COLORS.len() } else { group };
+            let base = GROUP_COLORS[g];
+            let k = (depth as f32 * 0.09).min(0.5);
+            let mut color = [0, 1, 2].map(|j| (base[j] as f32 + (255.0 - base[j] as f32) * k) as u8);
+            if !n.is_dir() && p.highlight.is_none() {
+                color = [0, 1, 2].map(|j| (color[j] as f32 * 0.88) as u8); // files a bit darker
             }
             levels[depth].push(Arc { a0: a, a1: a + span, id: c, color });
             if n.is_dir() {
-                stack.push((c, a, a + span, depth + 1, h));
+                stack.push((c, a, a + span, depth + 1, g));
             }
             a += span;
         }
@@ -144,7 +130,7 @@ pub fn build(tree: &Tree, root: u32, width: usize, height: usize, p: &Params) ->
         }
     }
     });
-    Layout { width, height, root, pixels, owner, rects: Default::default(), arcs, geom: Some([cx, cy, r0, ring]) }
+    Layout { width, height, root, pixels, owner, rects: Default::default(), labels: Vec::new(), arcs, geom: Some([cx, cy, r0, ring]) }
 }
 
 /// Outline polygon of an arc (in layout pixels), for hover/selection highlights.

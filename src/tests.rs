@@ -244,7 +244,7 @@ fn squarify_fills_rect_exactly() {
 #[test]
 fn treemap_covers_every_pixel() {
     let t = sample();
-    let l = treemap::build(&t, ROOT, 240, 120, None);
+    let l = treemap::build(&t, ROOT, 240, 120, None, [255, 255, 255]);
     let covered = l.owner.iter().filter(|&&o| o != u32::MAX).count();
     assert!(covered as f64 / l.owner.len() as f64 > 0.99, "covered {covered}");
     // the biggest file owns about its share of the pixels
@@ -256,7 +256,7 @@ fn treemap_covers_every_pixel() {
 #[test]
 fn rings_center_is_root_and_arcs_are_valid() {
     let t = sample();
-    let p = sunburst::Params { highlight_ext: None, bg: [0, 0, 0] };
+    let p = sunburst::Params { highlight: None, bg: [0, 0, 0] };
     let root = id(&t, D1);
     let l = sunburst::build(&t, root, 300, 200, &p);
     assert_eq!(l.owner[100 * 300 + 150], root, "center pixel is the view root");

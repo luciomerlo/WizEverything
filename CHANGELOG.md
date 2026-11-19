@@ -3,6 +3,23 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-11-19
+
+### Added
+- File types grouped into categories (Video, Audio, Images, Documents, Spreadsheets, Presentations, Mail, Archives, Disk images & VMs, Programs & system, Code, Databases, Fonts, Design & 3D, Logs & temporary, No extension, Others); every column sorts, Others included.
+- Clicking a category or an extension paints the treemap / rings with only those bytes.
+- Flat, two-level treemap (group colors, soft separators, group tags, name (size) labels); double-click to go deeper.
+- Ring chart uses the treemap palette; clicking a drive in the tree shows only that drive.
+- Duplicate folders pane; results stream live; stopping keeps results.
+
+### Fixed
+- Right-click menu now opens (selectable labels swallowed the click); simplified to Open / Copy full path / Copy name.
+- Columns can no longer be resized out of the panel.
+- Stale ids after a reload (highlight, hover, menu, real-size queue) could crash.
+- Keep oldest/newest could mark every copy of a file inside a duplicated folder.
+- Recycle Bin errors left the list stale; errors now fade; free-space query cached and underflow-safe.
+- App shown by a second instance now keeps syncing.
+
 ## [0.2.0] - 2026-11-19
 
 ### Added
