@@ -1798,7 +1798,10 @@ impl App {
             let edit = ui.add(egui::TextEdit::singleline(&mut self.ai.key_input).password(true).hint_text("gsk_…").desired_width(f32::INFINITY));
             edit.request_focus();
             let enter = edit.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-            ui.hyperlink_to(tr("Obtener una clave en console.groq.com", "Get a key at console.groq.com"), "https://console.groq.com/keys");
+            if ui.link(tr("Obtener una clave en console.groq.com", "Get a key at console.groq.com")).clicked() {
+                // eframe is built without its URL opener: use the Windows shell.
+                shell_open("https://console.groq.com/keys", None);
+            }
             ui.add_space(6.0);
             let mut close = false;
             ui.horizontal(|ui| {
