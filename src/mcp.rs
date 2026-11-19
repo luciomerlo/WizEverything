@@ -40,7 +40,7 @@ impl Server {
                 "protocolVersion": msg.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "wizeverything", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Disk usage, file types and duplicate files from the Everything index on this Windows PC. Sizes are in bytes. Paths look like C:\\Users\\name."
+                "instructions": "Read-only. Disk usage, file types and duplicate files from the Everything index on this Windows PC. It never deletes or changes files. Sizes are in bytes. Paths look like C:\\Users\\name."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -176,26 +176,28 @@ impl Server {
     }
 }
 
+/// Every tool is read-only: nothing here deletes, moves or writes files.
 fn tools() -> Value {
+    let ro = json!({ "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false });
     let path = json!({ "type": "string", "description": "Folder or drive, e.g. C:\\ or C:\\Users. Omit for all drives." });
     let limit = json!({ "type": "integer", "description": "Max items to return (default 25)." });
     json!([
-        { "name": "drives", "description": "List drives with label, used size, free space and item counts.",
+        { "name": "drives", "description": "List drives with label, used size, free space and item counts.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } },
-        { "name": "folder_sizes", "description": "Size of a folder and its largest children (like WizTree's tree view).",
+        { "name": "folder_sizes", "description": "Size of a folder and its largest children (like WizTree's tree view).", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit } } },
-        { "name": "largest_files", "description": "Largest files under a folder, optionally filtered by name.",
+        { "name": "largest_files", "description": "Largest files under a folder, optionally filtered by name.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "name_contains": { "type": "string", "description": "Case-insensitive name filter, e.g. .mp4" } } } },
-        { "name": "file_types", "description": "Space by category (Video, Audio, Documents…) and extension under a folder.",
+        { "name": "file_types", "description": "Space by category (Video, Audio, Documents…) and extension under a folder.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit } } },
-        { "name": "find_duplicates", "description": "Find duplicate files and folders (verified by content) under a folder. Read-only.",
+        { "name": "find_duplicates", "description": "Find duplicate files and folders (verified by content) under a folder. Read-only.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "min_size_mb": { "type": "number", "description": "Ignore files smaller than this (default 1)." },
             "same_name": { "type": "boolean", "description": "Only compare files with the same name (default true, faster)." },
             "verify": { "type": "boolean", "description": "Confirm by content hashes (default true). false = name + size only, reads nothing (safe for cloud drives)." },
             "all_drives": { "type": "boolean", "description": "Search every included drive when no path is given." } } } },
-        { "name": "refresh", "description": "Reload the index from Everything.",
+        { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])
 }
