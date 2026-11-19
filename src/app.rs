@@ -96,6 +96,8 @@ struct Dups {
     same_name: bool,
     /// Advanced mode (hash the content) vs quick mode (index only).
     verify: bool,
+    /// Versions mode: same name + folder, content may differ (overrides verify).
+    versions: bool,
     scope_all: bool,
     job: Option<DupJob>,
     groups: Vec<DupGroup>,
@@ -114,6 +116,8 @@ struct Dups {
     show_excl: bool,
     excl_text: String,
     pick: bool,
+    /// Smart marking: kept copy → why it was chosen.
+    keep_reason: std::collections::HashMap<String, String>,
 }
 
 impl Default for Dups {
@@ -122,6 +126,7 @@ impl Default for Dups {
             min_mb: 1.0,
             same_name: true,
             verify: true,
+            versions: false,
             scope_all: false,
             job: None,
             groups: Vec::new(),
@@ -137,6 +142,7 @@ impl Default for Dups {
             show_excl: false,
             excl_text: String::new(),
             pick: false,
+            keep_reason: Default::default(),
         }
     }
 }
@@ -251,6 +257,42 @@ fn under_marked(marked: &HashSet<String>, path: &str) -> bool {
             _ => return false,
         }
     }
+}
+
+/// How worth keeping a copy looks, from its path alone (higher is better),
+/// with the main reason. Used by the smart marking of duplicates.
+pub(crate) fn keep_score(path: &str, prefer: &str) -> (i32, &'static str) {
+    let p = path.to_lowercase();
+    let name = p.rsplit('\\').next().unwrap_or("");
+    let has = |words: &[&str]| words.iter().any(|w| p.contains(w));
+    let mut score = 0;
+    let mut why = "";
+    let mut note = |s: i32, w: &'static str| {
+        if s.abs() > 0 && why.is_empty() {
+            why = w;
+        }
+        score += s;
+    };
+    if !prefer.is_empty() && p.starts_with(prefer) {
+        note(100, "unidad preferida");
+    }
+    if has(&["\\$recycle.bin\\", "\\trash", "\\papelera", "\\temp\\", "\\tmp\\", "\\cache", "\\caché"]) {
+        note(-60, "las otras están en temporales/papelera");
+    }
+    if has(&["backup", "respaldo", "copia de seguridad", "\\old\\", "\\viejo", "\\archive", "\\archivo viejo", ".bak"]) {
+        note(-40, "las otras parecen respaldos viejos");
+    }
+    let copy_name = [" (1)", " (2)", " (3)", " - copia", " - copy", "copy of ", "copia de ", "_copy", "_copia"].iter().any(|w| name.contains(w));
+    if copy_name {
+        note(-30, "las otras tienen nombre de copia");
+    }
+    if has(&["\\downloads\\", "\\descargas\\"]) {
+        note(-20, "las otras están en Descargas");
+    }
+    if has(&["\\documents\\", "\\documentos\\", "\\pictures\\", "\\imágenes\\", "\\music\\", "\\música\\", "\\videos\\", "\\vídeos\\", "\\mi unidad\\", "\\my drive\\"]) {
+        note(15, "carpeta personal organizada");
+    }
+    (score, why)
 }
 
 fn natural_asc(c: Col) -> bool {
@@ -1859,7 +1901,8 @@ impl App {
             root: if self.dups.scope_all { ROOT } else { self.view_root },
             min_size: (self.dups.min_mb * 1024.0 * 1024.0) as u64,
             same_name: self.dups.same_name,
-            verify: self.dups.verify,
+            verify: self.dups.verify && !self.dups.versions,
+            versions: self.dups.versions,
             exclude: self.settings.dup_exclude.iter().filter_map(|p| tree.find_path(p)).collect(),
         };
         let prog = Arc::new(DupProgress::default());
@@ -1920,12 +1963,65 @@ impl App {
         self.settings.save();
     }
 
-    fn dups_mark(&mut self, keep_oldest: bool) {
+    /// Smart marking: in each group keep the copy that looks most "official"
+    /// (preferred drive, organized personal folder, not a backup/temp/copy-named
+    /// file), newest on ties; mark the rest. Works within a single drive too.
+    fn dups_mark_smart(&mut self) {
         self.dups.marked.clear();
+        self.dups.keep_reason.clear();
+        let prefer = if self.settings.dup_prefer.is_empty() { String::new() } else { format!("{}\\", self.settings.dup_prefer.to_lowercase()) };
+        for folders in [true, false] {
+            let mut add = Vec::new();
+            let mut reasons = Vec::new();
+            for g in self.dups.groups.iter().filter(|g| g.folder == folders) {
+                let ok: Vec<usize> = (0..g.files.len()).filter(|&i| !under_marked(&self.dups.marked, &g.files[i].path)).collect();
+                let pool = if ok.is_empty() { (0..g.files.len()).collect() } else { ok };
+                let scored: Vec<(i32, u64, usize, &'static str)> = pool
+                    .iter()
+                    .map(|&i| {
+                        let (s, w) = keep_score(&g.files[i].path, &prefer);
+                        (s, g.files[i].modified, i, w)
+                    })
+                    .collect();
+                let Some(&(best, _, keep, why)) = scored.iter().max_by_key(|x| (x.0, x.1)) else { continue };
+                // Explain with the winner's bonus, else with what was wrong with the others.
+                let reason = if best > 0 && !why.is_empty() {
+                    why.to_string()
+                } else {
+                    scored
+                        .iter()
+                        .filter(|x| x.2 != keep && x.0 < best)
+                        .map(|x| x.3)
+                        .find(|w| !w.is_empty())
+                        .map_or_else(|| "la más nueva".to_string(), String::from)
+                };
+                reasons.push((g.files[keep].path.clone(), reason));
+                for (i, f) in g.files.iter().enumerate() {
+                    if i != keep {
+                        add.push(f.path.clone());
+                    }
+                }
+            }
+            self.dups.marked.extend(add);
+            self.dups.keep_reason.extend(reasons);
+        }
+    }
+
+    fn dups_mark(&mut self, keep_oldest: bool) {
+        self.dups.keep_reason.clear();
+        self.dups.marked.clear();
+        let prefer = if self.settings.dup_prefer.is_empty() { String::new() } else { format!("{}\\", self.settings.dup_prefer.to_lowercase()) };
         let pick = |g: &DupGroup, avoid: &HashSet<String>| -> Option<usize> {
             // Prefer a copy that is not inside an already-marked folder.
             let ok: Vec<usize> = (0..g.files.len()).filter(|&i| !under_marked(avoid, &g.files[i].path)).collect();
-            let pool = if ok.is_empty() { (0..g.files.len()).collect() } else { ok };
+            let mut pool = if ok.is_empty() { (0..g.files.len()).collect() } else { ok };
+            // The preferred drive always wins (e.g. Google Drive over old backups).
+            if !prefer.is_empty() {
+                let on_pref: Vec<usize> = pool.iter().copied().filter(|&i| g.files[i].path.to_lowercase().starts_with(&prefer)).collect();
+                if !on_pref.is_empty() {
+                    pool = on_pref;
+                }
+            }
             if keep_oldest {
                 pool.into_iter().min_by_key(|&i| g.files[i].modified)
             } else {
@@ -1949,7 +2045,7 @@ impl App {
     fn dups_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tree: &Tree) {
         // --- options
         ui.horizontal_wrapped(|ui| {
-            let opts_before = (self.dups.min_mb, self.dups.same_name, self.dups.scope_all, self.dups.verify);
+            let opts_before = (self.dups.min_mb, self.dups.same_name, self.dups.scope_all);
             ui.label(tr("Buscar en:", "Search in:"));
             let here = if self.view_root == ROOT { tr("Todas", "All").to_string() } else { tree.full_path(self.view_root) };
             ui.radio_value(&mut self.dups.scope_all, false, format!("{} ({here})", tr("vista actual", "current view")));
@@ -1963,20 +2059,65 @@ impl App {
             ui.add(egui::DragValue::new(&mut self.dups.min_mb).range(0.0..=1_000_000.0).speed(0.5).suffix(" MB"));
             ui.separator();
             ui.label(tr("Modo:", "Mode:"));
-            ui.selectable_value(&mut self.dups.verify, false, tr("Rápido", "Quick")).on_hover_text(tr(
-                "Solo nombre y tamaño, desde el índice. No lee ningún archivo: instantáneo y seguro con Google Drive en streaming. Resultados sin verificar.",
+            let mode_before = (self.dups.verify, self.dups.versions);
+            if ui.selectable_label(!self.dups.verify && !self.dups.versions, tr("Rápido", "Quick")).clicked() {
+                (self.dups.verify, self.dups.versions) = (false, false);
+            }
+            ui.label(RichText::new("?").weak()).on_hover_text(tr(
+                "Rápido: solo nombre y tamaño, desde el índice. No lee ningún archivo: instantáneo y seguro con Google Drive en streaming. Resultados sin verificar.",
                 "Name and size only, from the index. Reads no file: instant and safe with streamed Google Drive. Results are unverified.",
             ));
-            ui.selectable_value(&mut self.dups.verify, true, tr("Avanzado", "Advanced")).on_hover_text(tr(
-                "Confirma el contenido con hash (lee los archivos; omite los que están solo en la nube).",
-                "Confirms content with hashes (reads the files; skips cloud-only ones).",
+            if ui
+                .selectable_label(self.dups.verify && !self.dups.versions, tr("Avanzado", "Advanced"))
+                .on_hover_text(tr(
+                    "Confirma el contenido con hash (lee los archivos; omite los que están solo en la nube).",
+                    "Confirms content with hashes (reads the files; skips cloud-only ones).",
+                ))
+                .clicked()
+            {
+                (self.dups.verify, self.dups.versions) = (true, false);
+            }
+            if ui
+                .selectable_label(self.dups.versions, tr("Versiones", "Versions"))
+                .on_hover_text(tr(
+                    "Mismo nombre dentro de una carpeta del mismo nombre, en cualquier unidad, aunque cambien tamaño y contenido (copias viejas). No lee archivos.",
+                    "Same name inside a same-named folder, on any drive, even if size and content differ (old copies). Reads no file.",
+                ))
+                .clicked()
+            {
+                self.dups.versions = true;
+            }
+            if mode_before != (self.dups.verify, self.dups.versions)
+                && let Some(job) = self.dups.job.take()
+            {
+                job.prog.cancel.store(true, Ordering::Relaxed);
+                self.start_dups(ctx);
+            }
+            ui.separator();
+            ui.label(tr("Preferir:", "Prefer:")).on_hover_text(tr(
+                "Al marcar, se conserva siempre la copia de esta unidad (por ejemplo tu Google Drive); si no hay, la más nueva.",
+                "When marking, the copy on this drive always wins (e.g. your Google Drive); otherwise the newest.",
             ));
+            let mut prefer = self.settings.dup_prefer.clone();
+            egui::ComboBox::from_id_salt("dup_prefer")
+                .selected_text(if prefer.is_empty() { tr("ninguna", "none").to_string() } else { tree.find_path(&prefer).map_or(prefer.clone(), |d| tree.drive_label(d)) })
+                .width(170.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut prefer, String::new(), tr("ninguna", "none"));
+                    for &d in &tree.drives {
+                        ui.selectable_value(&mut prefer, tree.name(d).to_string(), tree.drive_label(d));
+                    }
+                });
+            if prefer != self.settings.dup_prefer {
+                self.settings.dup_prefer = prefer;
+                self.settings.save();
+            }
             ui.add_enabled(self.dups.verify, egui::Checkbox::new(&mut self.dups.same_name, tr("Mismo nombre", "Same name"))).on_hover_text(tr(
                 "Activado: solo compara archivos con igual nombre y tamaño (rápido).\nDesactivado: compara todos los de igual tamaño (encuentra copias renombradas).",
                 "On: only compares files with the same name and size (fast).\nOff: compares every file of the same size (finds renamed copies).",
             ));
             // Changing an option while searching restarts the search with the new values.
-            if opts_before != (self.dups.min_mb, self.dups.same_name, self.dups.scope_all, self.dups.verify)
+            if opts_before != (self.dups.min_mb, self.dups.same_name, self.dups.scope_all)
                 && let Some(job) = self.dups.job.take()
             {
                 job.prog.cancel.store(true, Ordering::Relaxed);
@@ -2141,6 +2282,16 @@ impl App {
             }
             ui.separator();
             ui.label(tr("Marcar:", "Mark:"));
+            if ui
+                .button(RichText::new(tr("✓ sugerir cuál conservar", "✓ suggest which to keep")).strong())
+                .on_hover_text(tr(
+                    "Conserva en cada grupo la copia más «oficial»: unidad preferida o carpeta personal (Documentos, Imágenes, Música…), no respaldos, temporales, Descargas ni nombres tipo «(1)»/«- copia»; si empatan, la más nueva. Pasá el mouse por ✓ para ver el motivo.",
+                    "Keeps the most «official» copy in each group: preferred drive or personal folder (Documents, Pictures, Music…), not backups, temp, Downloads or «(1)»/«- copy» names; newest on ties. Hover ✓ to see why.",
+                ))
+                .clicked()
+            {
+                self.dups_mark_smart();
+            }
             if ui.button(tr("conservar el más antiguo", "keep oldest")).clicked() {
                 self.dups_mark(true);
             }
@@ -2149,6 +2300,7 @@ impl App {
             }
             if ui.button(tr("desmarcar", "clear")).clicked() {
                 self.dups.marked.clear();
+                self.dups.keep_reason.clear();
             }
             ui.separator();
             if ui.add_enabled(self.dups.export_rx.is_none(), egui::Button::new(tr("⇩ Exportar CSV", "⇩ Export CSV"))).clicked() {
@@ -2359,7 +2511,12 @@ impl App {
                                         file_icon(ui, [150, 150, 150]);
                                     }
                                     let label = ui.label(RichText::new(grp.name()).strong());
-                                    if !grp.verified {
+                                    if grp.versions {
+                                        ui.label(RichText::new("≠").weak()).on_hover_text(tr(
+                                            "Versiones: mismo nombre y carpeta, el contenido puede diferir",
+                                            "Versions: same name and folder, content may differ",
+                                        ));
+                                    } else if !grp.verified {
                                         ui.label(RichText::new("≈").weak()).on_hover_text(tr(
                                             "Sin verificar: coinciden nombre y tamaño (modo rápido)",
                                             "Unverified: name and size match (quick mode)",
@@ -2392,10 +2549,14 @@ impl App {
                                     {
                                         toggle = Some(file.path.clone());
                                     }
+                                    if let Some(why) = self.dups.keep_reason.get(&file.path) {
+                                        ui.label(RichText::new("✓").color(Color32::from_rgb(90, 190, 90)).strong())
+                                            .on_hover_text(format!("{}: {why}", tr("Se conserva", "Kept")));
+                                    }
                                     ui.label(shown).on_hover_text(&file.path);
                                 });
                                 row.col(|_| {});
-                                row.col(|_| {});
+                                row.col(|ui| right(ui, if grp.versions { fmt_size(file.size) } else { String::new() }));
                                 row.col(|_| {});
                                 row.col(|ui| {
                                     ui.label(fmt_date(file.modified));

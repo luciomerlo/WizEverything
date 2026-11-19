@@ -360,7 +360,7 @@ fn short(path: &str) -> String {
 #[test]
 fn dups_same_name_confirms_by_full_hash_and_skips_hardlinks() {
     let (_tmp, tree, root) = dup_fixture();
-    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() };
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default(), versions: false };
     let all = dup::find(Arc::new(tree), opt.clone(), Arc::new(DupProgress::default()));
     let groups: Vec<_> = all.iter().filter(|g| !g.folder).collect();
     assert_eq!(groups.len(), 1, "one file group");
@@ -378,7 +378,7 @@ fn dups_same_name_confirms_by_full_hash_and_skips_hardlinks() {
 #[test]
 fn dups_size_only_finds_renamed_copies() {
     let (_tmp, tree, root) = dup_fixture();
-    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default() };
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default(), versions: false };
     let all = dup::find(Arc::new(tree), opt.clone(), Arc::new(DupProgress::default()));
     let groups: Vec<_> = all.iter().filter(|g| !g.folder).collect();
     assert_eq!(groups.len(), 1);
@@ -391,18 +391,18 @@ fn dups_size_only_finds_renamed_copies() {
 fn dups_min_size_and_cancel() {
     let (_tmp, tree, root) = dup_fixture();
     let tree = Arc::new(tree);
-    let big = DupOptions { root, min_size: 300_000, same_name: false, verify: true, exclude: Default::default() };
+    let big = DupOptions { root, min_size: 300_000, same_name: false, verify: true, exclude: Default::default(), versions: false };
     assert!(dup::find(tree.clone(), big, Arc::new(DupProgress::default())).is_empty());
     let p = Arc::new(DupProgress::default());
     p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default() };
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default(), versions: false };
     assert!(dup::find(tree, opt.clone(), p).is_empty(), "cancelled search returns nothing");
 }
 
 #[test]
 fn dups_csv_export() {
     let (_tmp, tree, root) = dup_fixture();
-    let groups = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() }, Arc::new(DupProgress::default()));
+    let groups = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default(), versions: false }, Arc::new(DupProgress::default()));
     let path = std::env::temp_dir().join(format!("wiz_dups_{}.csv", std::process::id()));
     dup::write_csv(&groups, &path).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
@@ -416,7 +416,7 @@ fn dups_csv_export() {
 #[test]
 fn dups_finds_identical_folders_and_partitions_mismatches() {
     let (_tmp, tree, root) = dup_fixture();
-    let all = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() }, Arc::new(DupProgress::default()));
+    let all = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default(), versions: false }, Arc::new(DupProgress::default()));
     let folders: Vec<_> = all.iter().filter(|g| g.folder).collect();
     // d1, d2, d3, d5 share the same signature (same.bin, 200000 bytes) but d3's
     // content differs: it must be split off, not sink the whole group.
@@ -436,7 +436,7 @@ fn dups_stream_groups_as_found() {
     let (_tmp, tree, root) = dup_fixture();
     let seen = std::sync::Mutex::new(0usize);
     let p = DupProgress::default();
-    dup::find_streaming(Arc::new(tree), DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default() }, &p, &|_| {
+    dup::find_streaming(Arc::new(tree), DupOptions { root, min_size: 1, same_name: false, verify: true, exclude: Default::default(), versions: false }, &p, &|_| {
         *seen.lock().unwrap() += 1;
     });
     assert!(*seen.lock().unwrap() >= 2, "file + folder groups were streamed");
@@ -576,7 +576,7 @@ fn mcp_tools_answer_from_the_index() {
 #[test]
 fn dups_quick_mode_uses_only_the_index() {
     let (_tmp, tree, root) = dup_fixture();
-    let opt = DupOptions { root, min_size: 1, same_name: false, verify: false, exclude: Default::default() };
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: false, exclude: Default::default(), versions: false };
     let groups = dup::find(Arc::new(tree), opt.clone(), Arc::new(DupProgress::default()));
     let files: Vec<_> = groups.iter().filter(|g| !g.folder).collect();
     // Quick mode always matches by name + size: d1, d2, d3 and d5 all have same.bin
@@ -599,7 +599,7 @@ fn init_cache() {
 fn hash_cache_second_search_reads_nothing() {
     let (tmp, tree, root) = dup_fixture();
     let tree = Arc::new(tree);
-    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() };
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default(), versions: false };
     let first = Arc::new(DupProgress::default());
     let g1 = dup::find(tree.clone(), opt.clone(), first.clone());
     assert!(first.bytes_read.load(std::sync::atomic::Ordering::Relaxed) > 0);
@@ -628,7 +628,7 @@ fn hash_cache_persists_to_disk() {
     init_cache();
     let path = crate::hashcache::default_path();
     let (tmp, tree, root) = dup_fixture();
-    let _ = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default() }, Arc::new(DupProgress::default()));
+    let _ = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true, exclude: Default::default(), versions: false }, Arc::new(DupProgress::default()));
     let bytes = std::fs::read(&path).expect("cache file written");
     assert!(bytes.starts_with(b"WZHC01"));
     let needle = tmp.0.to_string_lossy().to_lowercase();
@@ -640,7 +640,7 @@ fn dups_skip_excluded_folders() {
     let d2 = tree.find_path(&format!("{}\\d2", tree.full_path(root))).unwrap();
     let mut exclude = std::collections::HashSet::new();
     exclude.insert(d2);
-    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude };
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true, exclude, versions: false };
     let groups = dup::find(Arc::new(tree), opt.clone(), Arc::new(DupProgress::default()));
     // Without d2, the only same-name match left is d1/d5 (hard links: one file) → nothing.
     assert!(groups.iter().all(|g| g.files.iter().all(|f| !f.path.contains("\\d2"))), "d2 never examined");
@@ -721,4 +721,43 @@ fn dpapi_roundtrip() {
     assert!(!enc.contains("gsk_test"), "not stored in plain text");
     assert_eq!(crate::ai::unprotect(&enc).as_deref(), Some("gsk_test_123"));
     assert_eq!(crate::ai::unprotect("zz"), None);
+}
+#[test]
+fn dups_versions_mode_groups_by_name_and_folder() {
+    init_cache();
+    let base = std::env::temp_dir().join(format!("wiz_versions_{}", std::process::id()));
+    for d in ["drive_new\\Docs", "backup\\old\\Docs", "other\\Docs"] {
+        std::fs::create_dir_all(base.join(d)).unwrap();
+    }
+    std::fs::write(base.join("drive_new\\Docs\\plan.xlsx"), vec![1u8; 3000]).unwrap(); // newer, bigger
+    std::fs::write(base.join("backup\\old\\Docs\\plan.xlsx"), vec![2u8; 1000]).unwrap(); // old version
+    std::fs::write(base.join("other\\Docs\\notes.txt"), b"x").unwrap();
+    let mut b = Builder::new();
+    for e in walk(&base) {
+        let m = std::fs::metadata(&e).unwrap();
+        b.add(m.is_dir(), &e.parent().unwrap().to_string_lossy(), &e.file_name().unwrap().to_string_lossy(), (!m.is_dir()).then_some(m.len()), 1);
+    }
+    let tree = b.finish(&[], Instant::now(), String::new());
+    let root = tree.find_path(&base.to_string_lossy()).unwrap();
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: false, exclude: Default::default(), versions: true };
+    let groups = dup::find(Arc::new(tree), opt, Arc::new(DupProgress::default()));
+    let _ = std::fs::remove_dir_all(&base);
+    assert_eq!(groups.len(), 1, "plan.xlsx in two Docs folders, different sizes");
+    let g = &groups[0];
+    assert!(g.versions && !g.verified);
+    let mut sizes: Vec<u64> = g.files.iter().map(|f| f.size).collect();
+    sizes.sort();
+    assert_eq!(sizes, [1000, 3000]);
+    assert_eq!(g.wasted(), 1000, "keeping the newest frees the old copy");
+}
+#[test]
+fn smart_keep_prefers_the_official_copy() {
+    use crate::app::keep_score;
+    let s = |p: &str| keep_score(p, "").0;
+    assert!(s("C:\\Users\\me\\Documents\\plan.xlsx") > s("C:\\Users\\me\\Downloads\\plan.xlsx"));
+    assert!(s("D:\\Fotos\\viaje.jpg") > s("D:\\Fotos\\viaje (1).jpg"));
+    assert!(s("D:\\Music\\a.mp3") > s("D:\\Backup\\Music\\a.mp3"));
+    assert!(s("C:\\Users\\me\\Pictures\\x.png") > s("C:\\Users\\me\\AppData\\Local\\Temp\\x.png"));
+    // The preferred drive beats everything else.
+    assert!(keep_score("H:\\Mi unidad\\Backup\\a.mp3", "h:\\").0 > keep_score("C:\\Users\\me\\Music\\a.mp3", "h:\\").0);
 }

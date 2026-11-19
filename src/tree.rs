@@ -126,9 +126,13 @@ pub fn volume_label(drive: &str) -> String {
     let s = |b: &[u16]| String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]);
     let (mut label, fs) = (s(&label), s(&fs));
     // FAT-style labels are truncated by Windows ("me@gmail.com - Google...").
-    let google = label.contains("Google Drive") || label.ends_with("Google...") || label.ends_with("- Google");
+    // Google Drive labels are "<account> - Google Drive", often cut short by Windows
+    // ("me@gmail.com - Google...", "me@company.com - G...").
+    let truncated_account = label.contains('@') && label.ends_with("...") && label.contains(" - ");
+    let google = label.contains("Google") || truncated_account;
     if google && !label.contains("Google Drive") {
-        label = format!("{} Google Drive", label.trim_end_matches("...").trim_end_matches("Google").trim_end());
+        let account = label.split(" - ").next().unwrap_or(&label).trim().to_string();
+        label = format!("{account} - Google Drive");
     }
     if google {
         // Streaming: "My Drive" lives inside the virtual drive.

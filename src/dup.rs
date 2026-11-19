@@ -37,6 +37,8 @@ fn threads() -> usize {
 pub struct DupFile {
     pub path: String,
     pub modified: u64,
+    /// Size of this copy (versions can differ; identical copies share the group size).
+    pub size: u64,
 }
 
 #[derive(Clone)]
@@ -49,10 +51,17 @@ pub struct DupGroup {
     pub inner_files: u32,
     /// Content confirmed by hashing (false in quick mode).
     pub verified: bool,
+    /// Versions mode: same name and folder, content may differ.
+    pub versions: bool,
 }
 
 impl DupGroup {
     pub fn wasted(&self) -> u64 {
+        if self.versions {
+            // Keeping one version (the biggest, worst case) frees the rest.
+            let total: u64 = self.files.iter().map(|f| f.size).sum();
+            return total - self.files.iter().map(|f| f.size).max().unwrap_or(0);
+        }
         self.size * (self.files.len() as u64).saturating_sub(1)
     }
     pub fn name(&self) -> &str {
@@ -87,6 +96,9 @@ pub struct DupOptions {
     pub verify: bool,
     /// Folders (node ids) whose content is never examined.
     pub exclude: std::collections::HashSet<u32>,
+    /// Versions mode: group by name + parent folder name only (sizes and content
+    /// may differ, e.g. an old backup vs the current file in Google Drive). Index only.
+    pub versions: bool,
 }
 
 struct Cand {
@@ -452,6 +464,40 @@ fn verify_folders(f: &FolderCand, p: &DupProgress) -> Vec<Vec<usize>> {
 /// Streaming search: `on_group` is called from worker threads for every
 /// confirmed group (files and whole folders), as soon as it is found.
 pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_group: &(dyn Fn(DupGroup) + Sync)) {
+    // Versions mode: same file name inside a same-named folder, on any drive or
+    // path; sizes and content may differ. Nothing is read from disk.
+    if opt.versions {
+        p.stage.store(0, Ordering::Relaxed);
+        let mut by: HashMap<String, Vec<u32>> = HashMap::new();
+        for (k, id) in tree.files_under_skipping(opt.root, &opt.exclude).into_iter().enumerate() {
+            if k % 65_536 == 0 && p.cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let n = &tree.nodes[id as usize];
+            if n.size < opt.min_size.max(1) {
+                continue;
+            }
+            let key = format!("{}\\{}", tree.name(n.parent).to_lowercase(), tree.name(id).to_lowercase());
+            by.entry(key).or_default().push(id);
+        }
+        let groups: Vec<Vec<u32>> = by.into_values().filter(|v| v.len() > 1).collect();
+        p.groups_total.store(groups.len() as u64, Ordering::Relaxed);
+        p.stage.store(1, Ordering::Relaxed);
+        for ids in groups {
+            let files: Vec<DupFile> = ids
+                .iter()
+                .map(|&id| {
+                    let n = &tree.nodes[id as usize];
+                    DupFile { path: tree.full_path(id), modified: n.modified, size: n.size }
+                })
+                .collect();
+            let size = files.iter().map(|f| f.size).max().unwrap_or(0);
+            on_group(DupGroup { size, files, folder: false, inner_files: 0, verified: false, versions: true });
+            p.groups_done.fetch_add(1, Ordering::Relaxed);
+        }
+        return;
+    }
+
     // 1. Candidates from the in-memory index (no disk access).
     p.stage.store(0, Ordering::Relaxed);
     let mut by_key: HashMap<(u64, String), Vec<u32>> = HashMap::new();
@@ -519,10 +565,11 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
                         };
                         on_group(DupGroup {
                             size,
-                            files: paths.iter().map(|c| DupFile { path: c.path.clone(), modified: c.modified }).collect(),
+                            files: paths.iter().map(|c| DupFile { path: c.path.clone(), modified: c.modified, size }).collect(),
                             folder,
                             inner_files: inner,
                             verified: false,
+                                versions: false,
                         });
                         p.bytes_done.fetch_add(size * paths.len() as u64, Ordering::Relaxed);
                         p.groups_done.fetch_add(1, Ordering::Relaxed);
@@ -538,10 +585,11 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
                                 for class in compare_group(*size, &owned, p) {
                                     on_group(DupGroup {
                                         size: *size,
-                                        files: class.into_iter().map(|c| DupFile { path: c.path.clone(), modified: c.modified }).collect(),
+                                        files: class.into_iter().map(|c| DupFile { path: c.path.clone(), modified: c.modified, size: *size }).collect(),
                                         folder: false,
                                         inner_files: 0,
                                         verified: true,
+                                versions: false,
                                     });
                                 }
                             }
@@ -557,11 +605,12 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
                                     size: f.size,
                                     files: class
                                         .into_iter()
-                                        .map(|i| DupFile { path: f.folders[i].path.clone(), modified: f.folders[i].modified })
+                                        .map(|i| DupFile { path: f.folders[i].path.clone(), modified: f.folders[i].modified, size: f.size })
                                         .collect(),
                                     folder: true,
                                     inner_files: f.files,
                                     verified: true,
+                                versions: false,
                                 });
                             }
                             // Count the whole folder set as processed for the progress bar.

@@ -57,6 +57,8 @@ pub struct Settings {
     pub dup_exclude: Vec<String>,
     /// The suggested exclusions were applied once (so clearing the list sticks).
     pub dup_exclude_init: bool,
+    /// Drive whose copy always wins when marking duplicates/versions (e.g. "H:").
+    pub dup_prefer: String,
     /// Groq API key encrypted with DPAPI (hex); never stored in plain text.
     pub groq_key_enc: String,
 }
@@ -85,6 +87,7 @@ impl Settings {
             dup_exclude: Vec::new(),
             dup_exclude_init: false,
             groq_key_enc: String::new(),
+            dup_prefer: String::new(),
         };
         for line in text.lines() {
             let Some((k, v)) = line.split_once('=') else { continue };
@@ -102,6 +105,7 @@ impl Settings {
                 ("dup_exclude", v) if !v.is_empty() => s.dup_exclude.push(v.to_string()),
                 ("dup_exclude_init", v) => s.dup_exclude_init = v != "0",
                 ("groq_key", v) => s.groq_key_enc = v.to_string(),
+                ("dup_prefer", v) => s.dup_prefer = v.to_string(),
                 ("excluded_drives", v) => {
                     s.excluded_drives = v.split(',').map(str::trim).filter(|d| !d.is_empty()).map(String::from).collect()
                 }
@@ -125,7 +129,7 @@ impl Settings {
             if self.rings { "rings" } else { "treemap" },
             self.close_to_tray as u8,
             self.excluded_drives.join(","),
-        ) + &format!("dup_exclude_init={}\ngroq_key={}\n", self.dup_exclude_init as u8, self.groq_key_enc)
+        ) + &format!("dup_exclude_init={}\ngroq_key={}\ndup_prefer={}\n", self.dup_exclude_init as u8, self.groq_key_enc, self.dup_prefer)
             + &self.dup_exclude.iter().map(|d| format!("dup_exclude={d}\n")).collect::<String>()
     }
 

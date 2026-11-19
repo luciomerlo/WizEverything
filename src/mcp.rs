@@ -158,6 +158,7 @@ impl Server {
                     min_size: (a.get("min_size_mb").and_then(Value::as_f64).unwrap_or(1.0) * 1024.0 * 1024.0) as u64,
                     same_name: a.get("same_name").and_then(Value::as_bool).unwrap_or(true),
                     verify: a.get("verify").and_then(Value::as_bool).unwrap_or(true),
+                    versions: a.get("versions").and_then(Value::as_bool).unwrap_or(false),
                     // The app's saved exclusions plus any given here.
                     exclude: crate::i18n::Settings::load()
                         .dup_exclude
@@ -210,6 +211,7 @@ pub fn tools() -> Value {
             "same_name": { "type": "boolean", "description": "Only compare files with the same name (default true, faster)." },
             "verify": { "type": "boolean", "description": "Confirm by content hashes (default true). false = name + size only, reads nothing (safe for cloud drives)." },
             "all_drives": { "type": "boolean", "description": "Search every included drive when no path is given." },
+            "versions": { "type": "boolean", "description": "Old versions: same name and folder name on any drive, even if size/content differ. Index only." },
             "exclude": { "type": "array", "items": { "type": "string" }, "description": "Extra folders to skip (the app's saved exclusions always apply)." } } } },
         { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
