@@ -3,6 +3,20 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.7.0] - 2026-11-19
+
+### Added
+- Natural-language questions (Groq): question bar under the toolbar, answers tab, chosen model and its remaining quota next to Search. The model uses the read-only MCP tools on the loaded index, with automatic failover across every available model (best first); models known to be out of quota are tried last. Key entered in its own dialog, masked, stored with DPAPI.
+- `--ask "question"` command-line mode.
+- Duplicate exclusions: suggested defaults on first run, Clear and Suggested buttons.
+- Starts maximized; the native title bar turns black in dark mode.
+- Tree view: folders first, loose files after (unless sorting by the Folder column).
+
+### Fixed
+- Clipboard: paste and Copy path did nothing (eframe clipboard feature was off); links open through the Windows shell.
+- MCP: all-drives guard bypassed by an empty path; standalone server ignored excluded drives; assistant duplicate searches default to quick mode.
+- Hash cache: files read to the end are cached even when unique; the cache shortcut no longer forces full reads of uncached files.
+
 ## [0.6.0] - 2026-11-19
 
 ### Added

@@ -246,6 +246,7 @@ fn rows_follow_expansion_and_depth() {
     let rows = app::flatten_rows(&t, q, &exp, Some((Col::Name, true)));
     let got: Vec<(String, u16)> = rows.iter().map(|&(i, d)| (t.name(i).to_string(), d)).collect();
     let want = [("Q9:", 0), ("big.iso", 1), ("docs", 1), ("a.pdf", 2), ("b.PDF", 2), ("sub", 2), ("noext", 1)];
+    // (sorted by name: mixed, as in Explorer)
     assert_eq!(got, want.map(|(n, d)| (n.to_string(), d)));
 }
 
@@ -652,4 +653,72 @@ fn settings_keep_dup_exclusions() {
     s.dup_exclude = vec!["C:\\Windows".into(), "H:\\Mi unidad\\Backups".into()];
     let back = crate::i18n::Settings::parse(&s.to_text(), Lang::Es);
     assert_eq!(back.dup_exclude, ["C:\\Windows", "H:\\Mi unidad\\Backups"]);
+}
+#[test]
+fn rows_show_folders_before_files_unless_sorted_by_name() {
+    let t = sample();
+    let q = id(&t, D1);
+    let exp: HashSet<u32> = [q].into_iter().collect();
+    let names_of = |sort| app::flatten_rows(&t, q, &exp, sort).iter().skip(1).map(|r| t.name(r.0).to_string()).collect::<Vec<_>>();
+    // big.iso (1 MB) is bigger than docs, but folders come first.
+    assert_eq!(names_of(None), ["docs", "big.iso", "noext"]);
+    assert_eq!(names_of(Some((Col::Size, true))), ["docs", "noext", "big.iso"]);
+    assert_eq!(names_of(Some((Col::Name, true))), ["big.iso", "docs", "noext"]);
+}
+// ------------------------------------------------------------------ Groq (mocked)
+
+/// Fake Groq: lists two models; the first is out of quota, the second answers
+/// after one tool call.
+struct FakeGroq {
+    calls: std::sync::Mutex<Vec<String>>,
+}
+
+impl crate::ai::Transport for FakeGroq {
+    fn get(&self, _path: &str) -> Result<(u16, serde_json::Value), String> {
+        Ok((200, serde_json::json!({"data":[{"id":"openai/gpt-oss-120b"},{"id":"llama-3.3-70b-versatile"},{"id":"whisper-large-v3"}]})))
+    }
+    fn post(&self, _path: &str, body: &serde_json::Value) -> Result<(u16, serde_json::Value), String> {
+        let model = body["model"].as_str().unwrap().to_string();
+        self.calls.lock().unwrap().push(model.clone());
+        if model == "openai/gpt-oss-120b" {
+            return Ok((429, serde_json::json!({"error":{"message":"rate limit"},"_rl":{"req_left":0,"tok_left":0}})));
+        }
+        let msgs = body["messages"].as_array().unwrap();
+        if msgs.iter().any(|m| m["role"] == "tool") {
+            let tool = msgs.iter().rev().find(|m| m["role"] == "tool").unwrap()["content"].as_str().unwrap().to_string();
+            return Ok((200, serde_json::json!({"choices":[{"message":{"content": format!("ok {}", tool.contains("Q9:"))}}],"_rl":{"req_left":999,"tok_left":8000}})));
+        }
+        Ok((200, serde_json::json!({"choices":[{"message":{"content":null,"tool_calls":[{"id":"c1","type":"function","function":{"name":"drives","arguments":"{}"}}]}}]})))
+    }
+}
+
+#[test]
+fn groq_fails_over_to_a_model_with_quota() {
+    let fake = FakeGroq { calls: Default::default() };
+    let mut server = mcp_server();
+    let tried = std::sync::Mutex::new(Vec::new());
+    let (model, answer) = crate::ai::ask_auto(&fake, None, "¿unidades?", &mut server, true, &|m| tried.lock().unwrap().push(m.to_string())).unwrap();
+    assert_eq!(model, "llama-3.3-70b-versatile");
+    assert_eq!(answer, "ok true", "the tool ran against the index");
+    assert_eq!(*tried.lock().unwrap(), ["openai/gpt-oss-120b", "llama-3.3-70b-versatile"], "whisper is not a chat model");
+    assert_eq!(crate::ai::quota("llama-3.3-70b-versatile").unwrap().req_left, Some(999));
+    // Next question: the exhausted model is known and tried last.
+    let tried2 = std::sync::Mutex::new(Vec::new());
+    let (model2, _) = crate::ai::ask_auto(&fake, None, "otra", &mut server, true, &|m| tried2.lock().unwrap().push(m.to_string())).unwrap();
+    assert_eq!(model2, "llama-3.3-70b-versatile");
+    assert_eq!(tried2.lock().unwrap()[0], "llama-3.3-70b-versatile", "no attempt wasted on the exhausted model");
+}
+
+#[test]
+fn groq_model_ranking() {
+    let ids: Vec<String> = ["llama-3.1-8b-instant", "whisper-large-v3", "some/new-200b", "openai/gpt-oss-120b", "meta-llama/llama-guard-4-12b"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(crate::ai::rank_models(&ids), ["openai/gpt-oss-120b", "llama-3.1-8b-instant", "some/new-200b"]);
+}
+
+#[test]
+fn dpapi_roundtrip() {
+    let enc = crate::ai::protect("gsk_test_123").unwrap();
+    assert!(!enc.contains("gsk_test"), "not stored in plain text");
+    assert_eq!(crate::ai::unprotect(&enc).as_deref(), Some("gsk_test_123"));
+    assert_eq!(crate::ai::unprotect("zz"), None);
 }

@@ -172,7 +172,7 @@ fn classify(size: u64, paths: &[&str], p: &DupProgress, credit: bool) -> Vec<Vec
         let mut c = hashcache::global().lock().unwrap();
         (0..paths.len()).map(|i| keys[i].filter(|_| readers[i].is_some()).and_then(|k| c.get(paths[i], k))).collect()
     };
-    if live.iter().any(|&i| cached[i].is_some()) {
+    if live.iter().all(|&i| cached[i].is_some()) {
         let mut by: HashMap<u128, Vec<usize>> = HashMap::new();
         for &i in &live {
             let h = match cached[i] {

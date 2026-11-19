@@ -13,7 +13,7 @@ raw-window-handle = "0.6.2"
 serde_json = "1.0.154"
 tray-icon = "0.26.1"
 ureq = { version = "2", features = ["json"] }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_Shell", "Win32_Security", "Win32_Globalization", "Win32_UI_Controls_Dialogs", "Win32_System_SystemInformation", "Win32_UI_Controls", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_DataExchange", "Win32_System_LibraryLoader", "Win32_Storage_FileSystem", "Win32_System_Registry", "Win32_System_Threading", "Win32_System_Time", "Win32_UI_Shell", "Win32_Security", "Win32_Globalization", "Win32_UI_Controls_Dialogs", "Win32_System_SystemInformation", "Win32_UI_Controls", "Win32_Security_Cryptography", "Win32_Graphics_Dwm"] }
 xxhash-rust = { version = "0.8.21", features = ["xxh3"] }
 
 [profile.release]

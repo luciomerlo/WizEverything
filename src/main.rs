@@ -126,6 +126,31 @@ fn main() -> eframe::Result {
         mcp::serve();
         return Ok(());
     }
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--ask") {
+        // Command-line question: wizeverything.exe --ask "¿Qué ocupa más en C:?"
+        let question = args.get(i + 1).cloned().unwrap_or_default();
+        let settings = i18n::Settings::load();
+        i18n::set_lang(settings.lang);
+        let Some(key) = ai::unprotect(&settings.groq_key_enc) else {
+            println!("No Groq key saved (Options → Enter Groq key).");
+            return Ok(());
+        };
+        let groq = ai::Groq::new(key);
+        let excluded = settings.excluded_drives.clone();
+        let mut server = mcp::Server::new(Box::new(move || {
+            tree::load(std::sync::Arc::new(tree::Progress::default()), &excluded).map(std::sync::Arc::new)
+        }));
+        let spanish = settings.lang == i18n::Lang::Es;
+        match ai::ask_auto(&groq, None, &question, &mut server, spanish, &|m: &str| eprintln!("[trying {m}]")) {
+            Ok((model, answer)) => {
+                let q = ai::quota(&model);
+                println!("[{model} · requests left today: {:?} · tokens left this minute: {:?}]\n{answer}", q.and_then(|q| q.req_left), q.and_then(|q| q.tok_left));
+            }
+            Err(e) => println!("ERROR: {e}"),
+        }
+        return Ok(());
+    }
     let background = std::env::args().any(|a| a == "--background");
     if activate_existing_instance() {
         return Ok(());
@@ -137,6 +162,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title(TITLE)
             .with_inner_size([1280.0, 860.0])
+            .with_maximized(true)
             .with_min_inner_size([640.0, 420.0])
             .with_visible(!background)
             .with_icon(egui::IconData { rgba: icon_rgba(64), width: 64, height: 64 }),

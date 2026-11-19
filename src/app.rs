@@ -317,14 +317,15 @@ pub(crate) fn flatten_rows(tree: &Tree, root: u32, expanded: &HashSet<u32>, sort
     while let Some((id, d)) = stack.pop() {
         rows.push((id, d));
         if expanded.contains(&id) {
-            let ch = tree.children(id);
+            let mut v = tree.children(id).to_vec();
             if let Some((col, asc)) = sort {
-                let mut v = ch.to_vec();
                 sort_nodes(tree, &mut v, col, asc);
-                stack.extend(v.into_iter().rev().map(|c| (c, d + 1)));
-            } else {
-                stack.extend(ch.iter().rev().map(|&c| (c, d + 1)));
             }
+            // Folders first, loose files after — unless sorting by the Folder (name) column.
+            if !matches!(sort, Some((Col::Name, _))) {
+                v.sort_by_key(|&c| !tree.nodes[c as usize].is_dir()); // stable: keeps the size/column order
+            }
+            stack.extend(v.into_iter().rev().map(|c| (c, d + 1)));
         }
     }
     rows
@@ -403,6 +404,8 @@ pub struct App {
     dups: Dups,
     ctx_menu: Option<(MenuTarget, egui::Pos2)>,
     ai: Ai,
+    /// Dark/light state last applied to the native title bar.
+    title_dark: Option<bool>,
     highlight_cache: Option<(u32, u64, Arc<treemap::Highlight>)>,
 
     view_root: u32,
@@ -483,6 +486,7 @@ impl App {
             dups: Dups::default(),
             ctx_menu: None,
             ai: Ai::default(),
+            title_dark: None,
             highlight_cache: None,
             view_root: ROOT,
             selected: None,
@@ -522,6 +526,25 @@ impl App {
     fn set_error(&mut self, e: String) {
         self.error = Some(e);
         self.error_at = Instant::now();
+    }
+
+    /// Windows title bar follows the app theme (black in dark mode).
+    fn sync_title_bar(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
+        use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+        use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+        let dark = ctx.global_style().visuals.dark_mode;
+        if self.title_dark == Some(dark) {
+            return;
+        }
+        let Ok(handle) = frame.window_handle() else { return };
+        if let RawWindowHandle::Win32(w) = handle.as_raw() {
+            const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+            let value: i32 = dark.into();
+            unsafe {
+                DwmSetWindowAttribute(w.hwnd.get() as _, DWMWA_USE_IMMERSIVE_DARK_MODE, &value as *const i32 as _, 4);
+            }
+            self.title_dark = Some(dark);
+        }
     }
 
     fn set_info(&mut self, s: String) {
@@ -975,7 +998,8 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.sync_title_bar(ctx, frame);
         self.handle_tray(ctx);
         self.poll_load();
         self.poll_jobs(ctx);
@@ -1010,6 +1034,7 @@ impl eframe::App for App {
 
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &ctx, tree.as_deref()));
         egui::Panel::top("ask").show(ui, |ui| self.ask_bar(ui, &ctx));
+        self.groq_key_dialog(&ctx);
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, tree.as_deref()));
 
         let Some(tree) = tree else {
@@ -1070,7 +1095,6 @@ impl eframe::App for App {
             }
         });
         self.menu_ui(&ctx);
-        self.groq_key_dialog(&ctx);
         // Sorting / expanding marks the rows dirty during this frame: draw the
         // result right away instead of waiting for the next mouse move.
         if self.rows_dirty {
@@ -1646,20 +1670,11 @@ impl App {
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let groq = crate::ai::Groq::new(key);
-            let pick = |tx: &std::sync::mpsc::Sender<AiMsg>| {
-                let r = crate::ai::pick_model(&groq);
-                let _ = tx.send(AiMsg::Model(r.clone()));
-                r
-            };
             let mut server = crate::mcp::Server::new(Box::new(move || Ok(tree.clone())));
-            let r = (|| {
-                let model = match known { Some(m) => m, None => pick(&tx)? };
-                match crate::ai::ask(&groq, &model, &question, &mut server, spanish) {
-                    // Out of quota on this model: choose again and retry once.
-                    Err(e) if e.contains("Rate limited") => crate::ai::ask(&groq, &pick(&tx)?, &question, &mut server, spanish),
-                    other => other,
-                }
-            })();
+            let r = crate::ai::ask_auto(&groq, known.as_deref(), &question, &mut server, spanish, &|m: &str| {
+                let _ = tx.send(AiMsg::Model(Ok(m.to_string())));
+            })
+            .map(|(_, answer)| answer);
             let _ = tx.send(AiMsg::Answer(idx, r));
             ctx.request_repaint();
         });
@@ -1718,7 +1733,19 @@ impl App {
             } else if self.ai.picking {
                 tr("(eligiendo modelo…)", "(choosing model…)").to_string()
             } else {
-                format!("({})", self.ai.model.as_deref().unwrap_or(tr("modelo automático", "automatic model")))
+                match self.ai.model.as_deref() {
+                    None => format!("({})", tr("modelo automático", "automatic model")),
+                    Some(m) => match crate::ai::quota(m) {
+                        Some(q) => format!(
+                            "({m} · {} {} · {} {})",
+                            q.req_left.map_or("?".into(), fmt_int),
+                            tr("consultas/día", "requests/day"),
+                            q.tok_left.map_or("?".into(), fmt_int),
+                            tr("tokens/min", "tokens/min")
+                        ),
+                        None => format!("({m})"),
+                    },
+                }
             };
             ui.label(RichText::new(note).weak());
         });
@@ -2028,7 +2055,7 @@ impl App {
             );
             if edit.changed() {
                 self.settings.dup_exclude =
-                    self.dups.excl_text.lines().map(|l| l.trim().trim_end_matches('\\').to_string()).filter(|l| !l.is_empty()).collect();
+                    self.dups.excl_text.lines().map(|l| l.trim().replace('/', "\\").trim_end_matches('\\').to_string()).filter(|l| !l.is_empty()).collect();
                 self.settings.save();
             }
             let missing: Vec<&String> = self.settings.dup_exclude.iter().filter(|p| tree.find_path(p).is_none()).collect();

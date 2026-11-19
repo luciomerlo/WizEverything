@@ -150,7 +150,7 @@ impl Server {
                     .collect::<Vec<_>>()))
             }
             "find_duplicates" => {
-                if root == ROOT && a.get("path").is_none() && !a.get("all_drives").and_then(Value::as_bool).unwrap_or(false) {
+                if root == ROOT && !a.get("all_drives").and_then(Value::as_bool).unwrap_or(false) {
                     return Err("Give a 'path' to search (or all_drives=true; that can read a lot of data).".into());
                 }
                 let opt = DupOptions {
@@ -164,6 +164,7 @@ impl Server {
                         .into_iter()
                         .chain(a.get("exclude").and_then(Value::as_array).into_iter().flatten().filter_map(|v| v.as_str().map(String::from)))
                         .filter_map(|p| t.find_path(&p.replace('/', "\\")))
+                        .filter(|&id| id != ROOT)
                         .collect(),
                 };
                 let prog = Arc::new(DupProgress::default());
@@ -217,7 +218,9 @@ pub fn tools() -> Value {
 
 /// Serve MCP on stdin/stdout until stdin closes.
 pub fn serve() {
-    let mut server = Server::new(Box::new(|| tree::load(Arc::new(Progress::default()), &[]).map(Arc::new)));
+    let mut server = Server::new(Box::new(|| {
+        tree::load(Arc::new(Progress::default()), &crate::i18n::Settings::load().excluded_drives).map(Arc::new)
+    }));
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {

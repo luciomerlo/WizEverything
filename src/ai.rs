@@ -26,7 +26,35 @@ const PREFERRED: &[&str] = &[
 const NOT_CHAT: &[&str] = &["whisper", "tts", "guard", "playai", "orpheus", "embed", "distil", "compound"];
 
 const MAX_STEPS: usize = 8;
-const MAX_TOOL_CHARS: usize = 12_000;
+
+/// Last known quota per model (from response headers).
+#[derive(Clone, Copy, Debug)]
+pub struct Quota {
+    pub req_left: Option<u64>,
+    pub tok_left: Option<u64>,
+    pub at: std::time::Instant,
+}
+
+static QUOTAS: std::sync::Mutex<Option<std::collections::HashMap<String, Quota>>> = std::sync::Mutex::new(None);
+
+fn remember_quota(model: &str, v: &Value) {
+    let rl = &v["_rl"];
+    let q = Quota { req_left: rl["req_left"].as_u64(), tok_left: rl["tok_left"].as_u64(), at: std::time::Instant::now() };
+    if q.req_left.is_some() || q.tok_left.is_some() {
+        QUOTAS.lock().unwrap().get_or_insert_with(Default::default).insert(model.to_string(), q);
+    }
+}
+
+pub fn quota(model: &str) -> Option<Quota> {
+    QUOTAS.lock().unwrap().as_ref()?.get(model).copied()
+}
+
+/// Known to be out of quota: no requests left today, or almost no tokens left
+/// in the current minute (token quotas refill within a minute).
+fn exhausted(model: &str) -> bool {
+    quota(model).is_some_and(|q| q.req_left == Some(0) || (q.tok_left.is_some_and(|t| t < 1500) && q.at.elapsed().as_secs() < 60))
+}
+const MAX_TOOL_CHARS: usize = 4_000;
 
 /// HTTP access, abstracted so the agent can be tested without the network.
 pub trait Transport {
@@ -47,15 +75,30 @@ impl Groq {
         ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(90)).build()
     }
 
+    /// Groq reports the remaining quota in headers on every response; keep them
+    /// next to the body as _rl.
+    fn rate_headers(resp: &ureq::Response) -> Value {
+        let h = |n: &str| resp.header(n).and_then(|v| v.parse::<u64>().ok());
+        json!({
+            "req_left": h("x-ratelimit-remaining-requests"),
+            "tok_left": h("x-ratelimit-remaining-tokens"),
+            "req_limit": h("x-ratelimit-limit-requests"),
+            "tok_limit": h("x-ratelimit-limit-tokens"),
+        })
+    }
+
     fn reply(r: Result<ureq::Response, ureq::Error>) -> Result<(u16, Value), String> {
-        match r {
-            Ok(resp) => {
-                let code = resp.status();
-                resp.into_json::<Value>().map(|v| (code, v)).map_err(|e| e.to_string())
-            }
-            Err(ureq::Error::Status(code, resp)) => Ok((code, resp.into_json::<Value>().unwrap_or(Value::Null))),
-            Err(e) => Err(e.to_string()),
+        let (code, resp) = match r {
+            Ok(resp) => (resp.status(), resp),
+            Err(ureq::Error::Status(code, resp)) => (code, resp),
+            Err(e) => return Err(e.to_string()),
+        };
+        let rl = Self::rate_headers(&resp);
+        let mut v = resp.into_json::<Value>().unwrap_or(Value::Null);
+        if v.is_object() {
+            v["_rl"] = rl;
         }
+        Ok((code, v))
     }
 }
 
@@ -94,13 +137,13 @@ fn api_error(code: u16, v: &Value) -> String {
     let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("");
     match code {
         401 => "La clave de Groq no es válida / Invalid Groq API key".into(),
-        429 => format!("Sin cuota / Rate limited: {msg}"),
+        429 | 413 => format!("Rate limited: {msg}"),
         _ => format!("Groq HTTP {code}: {msg}"),
     }
 }
 
-/// Pick the best listed model that currently answers (has quota).
-pub fn pick_model(t: &dyn Transport) -> Result<String, String> {
+/// Chat models the account can use, best first.
+pub fn list_models(t: &dyn Transport) -> Result<Vec<String>, String> {
     let (code, v) = t.get("/models")?;
     if code != 200 {
         return Err(api_error(code, &v));
@@ -113,17 +156,42 @@ pub fn pick_model(t: &dyn Transport) -> Result<String, String> {
         .filter(|m| m.get("active").and_then(Value::as_bool).unwrap_or(true))
         .filter_map(|m| m.get("id").and_then(Value::as_str).map(String::from))
         .collect();
-    let mut last = String::from("No hay modelos de chat disponibles / No chat models available");
-    for m in rank_models(&ids) {
-        let probe = json!({ "model": m, "messages": [{ "role": "user", "content": "ok" }], "max_completion_tokens": 1 });
-        let (code, v) = t.post("/chat/completions", &probe)?;
-        match code {
-            200 => return Ok(m),
-            401 => return Err(api_error(code, &v)),
-            _ => last = api_error(code, &v), // 429 no quota, 400/404 not usable: try the next one
+    Ok(rank_models(&ids))
+}
+
+/// Ask with automatic failover: start with `preferred` (if still listed), then
+/// try every other model best-first until one answers. Only an invalid key
+/// stops early. `on_model` is told which model is being tried.
+pub fn ask_auto(
+    t: &dyn Transport,
+    preferred: Option<&str>,
+    question: &str,
+    server: &mut mcp::Server,
+    spanish: bool,
+    on_model: &dyn Fn(&str),
+) -> Result<(String, String), String> {
+    let mut order = list_models(t)?;
+    if let Some(p) = preferred
+        && let Some(i) = order.iter().position(|m| m == p)
+    {
+        let m = order.remove(i);
+        order.insert(0, m);
+    }
+    // Models known to be out of quota go last instead of wasting an attempt.
+    order.sort_by_key(|m| exhausted(m));
+    if order.is_empty() {
+        return Err("No hay modelos de chat disponibles / No chat models available".into());
+    }
+    let mut errors = Vec::new();
+    for m in order {
+        on_model(&m);
+        match ask(t, &m, question, server, spanish) {
+            Ok(answer) => return Ok((m, answer)),
+            Err(e) if e.contains("Invalid Groq API key") => return Err(e),
+            Err(e) => errors.push(format!("{m}: {e}")),
         }
     }
-    Err(last)
+    Err(format!("Ningún modelo pudo responder / No model could answer:\n{}", errors.join("\n")))
 }
 
 fn system_prompt(spanish: bool) -> String {
@@ -154,22 +222,27 @@ pub fn ask(t: &dyn Transport, model: &str, question: &str, server: &mut mcp::Ser
     for _ in 0..MAX_STEPS {
         let body = json!({ "model": model, "messages": messages, "tools": tools, "tool_choice": "auto", "temperature": 0.2 });
         let (code, v) = t.post("/chat/completions", &body)?;
+        remember_quota(model, &v);
         if code != 200 {
             return Err(api_error(code, &v));
         }
         let msg = v.pointer("/choices/0/message").cloned().unwrap_or(Value::Null);
         let calls = msg.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
         if calls.is_empty() {
-            return Ok(msg.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string());
+            let text = msg.get("content").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            return if text.is_empty() { Err("Empty answer (the model stopped early); try again".into()) } else { Ok(text) };
         }
         messages.push(json!({ "role": "assistant", "content": msg.get("content").cloned().unwrap_or(Value::Null), "tool_calls": calls }));
         for call in &calls {
             let name = call.pointer("/function/name").and_then(Value::as_str).unwrap_or("");
-            let args: Value = call
+            let mut args: Value = call
                 .pointer("/function/arguments")
                 .and_then(Value::as_str)
                 .and_then(|s| serde_json::from_str(s).ok())
                 .unwrap_or(json!({}));
+            if name == "find_duplicates" && args.get("verify").is_none() {
+                args["verify"] = json!(false); // quick by default: never read whole disks unasked
+            }
             let mut out = match server.call_tool(name, &args) {
                 Ok(v) => v.to_string(),
                 Err(e) => format!("{{\"error\":{}}}", Value::String(e)),
