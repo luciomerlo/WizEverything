@@ -20,6 +20,10 @@ pub struct Layout {
     pub owner: Vec<u32>,
     /// Rectángulo de cada nodo dibujado (carpetas incluidas), para resaltar selección.
     pub rects: std::collections::HashMap<u32, R>,
+    /// Ring chart only: (start angle, end angle, depth) of each drawn arc.
+    pub arcs: std::collections::HashMap<u32, [f32; 3]>,
+    /// Ring chart only: (center x, center y, inner radius, ring width) in pixels.
+    pub geom: Option<[f32; 4]>,
 }
 
 const HEIGHT: f32 = 0.38;
@@ -27,14 +31,18 @@ const SCALE: f32 = 0.91;
 const AMBIENT: f32 = 0.15;
 const MIN_SIDE: f32 = 1.0;
 
+/// A rectangle to paint: node, rect, cushion surface coefficients, base color.
+struct Leaf {
+    id: u32,
+    r: R,
+    s: [f32; 4],
+    color: [u8; 3],
+}
+
 struct Ctx<'a> {
     tree: &'a Tree,
-    width: usize,
-    height: usize,
-    pixels: Vec<[u8; 4]>,
-    owner: Vec<u32>,
+    leaves: Vec<Leaf>,
     rects: std::collections::HashMap<u32, R>,
-    light: [f32; 3],
     highlight_ext: Option<u32>,
 }
 
@@ -54,28 +62,7 @@ fn ridge(s: &mut [f32; 4], r: R, h: f32) {
 
 impl Ctx<'_> {
     fn paint(&mut self, id: u32, r: R, s: &[f32; 4], color: [u8; 3]) {
-        let x0 = r.x.round().max(0.0) as usize;
-        let x1 = ((r.x + r.w).round() as usize).min(self.width);
-        let y0 = r.y.round().max(0.0) as usize;
-        let y1 = ((r.y + r.h).round() as usize).min(self.height);
-        let [lx, ly, lz] = self.light;
-        let (cr, cg, cb) = (color[0] as f32, color[1] as f32, color[2] as f32);
-        for y in y0..y1 {
-            let ny = -(2.0 * s[3] * (y as f32 + 0.5) + s[2]);
-            let row = y * self.width;
-            for x in x0..x1 {
-                let nx = -(2.0 * s[1] * (x as f32 + 0.5) + s[0]);
-                let cos = (nx * lx + ny * ly + lz) / (nx * nx + ny * ny + 1.0).sqrt();
-                let i = (AMBIENT + (1.0 - AMBIENT) * cos.max(0.0)) * 1.25;
-                self.pixels[row + x] = [
-                    (cr * i).min(255.0) as u8,
-                    (cg * i).min(255.0) as u8,
-                    (cb * i).min(255.0) as u8,
-                    255,
-                ];
-                self.owner[row + x] = id;
-            }
-        }
+        self.leaves.push(Leaf { id, r, s: *s, color });
     }
 
     fn node(&mut self, id: u32, r: R, mut s: [f32; 4], h: f32) {
@@ -83,7 +70,7 @@ impl Ctx<'_> {
         let n = &tree.nodes[id as usize];
         self.rects.insert(id, r);
         ridge(&mut s, r, h);
-        if !n.is_dir {
+        if !n.is_dir() {
             let mut c = tree.exts[n.ext as usize].color;
             if let Some(e) = self.highlight_ext
                 && e != n.ext
@@ -99,8 +86,8 @@ impl Ctx<'_> {
             self.paint(id, r, &s, c);
             return;
         }
-        let kids: Vec<(u32, f64)> = n
-            .children
+        let kids: Vec<(u32, f64)> = tree
+            .children(id)
             .iter()
             .map(|&c| (c, tree.nodes[c as usize].size as f64))
             .filter(|c| c.1 > 0.0)
@@ -166,22 +153,67 @@ pub fn squarify(items: &[(u32, f64)], rect: R, total: f64, out: &mut Vec<(u32, R
     }
 }
 
+/// Pixel range [start, end) covered by a span, with consistent rounding so
+/// neighbouring rectangles share edges without gaps or overlaps.
+fn span(a: f32, len: f32, max: usize) -> (usize, usize) {
+    ((a.round().max(0.0) as usize).min(max), (((a + len).round().max(0.0)) as usize).min(max))
+}
+
+/// Run `f(first_row, rows_of_pixels, rows_of_owner)` over horizontal bands in parallel.
+pub fn par_bands(
+    width: usize,
+    pixels: &mut [[u8; 4]],
+    owner: &mut [u32],
+    f: impl Fn(usize, &mut [[u8; 4]], &mut [u32]) + Sync,
+) {
+    let height = if width == 0 { 0 } else { pixels.len() / width };
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).max(1);
+    let rows = height.div_ceil(threads).max(1);
+    std::thread::scope(|s| {
+        for (i, (px, ow)) in pixels.chunks_mut(rows * width).zip(owner.chunks_mut(rows * width)).enumerate() {
+            let f = &f;
+            s.spawn(move || f(i * rows, px, ow));
+        }
+    });
+}
+
 pub fn build(tree: &Tree, root: u32, width: usize, height: usize, highlight_ext: Option<u32>) -> Layout {
-    let (lx, ly, lz) = (-1.0f32, -1.0f32, 10.0f32);
-    let len = (lx * lx + ly * ly + lz * lz).sqrt();
-    let mut ctx = Ctx {
-        tree,
-        width,
-        height,
-        pixels: vec![[30, 30, 30, 255]; width * height],
-        owner: vec![u32::MAX; width * height],
-        rects: Default::default(),
-        light: [lx / len, ly / len, lz / len],
-        highlight_ext,
-    };
+    let mut ctx = Ctx { tree, leaves: Vec::new(), rects: Default::default(), highlight_ext };
     if width > 0 && height > 0 {
         let r = R { x: 0.0, y: 0.0, w: width as f32, h: height as f32 };
         ctx.node(root, r, [0.0; 4], HEIGHT);
     }
-    Layout { width, height, root, pixels: ctx.pixels, owner: ctx.owner, rects: ctx.rects }
+
+    // Cushion shading, rasterized in horizontal bands on every core.
+    let (lx, ly, lz) = (-1.0f32, -1.0f32, 10.0f32);
+    let len = (lx * lx + ly * ly + lz * lz).sqrt();
+    let (lx, ly, lz) = (lx / len, ly / len, lz / len);
+    let mut pixels = vec![[30, 30, 30, 255]; width * height];
+    let mut owner = vec![u32::MAX; width * height];
+    let leaves = &ctx.leaves;
+    par_bands(width, &mut pixels, &mut owner, |y_start, px, ow| {
+        let y_end = y_start + px.len() / width.max(1);
+        for leaf in leaves {
+            let (x0, x1) = span(leaf.r.x, leaf.r.w, width);
+            let (y0, y1) = span(leaf.r.y, leaf.r.h, height);
+            let (y0, y1) = (y0.max(y_start), y1.min(y_end));
+            if x0 >= x1 || y0 >= y1 {
+                continue;
+            }
+            let s = &leaf.s;
+            let (cr, cg, cb) = (leaf.color[0] as f32, leaf.color[1] as f32, leaf.color[2] as f32);
+            for y in y0..y1 {
+                let ny = -(2.0 * s[3] * (y as f32 + 0.5) + s[2]);
+                let row = (y - y_start) * width;
+                for x in x0..x1 {
+                    let nx = -(2.0 * s[1] * (x as f32 + 0.5) + s[0]);
+                    let cos = (nx * lx + ny * ly + lz) / (nx * nx + ny * ny + 1.0).sqrt();
+                    let i = (AMBIENT + (1.0 - AMBIENT) * cos.max(0.0)) * 1.25;
+                    px[row + x] = [(cr * i).min(255.0) as u8, (cg * i).min(255.0) as u8, (cb * i).min(255.0) as u8, 255];
+                    ow[row + x] = leaf.id;
+                }
+            }
+        }
+    });
+    Layout { width, height, root, pixels, owner, rects: ctx.rects, arcs: Default::default(), geom: None }
 }

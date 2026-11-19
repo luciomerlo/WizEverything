@@ -184,11 +184,11 @@ fn rd_str<'a>(b: &'a [u8], at: &mut usize) -> &'a [u16] {
     *at += len * 2 + 2;
     // El buffer viene de un Vec<u8>; puede no estar alineado a 2, así que lo
     // reinterpretamos solo si lo está, si no copiamos (raro en la práctica).
-    if (bytes.as_ptr() as usize) % 2 == 0 {
+    if (bytes.as_ptr() as usize).is_multiple_of(2) {
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, len) }
     } else {
         // Leak controlado: no debería ocurrir porque Everything alinea los datos.
-        let v: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let v: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         Box::leak(v.into_boxed_slice())
     }
 }
@@ -200,16 +200,56 @@ pub fn for_each_item(
     mut f: impl FnMut(Item<'_>),
     mut progress: impl FnMut(u32, u32),
 ) -> Result<(), String> {
-    let reply = ReplyWindow::new()?;
+    // Pipeline: a fetcher thread asks Everything for the next page while this
+    // thread parses the current one.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(2);
+    let search_owned = search.to_string();
+    let fetcher = std::thread::spawn(move || {
+        let reply = match ReplyWindow::new() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        let mut offset = 0u32;
+        loop {
+            let page = query_page(&reply, &search_owned, offset, PAGE);
+            let (num, total) = match &page {
+                Ok(d) if d.len() >= 20 => (rd_u32(d, 4), rd_u32(d, 0)),
+                _ => (0, 0),
+            };
+            let failed = page.is_err();
+            if tx.send(page).is_err() || failed || num == 0 {
+                return;
+            }
+            offset += num;
+            if offset >= total {
+                return;
+            }
+        }
+    });
+    let result = parse_pages(rx, &mut f, &mut progress);
+    let _ = fetcher.join();
+    result
+}
+
+fn parse_pages(
+    rx: std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    f: &mut impl FnMut(Item<'_>),
+    progress: &mut impl FnMut(u32, u32),
+) -> Result<(), String> {
     let mut offset = 0u32;
     loop {
-        let data = query_page(&reply, search, offset, PAGE)?;
+        let Ok(data) = rx.recv() else { return Ok(()) };
+        let data = data?;
         if data.len() < 20 {
             return Err(tr("Respuesta IPC inválida", "Invalid IPC reply").into());
         }
         let total = rd_u32(&data, 0);
         let num = rd_u32(&data, 4);
         let request = rd_u32(&data, 12);
+        progress(offset, total); // permite reservar memoria antes de procesar
         for i in 0..num as usize {
             let flags = rd_u32(&data, 20 + i * 8);
             let mut at = rd_u32(&data, 20 + i * 8 + 4) as usize;

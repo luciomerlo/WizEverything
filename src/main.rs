@@ -2,10 +2,14 @@
 
 mod app;
 mod autostart;
+mod dup;
 mod everything;
 mod i18n;
 mod tree;
+mod sunburst;
 mod treemap;
+#[cfg(test)]
+mod tests;
 
 use std::sync::mpsc::channel;
 
@@ -17,37 +21,75 @@ use app::TrayCmd;
 
 const TITLE: &str = "WizEverything";
 
-/// Ícono generado: un mini treemap de 4 colores.
-fn icon_rgba(size: u32) -> Vec<u8> {
-    let mut v = Vec::with_capacity((size * size * 4) as usize);
-    let s = size as f32;
-    for y in 0..size {
-        for x in 0..size {
-            let (fx, fy) = (x as f32 / s, y as f32 / s);
-            let border = x == 0 || y == 0 || x == size - 1 || y == size - 1;
-            let c: [u8; 3] = if border {
-                [20, 20, 20]
-            } else if fx < 0.58 {
-                [0, 92, 255]
-            } else if fy < 0.55 {
-                [255, 40, 40]
-            } else if fx < 0.8 {
-                [40, 200, 40]
-            } else {
-                [255, 210, 0]
-            };
-            // líneas divisorias
-            let line = (fx - 0.58).abs() < 1.0 / s
-                || (fx > 0.58 && (fy - 0.55).abs() < 1.0 / s)
-                || (fx > 0.58 && fy > 0.55 && (fx - 0.8).abs() < 1.0 / s);
-            let c = if line { [20, 20, 20] } else { c };
-            v.extend_from_slice(&[c[0], c[1], c[2], 255]);
+/// Icon: an Everything-style magnifying glass whose lens ring is split into
+/// three colors (blue / red / green), rendered with 4×4 supersampling.
+pub fn icon_rgba(size: u32) -> Vec<u8> {
+    const SS: u32 = 4;
+    const RING: [[f32; 3]; 3] = [[0.0, 92.0, 255.0], [255.0, 40.0, 40.0], [40.0, 200.0, 40.0]];
+    // Lens up-right, handle down-left (tilted to the right, like Everything's icon).
+    let (cx, cy) = (0.59f32, 0.41f32);
+    let (r_out, r_in) = (0.36f32, 0.235f32);
+    let (h0, h1, hw) = ((0.36f32, 0.64f32), (0.07f32, 0.93f32), 0.075f32);
+
+    let sample = |x: f32, y: f32| -> [f32; 4] {
+        // Handle: rounded segment.
+        let (dx, dy) = (h1.0 - h0.0, h1.1 - h0.1);
+        let t = (((x - h0.0) * dx + (y - h0.1) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        let (px, py) = (h0.0 + t * dx, h0.1 + t * dy);
+        let dh = ((x - px).powi(2) + (y - py).powi(2)).sqrt();
+        let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        if d <= r_out + 0.025 && d >= r_in - 0.025 {
+            // Dark outline around the ring for contrast on any background.
+            if d > r_out || d < r_in {
+                return [25.0, 25.0, 25.0, 255.0];
+            }
+            let ang = (y - cy).atan2(x - cx).to_degrees(); // -180..180
+            let a = (ang + 90.0 + 360.0) % 360.0; // 0 at top, clockwise
+            let c = RING[(a / 120.0) as usize % 3];
+            // Light from top-left gives the ring some depth.
+            let shade = 1.0 + 0.25 * (-(x - cx) - (y - cy)) / r_out;
+            return [c[0] * shade, c[1] * shade, c[2] * shade, 255.0];
+        }
+        if d < r_in - 0.025 {
+            // Glass: light tint with a highlight in the upper-left.
+            let hl = ((x - (cx - 0.08)).powi(2) + (y - (cy - 0.08)).powi(2)).sqrt();
+            let g = if hl < 0.08 { 255.0 } else { 225.0 };
+            return [g, g + 5.0_f32.min(255.0 - g), 255.0, 235.0];
+        }
+        if dh <= hw {
+            let edge = dh > hw - 0.022;
+            let v = if edge { 25.0 } else { 70.0 + 50.0 * (1.0 - t) };
+            return [v, v, v, 255.0];
+        }
+        [0.0, 0.0, 0.0, 0.0]
+    };
+
+    let mut out = Vec::with_capacity((size * size * 4) as usize);
+    for py in 0..size {
+        for px in 0..size {
+            let mut acc = [0f32; 4];
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) / size as f32;
+                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / size as f32;
+                    let s = sample(x, y);
+                    let a = s[3] / 255.0;
+                    acc[0] += s[0].min(255.0) * a;
+                    acc[1] += s[1].min(255.0) * a;
+                    acc[2] += s[2].min(255.0) * a;
+                    acc[3] += a;
+                }
+            }
+            let n = (SS * SS) as f32;
+            let a = acc[3] / n;
+            let (r, g, b) = if acc[3] > 0.0 { (acc[0] / acc[3], acc[1] / acc[3], acc[2] / acc[3]) } else { (0.0, 0.0, 0.0) };
+            out.extend_from_slice(&[r as u8, g as u8, b as u8, (a * 255.0).round() as u8]);
         }
     }
-    v
+    out
 }
 
-/// Si ya hay una instancia corriendo, la muestra y devuelve true.
+/// If another instance is already running, bring it to the front and return true.
 fn activate_existing_instance() -> bool {
     use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
     use windows_sys::Win32::System::Threading::CreateMutexW;
@@ -70,6 +112,11 @@ fn activate_existing_instance() -> bool {
 }
 
 fn main() -> eframe::Result {
+    if std::env::args().any(|a| a == "--write-icon") {
+        // Dev helper: dump the icon as raw RGBA for previews.
+        let _ = std::fs::write("icon256.rgba", icon_rgba(256));
+        return Ok(());
+    }
     let background = std::env::args().any(|a| a == "--background");
     if activate_existing_instance() {
         return Ok(());
@@ -93,9 +140,9 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             let (tx, rx) = channel::<TrayCmd>();
 
-            // Bandeja del sistema
-            let menu = Menu::new();
+            // System tray
             use i18n::tr;
+            let menu = Menu::new();
             let open = MenuItem::new(tr("Abrir", "Open"), true, None);
             let refresh = MenuItem::new(tr("Actualizar", "Refresh"), true, None);
             let auto = CheckMenuItem::new(tr("Iniciar con Windows", "Start with Windows"), true, autostart::is_enabled(), None);
@@ -109,8 +156,6 @@ fn main() -> eframe::Result {
                 .build()
                 .ok();
             let has_tray = tray.is_some();
-            // mantener vivo el ícono durante toda la ejecución
-            std::mem::forget(tray);
 
             let (open_id, refresh_id, auto_id, quit_id) = (open.id().clone(), refresh.id().clone(), auto.id().clone(), quit.id().clone());
             let ctx = cc.egui_ctx.clone();
@@ -145,6 +190,7 @@ fn main() -> eframe::Result {
 
             let mut app = app::App::new(&cc.egui_ctx, rx, has_tray, background, settings);
             app.tray_items = Some(app::TrayItems { open, refresh, auto, quit });
+            app.tray_icon = tray;
             Ok(Box::new(app))
         }),
     )
