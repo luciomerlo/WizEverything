@@ -46,6 +46,8 @@ pub struct DupGroup {
     pub folder: bool,
     /// Number of files inside each folder (folders only).
     pub inner_files: u32,
+    /// Content confirmed by hashing (false in quick mode).
+    pub verified: bool,
 }
 
 impl DupGroup {
@@ -75,6 +77,9 @@ pub struct DupOptions {
     pub root: u32,
     pub min_size: u64,
     pub same_name: bool,
+    /// Advanced mode: confirm by content (hashes). Quick mode only matches the
+    /// index (name + size, folder signatures) and never reads a file.
+    pub verify: bool,
 }
 
 struct Cand {
@@ -188,22 +193,32 @@ fn compare_group<'a>(size: u64, cands: &'a [Cand], p: &DupProgress) -> Vec<Vec<&
 }
 
 /// Split a big group by the hash of its first block, one file at a time.
-fn presplit<'a>(cands: &'a [Cand], p: &DupProgress) -> Vec<Vec<&'a Cand>> {
+fn presplit<'a>(size: u64, cands: &'a [Cand], p: &DupProgress) -> Vec<Vec<&'a Cand>> {
     let mut by: HashMap<u64, Vec<&'a Cand>> = HashMap::new();
     let mut buf = vec![0u8; FIRST_BLOCK];
     for c in cands {
         if p.cancel.load(Ordering::Relaxed) {
             return Vec::new();
         }
-        if is_not_local(&c.path) {
+        let opened = if is_not_local(&c.path) {
             p.skipped.fetch_add(1, Ordering::Relaxed);
-            continue;
+            None
+        } else {
+            std::fs::File::open(&c.path).ok().and_then(|mut f| read_full(&mut f, &mut buf).ok())
+        };
+        match opened {
+            Some(n) => {
+                by.entry(xxh3_64(&buf[..n])).or_default().push(c);
+            }
+            None => {
+                p.bytes_done.fetch_add(size, Ordering::Relaxed);
+            }
         }
-        let Ok(mut f) = std::fs::File::open(&c.path) else { continue };
-        let Ok(n) = read_full(&mut f, &mut buf) else { continue };
-        by.entry(xxh3_64(&buf[..n])).or_default().push(c);
     }
-    by.into_values().filter(|v| v.len() > 1).collect()
+    let (keep, drop): (Vec<_>, Vec<_>) = by.into_values().partition(|v| v.len() > 1);
+    // Files that turned out unique are done: count them for the progress bar.
+    p.bytes_done.fetch_add(size * drop.len() as u64, Ordering::Relaxed);
+    keep
 }
 
 /// Split same-size files into classes of identical content (indices into
@@ -213,6 +228,15 @@ fn partition(size: u64, paths: &[String], p: &DupProgress) -> Vec<Vec<usize>> {
         .iter()
         .map(|path| if is_not_local(path) { None } else { std::fs::File::open(path).ok() })
         .collect();
+    // Paths that are the same physical file (hard links) free nothing: keep one.
+    let mut seen = std::collections::HashSet::new();
+    for f in files.iter_mut() {
+        if let Some(id) = f.as_ref().and_then(file_id)
+            && !seen.insert(id)
+        {
+            *f = None;
+        }
+    }
     let mut classes: Vec<Vec<usize>> = vec![(0..paths.len()).filter(|&i| files[i].is_some()).collect()];
     classes.retain(|c| c.len() > 1);
     let (mut offset, mut block) = (0u64, FIRST_BLOCK);
@@ -231,7 +255,6 @@ fn partition(size: u64, paths: &[String], p: &DupProgress) -> Vec<Vec<usize>> {
             for i in class {
                 let Some(f) = files[i].as_mut() else { continue };
                 if matches!(read_full(f, &mut buf[..want]), Ok(n) if n == want) {
-                    p.bytes_done.fetch_add(want as u64, Ordering::Relaxed);
                     split.entry(xxh3_64(&buf[..want])).or_default().push(i);
                 } else {
                     files[i] = None;
@@ -248,6 +271,9 @@ fn partition(size: u64, paths: &[String], p: &DupProgress) -> Vec<Vec<usize>> {
 
 /// A candidate set of identical folders: same content signature (names + sizes).
 struct FolderCand {
+    /// Index of this candidate group, and of the group holding all its parents.
+    gid: usize,
+    parent: Option<usize>,
     size: u64,
     files: u32,
     folders: Vec<Cand>,
@@ -271,7 +297,7 @@ impl Work {
 
 /// Folder signatures computed bottom-up from the index (no disk access):
 /// a folder's signature hashes the sorted (name, size | sub-signature) of its children.
-fn folder_candidates(tree: &Tree, root: u32, min_size: u64) -> Vec<FolderCand> {
+fn folder_candidates(tree: &Tree, root: u32, min_size: u64, cancel: &AtomicBool) -> Vec<FolderCand> {
     let mut dirs = Vec::new();
     let mut stack = vec![root];
     while let Some(id) = stack.pop() {
@@ -283,7 +309,10 @@ fn folder_candidates(tree: &Tree, root: u32, min_size: u64) -> Vec<FolderCand> {
     dirs.sort_unstable_by(|a, b| b.cmp(a)); // children have larger ids: deepest first
     let mut sig: HashMap<u32, u64> = HashMap::with_capacity(dirs.len());
     let mut entries: Vec<u64> = Vec::new();
-    for &d in &dirs {
+    for (k, &d) in dirs.iter().enumerate() {
+        if k % 16_384 == 0 && cancel.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         entries.clear();
         for &c in tree.children(d) {
             let n = &tree.nodes[c as usize];
@@ -313,8 +342,8 @@ fn folder_candidates(tree: &Tree, root: u32, min_size: u64) -> Vec<FolderCand> {
     }
     let groups: Vec<Vec<u32>> = by_sig.into_values().filter(|v| v.len() > 1).collect();
 
-    // Drop nested matches: if every member's parent is in one same group, the
-    // parents are already reported as identical folders.
+    // Nested matches are verified too, unless their parent group is confirmed
+    // as a whole first (then they're redundant).
     let mut group_of: HashMap<u32, usize> = HashMap::new();
     for (i, g) in groups.iter().enumerate() {
         for &d in g {
@@ -322,12 +351,14 @@ fn folder_candidates(tree: &Tree, root: u32, min_size: u64) -> Vec<FolderCand> {
         }
     }
     let mut out = Vec::new();
-    for g in &groups {
+    for (gid, g) in groups.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return Vec::new();
+        }
         let parent_groups: std::collections::HashSet<Option<usize>> =
             g.iter().map(|&d| group_of.get(&tree.nodes[d as usize].parent).copied()).collect();
-        if parent_groups.len() == 1 && parent_groups.iter().next().is_some_and(|x| x.is_some()) {
-            continue;
-        }
+        // Nested match: every member's parent is in one same candidate group.
+        let parent = if parent_groups.len() == 1 { parent_groups.into_iter().next().flatten() } else { None };
         let first = g[0];
         let base = tree.full_path(first);
         let mut rel: Vec<(String, u64)> = tree
@@ -337,6 +368,8 @@ fn folder_candidates(tree: &Tree, root: u32, min_size: u64) -> Vec<FolderCand> {
             .collect();
         rel.sort_by_key(|r| std::cmp::Reverse(r.1));
         out.push(FolderCand {
+            gid,
+            parent,
             size: tree.nodes[first as usize].size,
             files: tree.nodes[first as usize].files,
             folders: g.iter().map(|&d| Cand { path: tree.full_path(d), modified: tree.nodes[d as usize].modified }).collect(),
@@ -373,12 +406,16 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
     // 1. Candidates from the in-memory index (no disk access).
     p.stage.store(0, Ordering::Relaxed);
     let mut by_key: HashMap<(u64, String), Vec<u32>> = HashMap::new();
-    for id in tree.files_under(opt.root) {
+    for (k, id) in tree.files_under(opt.root).into_iter().enumerate() {
+        if k % 65_536 == 0 && p.cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let n = &tree.nodes[id as usize];
         if n.size < opt.min_size.max(1) {
             continue;
         }
-        let name = if opt.same_name { tree.name(id).to_lowercase() } else { String::new() };
+        // Quick mode has nothing else to go on, so it always requires the same name.
+        let name = if opt.same_name || !opt.verify { tree.name(id).to_lowercase() } else { String::new() };
         by_key.entry((n.size, name)).or_default().push(id);
     }
     let mut work: Vec<Work> = by_key
@@ -389,7 +426,10 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
             Work::Files(size, c)
         })
         .collect();
-    work.extend(folder_candidates(&tree, opt.root, opt.min_size).into_iter().map(Work::Folders));
+    if p.cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    work.extend(folder_candidates(&tree, opt.root, opt.min_size, &p.cancel).into_iter().map(Work::Folders));
     drop(tree);
     // Biggest potential savings first, so the most useful results show up early.
     work.sort_by_key(|w| std::cmp::Reverse(w.potential()));
@@ -410,6 +450,8 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
 
     // 2. Compare contents on a small thread pool.
     p.stage.store(1, Ordering::Relaxed);
+    let max_gid = work.iter().map(|w| if let Work::Folders(f) = w { f.gid + 1 } else { 0 }).max().unwrap_or(0);
+    let whole: Vec<AtomicBool> = (0..max_gid).map(|_| AtomicBool::new(false)).collect();
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
         for _ in 0..threads() {
@@ -420,10 +462,27 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
                     }
                     let i = next.fetch_add(1, Ordering::Relaxed);
                     let Some(w) = work.get(i) else { break };
+                    if !opt.verify {
+                        // Quick mode: report the index match as is, no disk access.
+                        let (size, folder, inner, paths) = match w {
+                            Work::Files(s, c) => (*s, false, 0, c),
+                            Work::Folders(f) => (f.size, true, f.files, &f.folders),
+                        };
+                        on_group(DupGroup {
+                            size,
+                            files: paths.iter().map(|c| DupFile { path: c.path.clone(), modified: c.modified }).collect(),
+                            folder,
+                            inner_files: inner,
+                            verified: false,
+                        });
+                        p.bytes_done.fetch_add(size * paths.len() as u64, Ordering::Relaxed);
+                        p.groups_done.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     match w {
                         Work::Files(size, cands) => {
                             let parts: Vec<Vec<&Cand>> =
-                                if cands.len() > MAX_OPEN { presplit(cands, p) } else { vec![cands.iter().collect()] };
+                                if cands.len() > MAX_OPEN { presplit(*size, cands, p) } else { vec![cands.iter().collect()] };
                             for part in parts {
                                 let owned: Vec<Cand> =
                                     part.iter().map(|c| Cand { path: c.path.clone(), modified: c.modified }).collect();
@@ -433,13 +492,18 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
                                         files: class.into_iter().map(|c| DupFile { path: c.path.clone(), modified: c.modified }).collect(),
                                         folder: false,
                                         inner_files: 0,
+                                        verified: true,
                                     });
                                 }
                             }
                         }
                         Work::Folders(f) => {
-                            let before = p.bytes_done.load(Ordering::Relaxed);
-                            for class in verify_folders(f, p) {
+                            let redundant = f.parent.is_some_and(|pg| whole.get(pg).is_some_and(|w| w.load(Ordering::Relaxed)));
+                            let classes = if redundant { Vec::new() } else { verify_folders(f, p) };
+                            if classes.len() == 1 && classes[0].len() == f.folders.len() {
+                                whole[f.gid].store(true, Ordering::Relaxed);
+                            }
+                            for class in classes {
                                 on_group(DupGroup {
                                     size: f.size,
                                     files: class
@@ -448,11 +512,11 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
                                         .collect(),
                                     folder: true,
                                     inner_files: f.files,
+                                    verified: true,
                                 });
                             }
                             // Count the whole folder set as processed for the progress bar.
-                            let read = p.bytes_done.load(Ordering::Relaxed) - before;
-                            p.bytes_done.fetch_add((f.size * f.folders.len() as u64).saturating_sub(read), Ordering::Relaxed);
+                            p.bytes_done.fetch_add(f.size * f.folders.len() as u64, Ordering::Relaxed);
                         }
                     }
                     p.groups_done.fetch_add(1, Ordering::Relaxed);

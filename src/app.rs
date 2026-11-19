@@ -49,13 +49,15 @@ struct DupView {
     sort: Sort,
     /// Display order of the groups of this kind (recomputed when the key changes).
     order: Vec<usize>,
-    key: (usize, Sort),
+    key: (usize, Sort, u64),
 }
 
 /// State of the duplicates tab.
 struct Dups {
     min_mb: f64,
     same_name: bool,
+    /// Advanced mode (hash the content) vs quick mode (index only).
+    verify: bool,
     scope_all: bool,
     job: Option<DupJob>,
     groups: Vec<DupGroup>,
@@ -74,6 +76,7 @@ impl Default for Dups {
         Self {
             min_mb: 1.0,
             same_name: true,
+            verify: true,
             scope_all: false,
             job: None,
             groups: Vec::new(),
@@ -116,7 +119,7 @@ pub(crate) type Sort = Option<(Col, bool)>;
 /// File type categories for the "File types" panel. "Others" catches the rest.
 /// (Spanish name, English name, extensions.) Extensions without a dot are matched
 /// lowercase; the empty string is "no extension".
-const CATEGORIES: &[(&str, &str, &[&str])] = &[
+pub(crate) const CATEGORIES: &[(&str, &str, &[&str])] = &[
     ("Video", "Video", &[
         "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "3gp", "ts", "m2ts", "mts", "vob",
         "mxf", "divx", "rm", "rmvb", "ogv", "f4v", "asf", "m2v",
@@ -177,11 +180,11 @@ const CATEGORIES: &[(&str, &str, &[&str])] = &[
 /// highlight_ext values with this bit set mean a whole category (low bits = index).
 const CAT_FLAG: u32 = 0x8000_0000;
 
-fn category_of(ext: &str) -> usize {
+pub(crate) fn category_of(ext: &str) -> usize {
     CATEGORIES.iter().position(|(_, _, exts)| exts.contains(&ext)).unwrap_or(CATEGORIES.len() - 1)
 }
 
-fn category_name(c: usize) -> &'static str {
+pub(crate) fn category_name(c: usize) -> &'static str {
     let (es, en, _) = CATEGORIES[c];
     tr(es, en)
 }
@@ -1518,6 +1521,7 @@ impl App {
             root: if self.dups.scope_all { ROOT } else { self.view_root },
             min_size: (self.dups.min_mb * 1024.0 * 1024.0) as u64,
             same_name: self.dups.same_name,
+            verify: self.dups.verify,
         };
         let prog = Arc::new(DupProgress::default());
         let p = prog.clone();
@@ -1580,6 +1584,7 @@ impl App {
     fn dups_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tree: &Tree) {
         // --- options
         ui.horizontal_wrapped(|ui| {
+            let opts_before = (self.dups.min_mb, self.dups.same_name, self.dups.scope_all, self.dups.verify);
             ui.label(tr("Buscar en:", "Search in:"));
             let here = if self.view_root == ROOT { tr("Todas", "All").to_string() } else { tree.full_path(self.view_root) };
             ui.radio_value(&mut self.dups.scope_all, false, format!("{} ({here})", tr("vista actual", "current view")));
@@ -1591,14 +1596,35 @@ impl App {
             ui.separator();
             ui.label(tr("Tamaño mínimo", "Minimum size"));
             ui.add(egui::DragValue::new(&mut self.dups.min_mb).range(0.0..=1_000_000.0).speed(0.5).suffix(" MB"));
-            ui.checkbox(&mut self.dups.same_name, tr("Mismo nombre", "Same name")).on_hover_text(tr(
+            ui.separator();
+            ui.label(tr("Modo:", "Mode:"));
+            ui.selectable_value(&mut self.dups.verify, false, tr("Rápido", "Quick")).on_hover_text(tr(
+                "Solo nombre y tamaño, desde el índice. No lee ningún archivo: instantáneo y seguro con Google Drive en streaming. Resultados sin verificar.",
+                "Name and size only, from the index. Reads no file: instant and safe with streamed Google Drive. Results are unverified.",
+            ));
+            ui.selectable_value(&mut self.dups.verify, true, tr("Avanzado", "Advanced")).on_hover_text(tr(
+                "Confirma el contenido con hash (lee los archivos; omite los que están solo en la nube).",
+                "Confirms content with hashes (reads the files; skips cloud-only ones).",
+            ));
+            ui.add_enabled(self.dups.verify, egui::Checkbox::new(&mut self.dups.same_name, tr("Mismo nombre", "Same name"))).on_hover_text(tr(
                 "Activado: solo compara archivos con igual nombre y tamaño (rápido).\nDesactivado: compara todos los de igual tamaño (encuentra copias renombradas).",
                 "On: only compares files with the same name and size (fast).\nOff: compares every file of the same size (finds renamed copies).",
             ));
+            // Changing an option while searching restarts the search with the new values.
+            if opts_before != (self.dups.min_mb, self.dups.same_name, self.dups.scope_all, self.dups.verify)
+                && let Some(job) = self.dups.job.take()
+            {
+                job.prog.cancel.store(true, Ordering::Relaxed);
+                self.start_dups(ctx);
+            }
             ui.separator();
             if let Some(job) = &self.dups.job {
                 if ui.button(tr("✖ Cancelar", "✖ Cancel")).clicked() {
                     job.prog.cancel.store(true, Ordering::Relaxed);
+                    // Keep what was found; the worker winds down on its own.
+                    self.dups.groups.extend(job.rx.try_iter());
+                    self.dups.last_secs = job.started.elapsed().as_secs_f64();
+                    self.dups.job = None;
                 }
             } else if ui.button(RichText::new(tr("Buscar duplicados", "Find duplicates")).strong()).clicked() {
                 self.start_dups(ctx);
@@ -1717,6 +1743,16 @@ impl App {
                     "If a drive has no Recycle Bin, Windows will ask before deleting permanently.",
                 ))
                 .weak());
+                let unverified = self.dups.groups.iter().any(|g| !g.verified && g.files.iter().any(|f| self.dups.marked.contains(&f.path)));
+                if unverified {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        tr(
+                            "Hay grupos sin verificar (modo rápido): comprobá el contenido antes de borrar, o usá el modo Avanzado.",
+                            "Some groups are unverified (quick mode): check the content before deleting, or use Advanced mode.",
+                        ),
+                    );
+                }
                 if all_marked > 0 {
                     ui.colored_label(
                         ui.visuals().error_fg_color,
@@ -1757,9 +1793,16 @@ impl App {
         }
 
         // --- results: files on the left, whole folders on the right
-        ui.columns(2, |cols| {
-            self.dup_table(&mut cols[0], ctx, tree, false);
-            self.dup_table(&mut cols[1], ctx, tree, true);
+        // Draggable split between files and folders, each side between 10% and 90%.
+        let w = ui.available_width().max(200.0);
+        egui::Panel::left("dup_files_pane")
+            .resizable(true)
+            .default_size(w * 0.5)
+            .size_range(w * 0.1..=w * 0.9)
+            .show(ui, |ui| self.dup_table(ui, ctx, tree, false));
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            ui.add_space(2.0);
+            self.dup_table(ui, ctx, tree, true);
         });
     }
 
@@ -1779,10 +1822,28 @@ impl App {
             ui.label(RichText::new(format!("{} · {} {}", fmt_int(count as u64), fmt_size(wasted), tr("recuperables", "reclaimable"))).weak());
         });
         let view = &mut self.dups.views[k];
-        let order_key = (self.dups.groups.len(), view.sort);
+        let order_key = (self.dups.groups.len(), view.sort, self.dups.min_mb.to_bits());
         if order_key != view.key {
             let groups = &self.dups.groups;
-            let mut order: Vec<usize> = (0..groups.len()).filter(|&i| groups[i].folder == folders).collect();
+            let min = (self.dups.min_mb * 1024.0 * 1024.0) as u64;
+            let mut order: Vec<usize> = (0..groups.len()).filter(|&i| groups[i].folder == folders && groups[i].size >= min).collect();
+            if folders {
+                // Hide nested matches: all copies sit inside the copies of another folder group.
+                let mut owner: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+                for &i in &order {
+                    for f in &groups[i].files {
+                        owner.insert(f.path.to_lowercase(), i);
+                    }
+                }
+                order.retain(|&i| {
+                    let parents: HashSet<Option<usize>> = groups[i]
+                        .files
+                        .iter()
+                        .map(|f| f.path.rsplit_once('\\').and_then(|(d, _)| owner.get(&d.to_lowercase()).copied()))
+                        .collect();
+                    !(parents.len() == 1 && parents.iter().next().is_some_and(|x| x.is_some_and(|g| g != i)))
+                });
+            }
             let (col, asc) = view.sort.unwrap_or((Col::Alloc, false));
             let newest = |g: &DupGroup| g.files.iter().map(|f| f.modified).max().unwrap_or(0);
             order.sort_by(|&a, &b| {
@@ -1846,6 +1907,12 @@ impl App {
                                         file_icon(ui, [150, 150, 150]);
                                     }
                                     let label = ui.label(RichText::new(grp.name()).strong());
+                                    if !grp.verified {
+                                        ui.label(RichText::new("≈").weak()).on_hover_text(tr(
+                                            "Sin verificar: coinciden nombre y tamaño (modo rápido)",
+                                            "Unverified: name and size match (quick mode)",
+                                        ));
+                                    }
                                     if grp.folder {
                                         label.on_hover_text(format!("{} {}", fmt_int(grp.inner_files as u64), tr("archivos idénticos en cada copia", "identical files in each copy")));
                                     }

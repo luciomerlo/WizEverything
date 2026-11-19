@@ -5,6 +5,7 @@ mod autostart;
 mod dup;
 mod everything;
 mod i18n;
+mod mcp;
 mod tree;
 mod sunburst;
 mod treemap;
@@ -115,6 +116,12 @@ fn main() -> eframe::Result {
     if std::env::args().any(|a| a == "--write-icon") {
         // Dev helper: dump the icon as raw RGBA for previews.
         let _ = std::fs::write("icon256.rgba", icon_rgba(256));
+        return Ok(());
+    }
+    if std::env::args().any(|a| a == "--mcp") {
+        // MCP server on stdio for AI assistants; runs alongside the desktop app.
+        i18n::set_lang(i18n::Lang::En);
+        mcp::serve();
         return Ok(());
     }
     let background = std::env::args().any(|a| a == "--background");

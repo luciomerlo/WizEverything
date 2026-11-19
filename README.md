@@ -25,7 +25,8 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 - **Live updates**: changed files are synced from Everything every 30 s (deletions show on refresh / every 30 min).
 
 ### Duplicates
-- Candidates come straight from the index: **same name + size** (fast) or **same size only** (finds renamed copies).
+- **Quick mode**: name + size straight from the index, reads no file (safe with streamed Google Drive); results marked as unverified.
+- **Advanced mode**: candidates by **same name + size** or **same size only** (finds renamed copies), confirmed by content.
 - **Progressive block comparison** (64 KB → 8 MB blocks, xxh3): files are dropped as soon as they differ,
   so non-duplicates are rarely read to the end. Runs on every core, biggest savings first.
 - **Duplicate folders**: whole folders with identical content, detected by an index-only signature
@@ -39,6 +40,25 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 - Light / dark / system theme, English / Spanish UI (defaults to the Windows language).
 - System tray, single instance, **close to tray** option, **Start with Windows** (`--background`, index preloaded).
 
+## Use it from an AI (MCP server)
+
+`wizeverything.exe --mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio,
+using the same Everything index. It can run alongside the desktop app.
+
+Tools: `drives`, `folder_sizes`, `largest_files`, `file_types`, `find_duplicates` (read-only;
+`verify: false` = name + size only, reads no file), `refresh`.
+
+Claude Code:
+
+```powershell
+claude mcp add wizeverything -- "C:\path\to\wizeverything.exe" --mcp
+```
+
+Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{ "mcpServers": { "wizeverything": { "command": "C:\\path\\to\\wizeverything.exe", "args": ["--mcp"] } } }
+```
 ## How it works
 
 Everything exposes its index through a documented IPC protocol (`WM_COPYDATA`, the SDK's `QUERY2` request).

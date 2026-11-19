@@ -35,6 +35,8 @@ pub struct Node {
     pub folders: u32,
     first: u32,
     count: u32,
+    /// Slots reserved in kids for this node's children (>= count).
+    cap: u32,
 }
 
 impl Node {
@@ -122,8 +124,13 @@ pub fn volume_label(drive: &str) -> String {
         return String::new();
     }
     let s = |b: &[u16]| String::from_utf16_lossy(&b[..b.iter().position(|&c| c == 0).unwrap_or(b.len())]);
-    let (label, fs) = (s(&label), s(&fs));
-    if label.contains("Google Drive") {
+    let (mut label, fs) = (s(&label), s(&fs));
+    // FAT-style labels are truncated by Windows ("me@gmail.com - Google...").
+    let google = label.contains("Google Drive") || label.ends_with("Google...") || label.ends_with("- Google");
+    if google && !label.contains("Google Drive") {
+        label = format!("{} Google Drive", label.trim_end_matches("...").trim_end_matches("Google").trim_end());
+    }
+    if google {
         // Streaming: "My Drive" lives inside the virtual drive.
         // Mirroring: "My Drive" is a local folder, so the virtual drive doesn't have it.
         let base = drive.trim_end_matches('\\');
@@ -161,6 +168,21 @@ pub fn real_file_alloc(path: &str, cluster: u64) -> Option<u64> {
     Some(s.div_ceil(cluster) * cluster)
 }
 
+/// Split a path into tree levels. A network path keeps its prefix on the first
+/// level (\\server\share\x -> \\server, share, x), matching how the
+/// builder names the root of a network share.
+pub fn path_parts(path: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = path;
+    if let Some(r) = path.strip_prefix("\\\\") {
+        let end = r.find('\\').map_or(path.len(), |i| i + 2);
+        out.push(&path[..end]);
+        rest = &path[end..];
+    }
+    out.extend(rest.split('\\').filter(|p| !p.is_empty()));
+    out
+}
+
 fn ext_of(name: &str) -> String {
     match name.rfind('.') {
         Some(i) if i > 0 && i + 1 < name.len() => name[i + 1..].to_lowercase(),
@@ -185,6 +207,7 @@ fn new_node(nodes: &mut Vec<Node>, names: &mut String, name: &str, parent: u32, 
         folders: 0,
         first: 0,
         count: 0,
+        cap: 0,
     });
     id
 }
@@ -351,6 +374,9 @@ impl Builder {
         let slot = nodes[p].first + nodes[p].count;
         kids[slot as usize] = id as u32;
         nodes[p].count += 1;
+    }
+    for node in nodes.iter_mut() {
+        node.cap = node.count;
     }
     // Sort every children slice in parallel: node ranges map to contiguous,
     // disjoint ranges of `kids` (offsets are prefix sums in node order).
@@ -546,7 +572,7 @@ impl Tree {
 
     pub fn find_path(&self, path: &str) -> Option<u32> {
         let mut id = ROOT;
-        for part in path.split('\\').filter(|p| !p.is_empty()) {
+        for part in path_parts(path) {
             id = if id == ROOT {
                 self.find_drive(part)?
             } else {
@@ -658,14 +684,24 @@ impl Tree {
         }
     }
 
+    /// Append a child. Slices grow geometrically (spare slots are reserved), so a
+    /// sync that adds many files to one big folder doesn't copy it every time.
     fn push_child(&mut self, parent: u32, child: u32) {
-        let (f, c) = (self.nodes[parent as usize].first as usize, self.nodes[parent as usize].count as usize);
-        let new_first = self.kids.len() as u32;
-        self.kids.extend_from_within(f..f + c);
-        self.kids.push(child);
-        let p = &mut self.nodes[parent as usize];
-        p.first = new_first;
-        p.count += 1;
+        let n = self.nodes[parent as usize];
+        let (f, c, cap) = (n.first as usize, n.count as usize, n.cap as usize);
+        if c < cap {
+            self.kids[f + c] = child;
+        } else {
+            let new_cap = (c * 2).max(4);
+            let new_first = self.kids.len();
+            self.kids.extend_from_within(f..f + c);
+            self.kids.push(child);
+            self.kids.resize(new_first + new_cap, 0);
+            let p = &mut self.nodes[parent as usize];
+            p.first = new_first as u32;
+            p.cap = new_cap as u32;
+        }
+        self.nodes[parent as usize].count += 1;
     }
 
     fn resort(&mut self, id: u32) {
@@ -676,7 +712,7 @@ impl Tree {
 
     fn ensure_dir(&mut self, path: &str) -> u32 {
         let mut id = ROOT;
-        for part in path.split('\\').filter(|p| !p.is_empty()) {
+        for part in path_parts(path) {
             let found = if id == ROOT { self.find_drive(part) } else { self.find_child(id, part, true) };
             id = match found {
                 Some(c) => c,
@@ -795,6 +831,7 @@ impl Tree {
         }
         root.first = self.kids.len() as u32;
         root.count = included.len() as u32;
+        root.cap = root.count;
         self.kids.extend_from_slice(&included);
         self.nodes[ROOT as usize] = root;
         self.resort(ROOT);

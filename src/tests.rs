@@ -195,6 +195,33 @@ fn tree_memory_is_compact() {
     assert!(std::mem::size_of::<crate::tree::Node>() <= 64, "node grew to {}", std::mem::size_of::<crate::tree::Node>());
 }
 
+#[test]
+fn tree_sync_reserves_child_slots() {
+    let mut t = sample();
+    let before = t.memory();
+    let changes: Vec<Change> =
+        (0..2000).map(|i| Change { dir: "Q9:\\docs".into(), name: format!("n{i}.txt"), size: 1, modified: 1 }).collect();
+    assert_eq!(t.apply_changes(&changes), 2000);
+    assert_eq!(t.children(id(&t, "Q9:\\docs")).len(), 2003);
+    // Geometric growth: far below the ~2000²/2 slots a copy-per-insert would need.
+    assert!(t.memory() - before < 2_000_000, "grew {} bytes", t.memory() - before);
+    assert!(t.find_path("Q9:\\docs\\n1999.txt").is_some());
+}
+
+#[test]
+fn unc_paths_roundtrip() {
+    assert_eq!(crate::tree::path_parts("\\\\nas\\share\\a\\b.txt"), ["\\\\nas", "share", "a", "b.txt"]);
+    assert_eq!(crate::tree::path_parts("C:\\x"), ["C:", "x"]);
+    let mut b = Builder::new();
+    b.add(false, "\\\\nas\\share\\media", "song.mp3", Some(5), 1);
+    let mut t = b.finish(&[], Instant::now(), String::new());
+    let song = t.find_path("\\\\nas\\share\\media\\song.mp3").expect("UNC lookup");
+    assert_eq!(t.full_path(song), "\\\\nas\\share\\media\\song.mp3");
+    t.apply_changes(&[Change { dir: "\\\\nas\\share\\media".into(), name: "x.mp3".into(), size: 7, modified: 1 }]);
+    assert_eq!(t.drives.len(), 1, "sync into a share doesn't create a phantom drive");
+    assert_eq!(t.nodes[ROOT as usize].size, 12);
+}
+
 // ------------------------------------------------------------------ rows / sorting
 
 #[test]
@@ -331,7 +358,7 @@ fn short(path: &str) -> String {
 #[test]
 fn dups_same_name_confirms_by_full_hash_and_skips_hardlinks() {
     let (_tmp, tree, root) = dup_fixture();
-    let opt = DupOptions { root, min_size: 1, same_name: true };
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true };
     let all = dup::find(Arc::new(tree), opt, Arc::new(DupProgress::default()));
     let groups: Vec<_> = all.iter().filter(|g| !g.folder).collect();
     assert_eq!(groups.len(), 1, "one file group");
@@ -349,7 +376,7 @@ fn dups_same_name_confirms_by_full_hash_and_skips_hardlinks() {
 #[test]
 fn dups_size_only_finds_renamed_copies() {
     let (_tmp, tree, root) = dup_fixture();
-    let opt = DupOptions { root, min_size: 1, same_name: false };
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true };
     let all = dup::find(Arc::new(tree), opt, Arc::new(DupProgress::default()));
     let groups: Vec<_> = all.iter().filter(|g| !g.folder).collect();
     assert_eq!(groups.len(), 1);
@@ -362,24 +389,24 @@ fn dups_size_only_finds_renamed_copies() {
 fn dups_min_size_and_cancel() {
     let (_tmp, tree, root) = dup_fixture();
     let tree = Arc::new(tree);
-    let big = DupOptions { root, min_size: 300_000, same_name: false };
+    let big = DupOptions { root, min_size: 300_000, same_name: false, verify: true };
     assert!(dup::find(tree.clone(), big, Arc::new(DupProgress::default())).is_empty());
     let p = Arc::new(DupProgress::default());
     p.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-    let opt = DupOptions { root, min_size: 1, same_name: false };
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: true };
     assert!(dup::find(tree, opt, p).is_empty(), "cancelled search returns nothing");
 }
 
 #[test]
 fn dups_csv_export() {
     let (_tmp, tree, root) = dup_fixture();
-    let groups = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true }, Arc::new(DupProgress::default()));
+    let groups = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true }, Arc::new(DupProgress::default()));
     let path = std::env::temp_dir().join(format!("wiz_dups_{}.csv", std::process::id()));
     dup::write_csv(&groups, &path).unwrap();
     let text = std::fs::read_to_string(&path).unwrap();
     std::fs::remove_file(&path).ok();
-    // header + 2 file paths + 3 identical folders (d1, d2, d5)
-    assert_eq!(text.lines().count(), 6, "{text}");
+    // header + 2 file paths + 2 identical folders (d2 and d1/d5, which are hard links)
+    assert_eq!(text.lines().count(), 5, "{text}");
     assert!(text.contains(",File,200000,"));
     assert!(text.contains(",Folder,200000,"));
 }
@@ -387,16 +414,19 @@ fn dups_csv_export() {
 #[test]
 fn dups_finds_identical_folders_and_partitions_mismatches() {
     let (_tmp, tree, root) = dup_fixture();
-    let all = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true }, Arc::new(DupProgress::default()));
+    let all = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true }, Arc::new(DupProgress::default()));
     let folders: Vec<_> = all.iter().filter(|g| g.folder).collect();
     // d1, d2, d3, d5 share the same signature (same.bin, 200000 bytes) but d3's
     // content differs: it must be split off, not sink the whole group.
     assert_eq!(folders.len(), 1, "one folder group");
     let mut names: Vec<String> = folders[0].files.iter().map(|f| f.path.rsplit('\\').next().unwrap().to_string()).collect();
     names.sort();
-    assert_eq!(names, ["d1", "d2", "d5"]);
+    // d5 is a hard link of d1 (same physical file): only one of them counts.
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert!(names.contains(&"d2".to_string()));
+    assert!(names.iter().any(|n| n == "d1" || n == "d5"));
     assert_eq!(folders[0].inner_files, 1);
-    assert_eq!(folders[0].wasted(), 2 * 200_000);
+    assert_eq!(folders[0].wasted(), 200_000);
 }
 
 #[test]
@@ -404,7 +434,7 @@ fn dups_stream_groups_as_found() {
     let (_tmp, tree, root) = dup_fixture();
     let seen = std::sync::Mutex::new(0usize);
     let p = DupProgress::default();
-    dup::find_streaming(Arc::new(tree), DupOptions { root, min_size: 1, same_name: false }, &p, &|_| {
+    dup::find_streaming(Arc::new(tree), DupOptions { root, min_size: 1, same_name: false, verify: true }, &p, &|_| {
         *seen.lock().unwrap() += 1;
     });
     assert!(*seen.lock().unwrap() >= 2, "file + folder groups were streamed");
@@ -494,4 +524,61 @@ fn live_full_load() {
         assert!((n.parent as usize) < i);
     }
     println!("{} nodes, {} MB, {} ms", t.nodes.len(), t.memory() / (1024 * 1024), t.load_ms);
+}
+
+// ------------------------------------------------------------------ MCP
+
+fn mcp_server() -> crate::mcp::Server {
+    crate::mcp::Server::new(Box::new(|| Ok(sample())))
+}
+
+fn call(s: &mut crate::mcp::Server, name: &str, args: serde_json::Value) -> serde_json::Value {
+    let req = serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":name,"arguments":args}});
+    let r = s.handle(&req).expect("reply");
+    let text = r.pointer("/result/content/0/text").and_then(|v| v.as_str()).expect("text").to_string();
+    serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text))
+}
+
+#[test]
+fn mcp_handshake_and_tools() {
+    let mut s = mcp_server();
+    let init = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}})).unwrap();
+    assert_eq!(init["result"]["serverInfo"]["name"], "wizeverything");
+    assert!(s.handle(&serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
+    let list = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
+    let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["drives", "folder_sizes", "largest_files", "file_types", "find_duplicates", "refresh"]);
+    let bad = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"nope"})).unwrap();
+    assert_eq!(bad["error"]["code"], -32601);
+}
+
+#[test]
+fn mcp_tools_answer_from_the_index() {
+    let mut s = mcp_server();
+    let f = call(&mut s, "folder_sizes", serde_json::json!({"path":"Q9:\\","limit":2}));
+    assert_eq!(f["folder"]["size"], 1_005_111);
+    assert_eq!(f["largest_children"][0]["path"], "Q9:\\big.iso");
+    assert_eq!(f["largest_children"].as_array().unwrap().len(), 2);
+    let l = call(&mut s, "largest_files", serde_json::json!({"name_contains":"pdf"}));
+    assert_eq!(l.as_array().unwrap().len(), 2);
+    let ft = call(&mut s, "file_types", serde_json::json!({"path":"Q9:\\docs"}));
+    assert!(ft.as_array().unwrap().iter().any(|c| c["top_extensions"][0]["ext"] == "pdf"));
+    let d = call(&mut s, "drives", serde_json::json!({}));
+    assert_eq!(d.as_array().unwrap().len(), 2);
+    let missing = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"folder_sizes","arguments":{"path":"Z:\\nope"}}})).unwrap();
+    assert_eq!(missing["result"]["isError"], true);
+    let guard = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"find_duplicates","arguments":{}}})).unwrap();
+    assert_eq!(guard["result"]["isError"], true, "whole-PC duplicate scans need an explicit opt-in");
+}
+#[test]
+fn dups_quick_mode_uses_only_the_index() {
+    let (_tmp, tree, root) = dup_fixture();
+    let opt = DupOptions { root, min_size: 1, same_name: false, verify: false };
+    let groups = dup::find(Arc::new(tree), opt, Arc::new(DupProgress::default()));
+    let files: Vec<_> = groups.iter().filter(|g| !g.folder).collect();
+    // Quick mode always matches by name + size: d1, d2, d3 and d5 all have same.bin
+    // (d3's content differs, which only the advanced mode can tell).
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].files.len(), 4);
+    assert!(groups.iter().all(|g| !g.verified));
 }

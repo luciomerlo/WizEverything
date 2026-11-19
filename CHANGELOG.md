@@ -3,6 +3,21 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-11-19
+
+### Added
+- MCP server mode (--mcp) for AI assistants: drives, folder_sizes, largest_files, file_types, find_duplicates, refresh.
+- Duplicates quick mode (name + size from the index, no disk reads) vs advanced mode (content hashes); unverified groups marked with ≈ and warned about before deleting.
+- Draggable split between duplicate files and folders (10%–90%).
+
+### Fixed
+- Cancel in duplicates stops immediately and keeps results; changing options restarts a running search; minimum size filters results live.
+- Memory growth when syncing many new files into large folders (geometric child slots).
+- Network paths (\\server\share) no longer create phantom drives on sync.
+- Nested duplicate folders are verified instead of dropped; hidden only when covered by a duplicate parent.
+- Hard links no longer reported as duplicate folders; duplicate progress reaches 100%.
+- Google Drive detection with truncated volume labels.
+
 ## [0.3.0] - 2026-11-19
 
 ### Added
