@@ -309,6 +309,7 @@ impl Drop for TempDir {
 ///   d1/same.bin = A · d2/same.bin = A · d3/same.bin = A' (differs after 64 KB)
 ///   d4/renamed.bin = A · d5/same.bin = hard link to d1/same.bin · small/x.txt
 fn dup_fixture() -> (TempDir, Tree, u32) {
+    init_cache();
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let base = std::env::temp_dir().join(format!("wiz_dup_test_{}_{n}", std::process::id()));
@@ -582,4 +583,53 @@ fn dups_quick_mode_uses_only_the_index() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].files.len(), 4);
     assert!(groups.iter().all(|g| !g.verified));
+}
+/// All tests share one throwaway hash cache file (never the user's real one).
+fn init_cache() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let p = std::env::temp_dir().join(format!("wiz_hash_cache_test_{}.bin", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        crate::hashcache::set_path(p);
+    });
+}
+
+#[test]
+fn hash_cache_second_search_reads_nothing() {
+    let (tmp, tree, root) = dup_fixture();
+    let tree = Arc::new(tree);
+    let opt = DupOptions { root, min_size: 1, same_name: true, verify: true };
+    let first = Arc::new(DupProgress::default());
+    let g1 = dup::find(tree.clone(), opt, first.clone());
+    assert!(first.bytes_read.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+    let second = Arc::new(DupProgress::default());
+    let g2 = dup::find(tree.clone(), opt, second.clone());
+    assert_eq!(g1.len(), g2.len(), "same result from the cache");
+    assert_eq!(second.bytes_read.load(std::sync::atomic::Ordering::Relaxed), 0, "nothing read from disk");
+    assert!(second.cache_hits.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+    // Change d2's content (same size): its entry no longer matches and is re-hashed.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let path = tmp.0.join("d2/same.bin");
+    let mut data = std::fs::read(&path).unwrap();
+    data[0] ^= 0xFF;
+    std::fs::write(&path, &data).unwrap();
+    let third = Arc::new(DupProgress::default());
+    let g3 = dup::find(tree, opt, third.clone());
+    assert!(third.bytes_read.load(std::sync::atomic::Ordering::Relaxed) > 0, "changed file read again");
+    let files: Vec<_> = g3.iter().filter(|g| !g.folder).collect();
+    assert!(files.iter().all(|g| g.files.iter().all(|f| !f.path.ends_with("d2\\same.bin"))), "d2 no longer a duplicate");
+}
+
+#[test]
+fn hash_cache_persists_to_disk() {
+    init_cache();
+    let path = crate::hashcache::default_path();
+    let (tmp, tree, root) = dup_fixture();
+    let _ = dup::find(Arc::new(tree), DupOptions { root, min_size: 1, same_name: true, verify: true }, Arc::new(DupProgress::default()));
+    let bytes = std::fs::read(&path).expect("cache file written");
+    assert!(bytes.starts_with(b"WZHC01"));
+    let needle = tmp.0.to_string_lossy().to_lowercase();
+    assert!(String::from_utf8_lossy(&bytes).contains(&needle), "entries for the fixture were saved");
 }

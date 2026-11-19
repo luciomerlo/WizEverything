@@ -63,6 +63,8 @@ struct Dups {
     groups: Vec<DupGroup>,
     searched: bool,
     last_secs: f64,
+    last_read: u64,
+    last_hits: u64,
     marked: HashSet<String>,
     confirm: bool,
     /// Sort/order of the files (0) and folders (1) tables.
@@ -82,6 +84,8 @@ impl Default for Dups {
             groups: Vec::new(),
             searched: false,
             last_secs: 0.0,
+            last_read: 0,
+            last_hits: 0,
             marked: HashSet::new(),
             confirm: false,
             views: Default::default(),
@@ -703,6 +707,8 @@ impl App {
             if job.done_rx.try_recv().is_ok() {
                 self.dups.groups.extend(job.rx.try_iter());
                 self.dups.last_secs = job.started.elapsed().as_secs_f64();
+                self.dups.last_read = job.prog.bytes_read.load(Ordering::Relaxed);
+                self.dups.last_hits = job.prog.cache_hits.load(Ordering::Relaxed);
                 job.finished = Some(self.dups.last_secs);
             }
             if job.finished.is_some() {
@@ -1626,8 +1632,21 @@ impl App {
                     self.dups.last_secs = job.started.elapsed().as_secs_f64();
                     self.dups.job = None;
                 }
-            } else if ui.button(RichText::new(tr("Buscar duplicados", "Find duplicates")).strong()).clicked() {
-                self.start_dups(ctx);
+            } else {
+                if ui.button(RichText::new(tr("Buscar duplicados", "Find duplicates")).strong()).clicked() {
+                    self.start_dups(ctx);
+                }
+                if ui
+                    .small_button(tr("Vaciar caché", "Clear cache"))
+                    .on_hover_text(tr(
+                        "Borra los hashes guardados. La próxima búsqueda avanzada vuelve a leer todo.",
+                        "Deletes stored hashes. The next advanced search reads everything again.",
+                    ))
+                    .clicked()
+                {
+                    crate::hashcache::global().lock().unwrap().clear();
+                    self.set_info(tr("Caché de hashes vaciada", "Hash cache cleared").to_string());
+                }
             }
         });
 
@@ -1650,6 +1669,14 @@ impl App {
                     fmt_size(bt),
                     fmt_dec(job.started.elapsed().as_secs_f64())
                 ));
+                let hits = p.cache_hits.load(Ordering::Relaxed);
+                ui.label(RichText::new(format!(
+                    "· {} {} · {} {}",
+                    fmt_size(p.bytes_read.load(Ordering::Relaxed)),
+                    tr("leídos del disco", "read from disk"),
+                    fmt_int(hits),
+                    tr("desde caché", "from cache")
+                )).weak());
             });
             ui.add(egui::ProgressBar::new((bd as f32 / bt as f32).min(1.0)).desired_height(6.0));
         }
@@ -1685,7 +1712,15 @@ impl App {
             ))
             .strong());
             if self.dups.job.is_none() && self.dups.last_secs > 0.0 {
-                ui.label(RichText::new(format!("({} s)", fmt_dec(self.dups.last_secs))).weak());
+                ui.label(RichText::new(format!(
+                    "({} s · {} {} · {} {})",
+                    fmt_dec(self.dups.last_secs),
+                    fmt_size(self.dups.last_read),
+                    tr("leídos", "read"),
+                    fmt_int(self.dups.last_hits),
+                    tr("desde caché", "from cache")
+                ))
+                .weak());
             }
             ui.separator();
             ui.label(tr("Marcar:", "Mark:"));

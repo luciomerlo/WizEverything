@@ -68,7 +68,8 @@ impl Server {
         }
         let t = self.tree()?;
         let root = match a.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()) {
-            Some(p) => t.find_path(p).ok_or_else(|| format!("Path not found in the index: {p}"))?,
+            // Accept C:/Users/... as well as C:\Users\...
+            Some(p) => t.find_path(&p.replace('/', "\\")).ok_or_else(|| format!("Path not found in the index: {p}"))?,
             None => ROOT,
         };
         let limit = a.get("limit").and_then(Value::as_u64).unwrap_or(25).clamp(1, 1000) as usize;
@@ -157,10 +158,13 @@ impl Server {
                     same_name: a.get("same_name").and_then(Value::as_bool).unwrap_or(true),
                     verify: a.get("verify").and_then(Value::as_bool).unwrap_or(true),
                 };
-                let groups = dup::find(t.clone(), opt, Arc::new(DupProgress::default()));
+                let prog = Arc::new(DupProgress::default());
+                let groups = dup::find(t.clone(), opt, prog.clone());
                 let reclaimable: u64 = groups.iter().map(|g| g.wasted()).sum();
                 Ok(json!({
                     "groups": groups.len(),
+                    "bytes_read_from_disk": prog.bytes_read.load(std::sync::atomic::Ordering::Relaxed),
+                    "files_from_hash_cache": prog.cache_hits.load(std::sync::atomic::Ordering::Relaxed),
                     "reclaimable": reclaimable,
                     "top": groups.iter().take(limit).map(|g| json!({
                         "kind": if g.folder { "folder" } else { "file" },

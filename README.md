@@ -31,6 +31,7 @@ Written in Rust with [egui](https://github.com/emilk/egui).
   so non-duplicates are rarely read to the end. Runs on every core, biggest savings first.
 - **Duplicate folders**: whole folders with identical content, detected by an index-only signature
   (names + sizes of everything inside) and then verified; nested matches are not repeated.
+- **Hash cache**: the advanced mode remembers each file's content hash (valid while size and date are unchanged), so repeated searches read almost nothing from disk.
 - Results **stream in live** in two panes — files on the left, folders on the right — with sortable columns.
 - Stopping a search keeps what was found. Hard links are collapsed and cloud-only files are never downloaded.
 - Mark "keep oldest / keep newest", send to the **Recycle Bin** with confirmation (never all copies of a group),

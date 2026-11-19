@@ -3,6 +3,16 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.5.0] - 2026-11-19
+
+### Added
+- Persistent hash cache for the advanced duplicate search (`%LOCALAPPDATA%\WizEverything\hash_cache.bin`): files keep their full-content hash while size and modification time are unchanged. Measured on C:\Program Files: 345 MB read on the first search, 11 MB on the next (same 26 groups). Full hashes are computed during the normal block comparison at no extra cost; stale entries are dropped after 90 days; "Clear cache" button.
+- Duplicate progress shows bytes actually read from disk and files served from the cache (also reported by the MCP tool).
+- MCP accepts paths with forward slashes (C:/Users/...).
+
+### Changed
+- File and folder comparison share one routine (cache, hard links, cloud placeholders, early exit).
+
 ## [0.4.0] - 2026-11-19
 
 ### Added

@@ -17,9 +17,10 @@ use std::os::windows::io::AsRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{Xxh3, xxh3_64};
 
 use crate::everything::wide;
+use crate::hashcache;
 use crate::tree::Tree;
 
 const FIRST_BLOCK: usize = 64 * 1024;
@@ -69,6 +70,10 @@ pub struct DupProgress {
     pub bytes_done: AtomicU64,
     pub bytes_total: AtomicU64,
     pub skipped: AtomicU64,
+    /// Bytes actually read from disk (cache hits read nothing).
+    pub bytes_read: AtomicU64,
+    /// Files whose hash came from the cache.
+    pub cache_hits: AtomicU64,
     pub cancel: AtomicBool,
 }
 
@@ -116,72 +121,110 @@ fn read_full(f: &mut std::fs::File, buf: &mut [u8]) -> std::io::Result<usize> {
     Ok(n)
 }
 
-struct Open<'a> {
-    cand: &'a Cand,
+/// One file being compared: its open handle and the running full-content hash.
+struct Reader {
     file: std::fs::File,
+    hash: Xxh3,
 }
 
-/// Compare a set of same-size files; returns the classes of identical files.
-fn compare_group<'a>(size: u64, cands: &'a [Cand], p: &DupProgress) -> Vec<Vec<&'a Cand>> {
-    // Open (skipping cloud placeholders) and collapse hard links.
+/// Split same-size files into classes of identical content (indices into
+/// `paths`). Files left alone are dropped.
+///
+/// * Cache: files whose (size, mtime) match a cached hash are not read at all;
+///   when only some are cached, the rest are hashed in full and compared by hash.
+/// * Otherwise: progressive block comparison with early exit; files read to the
+///   end get their full hash computed on the way and stored in the cache.
+/// * Hard links (same physical file) count once; cloud placeholders are skipped.
+/// * `credit`: add processed bytes to `p.bytes_done` (file groups do; folder
+///   groups credit their whole size at the end).
+fn classify(size: u64, paths: &[&str], p: &DupProgress, credit: bool) -> Vec<Vec<usize>> {
+    let add = |n: u64| {
+        if credit {
+            p.bytes_done.fetch_add(n, Ordering::Relaxed);
+        }
+    };
+    // Open what is local; collapse hard links.
     let mut seen = std::collections::HashSet::new();
-    let mut open: Vec<Open<'a>> = Vec::with_capacity(cands.len());
-    for c in cands {
-        if is_not_local(&c.path) {
+    let mut readers: Vec<Option<Reader>> = Vec::with_capacity(paths.len());
+    for path in paths {
+        let r = if is_not_local(path) {
             p.skipped.fetch_add(1, Ordering::Relaxed);
-            p.bytes_done.fetch_add(size, Ordering::Relaxed);
-            continue;
-        }
-        let Ok(file) = std::fs::File::open(&c.path) else {
-            p.bytes_done.fetch_add(size, Ordering::Relaxed);
-            continue;
+            None
+        } else {
+            std::fs::File::open(path).ok().filter(|f| file_id(f).is_none_or(|id| seen.insert(id)))
         };
-        if let Some(id) = file_id(&file)
-            && !seen.insert(id)
-        {
-            p.bytes_done.fetch_add(size, Ordering::Relaxed);
-            continue; // another path to a file we already have
+        if r.is_none() {
+            add(size);
         }
-        open.push(Open { cand: c, file });
+        readers.push(r.map(|file| Reader { file, hash: Xxh3::new() }));
+    }
+    let live: Vec<usize> = (0..paths.len()).filter(|&i| readers[i].is_some()).collect();
+    if live.len() < 2 {
+        add(size * live.len() as u64);
+        return Vec::new();
     }
 
-    let mut classes: Vec<Vec<Open<'a>>> = vec![open];
-    let mut done: Vec<Vec<&'a Cand>> = Vec::new();
-    let mut offset = 0u64;
-    let mut block = FIRST_BLOCK;
+    // Cache lookups.
+    let keys: Vec<Option<(u64, u64)>> = paths.iter().map(|p| hashcache::file_key(p)).collect();
+    let cached: Vec<Option<u128>> = {
+        let mut c = hashcache::global().lock().unwrap();
+        (0..paths.len()).map(|i| keys[i].filter(|_| readers[i].is_some()).and_then(|k| c.get(paths[i], k))).collect()
+    };
+    if live.iter().any(|&i| cached[i].is_some()) {
+        let mut by: HashMap<u128, Vec<usize>> = HashMap::new();
+        for &i in &live {
+            let h = match cached[i] {
+                Some(h) => {
+                    p.cache_hits.fetch_add(1, Ordering::Relaxed);
+                    add(size);
+                    h
+                }
+                None => {
+                    let Some(r) = readers[i].as_mut() else { continue };
+                    let Some(h) = full_hash(&mut r.file, size, p, credit) else { continue };
+                    if let Some(k) = keys[i] {
+                        hashcache::global().lock().unwrap().put(paths[i], k, h);
+                    }
+                    h
+                }
+            };
+            by.entry(h).or_default().push(i);
+        }
+        return by.into_values().filter(|v| v.len() > 1).collect();
+    }
+
+    // Progressive comparison, hashing the whole content on the way.
+    let mut classes = vec![live];
+    let (mut offset, mut block) = (0u64, FIRST_BLOCK);
     let mut buf = vec![0u8; FIRST_BLOCK];
-    while !classes.is_empty() {
+    while offset < size && !classes.is_empty() {
         if p.cancel.load(Ordering::Relaxed) {
             return Vec::new();
-        }
-        if offset >= size {
-            done.extend(classes.into_iter().map(|c| c.into_iter().map(|o| o.cand).collect()));
-            break;
         }
         let want = block.min((size - offset) as usize);
         if buf.len() < want {
             buf.resize(want, 0);
         }
-        let mut next: Vec<Vec<Open<'a>>> = Vec::new();
+        let mut next = Vec::new();
         for class in classes {
-            let mut split: HashMap<u64, Vec<Open<'a>>> = HashMap::new();
-            for mut o in class {
-                match read_full(&mut o.file, &mut buf[..want]) {
-                    Ok(n) if n == want => {
-                        p.bytes_done.fetch_add(n as u64, Ordering::Relaxed);
-                        split.entry(xxh3_64(&buf[..n])).or_default().push(o);
-                    }
-                    _ => {
-                        p.bytes_done.fetch_add(size - offset, Ordering::Relaxed); // vanished / shrank
-                    }
+            let mut split: HashMap<u64, Vec<usize>> = HashMap::new();
+            for i in class {
+                let Some(r) = readers[i].as_mut() else { continue };
+                if matches!(read_full(&mut r.file, &mut buf[..want]), Ok(n) if n == want) {
+                    p.bytes_read.fetch_add(want as u64, Ordering::Relaxed);
+                    add(want as u64);
+                    r.hash.update(&buf[..want]);
+                    split.entry(xxh3_64(&buf[..want])).or_default().push(i);
+                } else {
+                    readers[i] = None; // vanished / shrank
+                    add(size - offset);
                 }
             }
-            for (_, v) in split {
+            for v in split.into_values() {
                 if v.len() > 1 {
                     next.push(v);
                 } else {
-                    // Unique from here on: count the unread rest as done.
-                    p.bytes_done.fetch_add(size - offset - want as u64, Ordering::Relaxed);
+                    add(size - offset - want as u64); // unique from here on
                 }
             }
         }
@@ -189,7 +232,43 @@ fn compare_group<'a>(size: u64, cands: &'a [Cand], p: &DupProgress) -> Vec<Vec<&
         offset += want as u64;
         block = (block * 4).min(MAX_BLOCK);
     }
-    done
+    // Everything still in a class was read to the end: remember its hash.
+    let mut c = hashcache::global().lock().unwrap();
+    for &i in classes.iter().flatten() {
+        if let (Some(r), Some(k)) = (readers[i].as_ref(), keys[i]) {
+            c.put(paths[i], k, r.hash.digest128());
+        }
+    }
+    classes
+}
+
+/// Hash a whole file (from its current position = start).
+fn full_hash(f: &mut std::fs::File, size: u64, p: &DupProgress, credit: bool) -> Option<u128> {
+    let mut h = Xxh3::new();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    loop {
+        if p.cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        let n = f.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        total += n as u64;
+        p.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+        if credit {
+            p.bytes_done.fetch_add(n as u64, Ordering::Relaxed);
+        }
+    }
+    (total == size).then(|| h.digest128())
+}
+
+/// Compare a set of same-size candidate files; returns the classes of identical files.
+fn compare_group<'a>(size: u64, cands: &'a [Cand], p: &DupProgress) -> Vec<Vec<&'a Cand>> {
+    let paths: Vec<&str> = cands.iter().map(|c| c.path.as_str()).collect();
+    classify(size, &paths, p, true).into_iter().map(|cl| cl.into_iter().map(|i| &cands[i]).collect()).collect()
 }
 
 /// Split a big group by the hash of its first block, one file at a time.
@@ -208,6 +287,7 @@ fn presplit<'a>(size: u64, cands: &'a [Cand], p: &DupProgress) -> Vec<Vec<&'a Ca
         };
         match opened {
             Some(n) => {
+                p.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
                 by.entry(xxh3_64(&buf[..n])).or_default().push(c);
             }
             None => {
@@ -221,54 +301,11 @@ fn presplit<'a>(size: u64, cands: &'a [Cand], p: &DupProgress) -> Vec<Vec<&'a Ca
     keep
 }
 
-/// Split same-size files into classes of identical content (indices into
-/// `paths`); files left alone are dropped. Progressive, with early exit.
+/// Same-size files of one relative path across folders → classes of identical content.
 fn partition(size: u64, paths: &[String], p: &DupProgress) -> Vec<Vec<usize>> {
-    let mut files: Vec<Option<std::fs::File>> = paths
-        .iter()
-        .map(|path| if is_not_local(path) { None } else { std::fs::File::open(path).ok() })
-        .collect();
-    // Paths that are the same physical file (hard links) free nothing: keep one.
-    let mut seen = std::collections::HashSet::new();
-    for f in files.iter_mut() {
-        if let Some(id) = f.as_ref().and_then(file_id)
-            && !seen.insert(id)
-        {
-            *f = None;
-        }
-    }
-    let mut classes: Vec<Vec<usize>> = vec![(0..paths.len()).filter(|&i| files[i].is_some()).collect()];
-    classes.retain(|c| c.len() > 1);
-    let (mut offset, mut block) = (0u64, FIRST_BLOCK);
-    let mut buf = vec![0u8; FIRST_BLOCK];
-    while offset < size && !classes.is_empty() {
-        if p.cancel.load(Ordering::Relaxed) {
-            return Vec::new();
-        }
-        let want = block.min((size - offset) as usize);
-        if buf.len() < want {
-            buf.resize(want, 0);
-        }
-        let mut next = Vec::new();
-        for class in classes {
-            let mut split: HashMap<u64, Vec<usize>> = HashMap::new();
-            for i in class {
-                let Some(f) = files[i].as_mut() else { continue };
-                if matches!(read_full(f, &mut buf[..want]), Ok(n) if n == want) {
-                    split.entry(xxh3_64(&buf[..want])).or_default().push(i);
-                } else {
-                    files[i] = None;
-                }
-            }
-            next.extend(split.into_values().filter(|v| v.len() > 1));
-        }
-        classes = next;
-        offset += want as u64;
-        block = (block * 4).min(MAX_BLOCK);
-    }
-    classes
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+    classify(size, &refs, p, false)
 }
-
 /// A candidate set of identical folders: same content signature (names + sizes).
 struct FolderCand {
     /// Index of this candidate group, and of the group holding all its parents.
@@ -524,6 +561,10 @@ pub fn find_streaming(tree: Arc<Tree>, opt: DupOptions, p: &DupProgress, on_grou
             });
         }
     });
+    if opt.verify {
+        // Keep what was hashed (also after a cancel) for the next search.
+        hashcache::global().lock().unwrap().save();
+    }
 }
 
 /// Blocking search that returns every group, sorted by reclaimable space.

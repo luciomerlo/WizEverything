@@ -4,6 +4,7 @@ mod app;
 mod autostart;
 mod dup;
 mod everything;
+mod hashcache;
 mod i18n;
 mod mcp;
 mod tree;
