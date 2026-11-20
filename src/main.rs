@@ -3,6 +3,8 @@
 mod ai;
 mod app;
 mod autostart;
+#[cfg(windows)]
+mod dedup;
 mod dup;
 mod everything;
 mod hashcache;
@@ -13,6 +15,7 @@ mod magic;
 mod mcp;
 mod tree;
 mod sunburst;
+mod sweeper;
 mod treemap;
 
 #[cfg(windows)]
