@@ -3,7 +3,7 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.9.0] - 2026-11-20
 
 ### Added
 - Advanced storage-analysis engines (branch `spec/7modules`), all backed by Everything's index and Win32 metadata,
