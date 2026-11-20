@@ -1,6 +1,6 @@
 [package]
 name = "wizeverything"
-version = "0.15.0"
+version = "0.16.0"
 edition = "2024"
 license = "MIT"
 description = "WizTree-style disk space visualizer that reads Everything's index"
@@ -23,6 +23,8 @@ symphonia = { version = "0.5", features = ["mp3", "flac", "wav", "ogg", "vorbis"
 rustfft = "6"
 cpal = "0.15"
 kamadak-exif = "0.6"
+zip = "4.6.1"
+rusqlite = { version = "0.43", features = ["bundled"] }
 
 [profile.release]
 strip = true

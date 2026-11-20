@@ -12,6 +12,7 @@ mod basket;
 mod catalog;
 mod cold;
 #[cfg(windows)]
+mod content_index;
 mod contents;
 mod dedup;
 mod dup;

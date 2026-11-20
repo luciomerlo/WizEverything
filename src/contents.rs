@@ -23,6 +23,10 @@ const TEXT_EXT: &[&str] = &[
 ];
 
 const IMAGE_EXT: &[&str] = &["png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp", "gif"];
+const DOC_EXT: &[&str] = &["docx", "odt", "rtf", "epub"];
+const PPT_EXT: &[&str] = &["pptx", "odp"];
+const SHEET_EXT: &[&str] = &["xlsx", "ods"];
+const LEGACY_EXT: &[&str] = &["doc", "ppt", "xls"];
 
 fn ext_of(p: &Path) -> String {
     p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
@@ -79,6 +83,55 @@ pub fn extract(path: &Path, deep: bool, tools: &Tools) -> Option<Extracted> {
             text: String::from_utf8_lossy(&bytes).into_owned(),
             kind: "text",
             note: String::new(),
+        });
+    }
+    if DOC_EXT.contains(&ext.as_str()) {
+        if ext == "rtf" {
+            let raw = std::fs::read_to_string(path).ok()?;
+            return Some(Extracted { text: rtf_text(&raw), kind: "document", note: String::new() });
+        }
+        if ext == "epub" {
+            let text = read_zip(path, |n| n.ends_with(".xhtml") || n.ends_with(".html"), &["p"])?;
+            return Some(Extracted { text, kind: "document", note: String::new() });
+        }
+        let text = read_zip(
+            path,
+            |n| {
+                n.starts_with("word/")
+                    && n.ends_with(".xml")
+                    && ["document", "header", "footer", "footnotes", "endnotes", "comments"]
+                        .iter()
+                        .any(|k| n.contains(k))
+            },
+            &["t"],
+        )?;
+        return Some(Extracted { text, kind: "document", note: String::new() });
+    }
+    if PPT_EXT.contains(&ext.as_str()) {
+        let text = if ext == "pptx" {
+            read_zip(path, |n| (n.starts_with("ppt/slides/slide") || n.starts_with("ppt/notesSlides/")) && n.ends_with(".xml"), &["t"])
+        } else {
+            read_zip(path, |n| n == "content.xml", &["p"])
+        }?;
+        return Some(Extracted { text, kind: "presentation", note: String::new() });
+    }
+    if SHEET_EXT.contains(&ext.as_str()) {
+        let text = if ext == "xlsx" {
+            read_zip(
+                path,
+                |n| n.starts_with("xl/sharedStrings") || n.starts_with("xl/worksheets/") || n.starts_with("xl/comments"),
+                &["t"],
+            )
+        } else {
+            read_zip(path, |n| n == "content.xml", &["p"])
+        }?;
+        return Some(Extracted { text, kind: "sheet", note: String::new() });
+    }
+    if LEGACY_EXT.contains(&ext.as_str()) {
+        return Some(Extracted {
+            text: String::new(),
+            kind: "document",
+            note: format!(".{ext} es un formato binario antiguo: convertí a .{} para buscar dentro.", if ext == "doc" { "docx" } else if ext == "ppt" { "pptx" } else { "xlsx" }),
         });
     }
     if ext == "pdf" {
@@ -153,6 +206,161 @@ fn ocr_pdf(path: &Path, tools: &Tools, deep: bool) -> Option<Extracted> {
     })
 }
 
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let Some(end) = rest.find(';').filter(|&e| e <= 10) else {
+            out.push('&');
+            rest = &rest[1..];
+            continue;
+        };
+        let ent = &rest[1..end];
+        let ch = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            _ => ent
+                .strip_prefix("#x")
+                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                .or_else(|| ent.strip_prefix('#').and_then(|d| d.parse().ok()))
+                .and_then(char::from_u32),
+        };
+        match ch {
+            Some(c) => {
+                out.push(c);
+                rest = &rest[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[..end + 1]);
+                rest = &rest[end + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Texto de un XML de Office/ODF, capturando sólo los tags de texto.
+fn xml_text(xml: &str, tags: &[&str]) -> String {
+    let mut out = String::new();
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < xml.len() {
+        if xml.as_bytes()[i] == b'<' {
+            let end = xml[i..].find('>').map(|x| i + x).unwrap_or(xml.len());
+            let raw = &xml[i + 1..end];
+            let closing = raw.starts_with('/');
+            let self_closing = raw.ends_with('/');
+            let name = raw
+                .trim_start_matches('/')
+                .split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or("");
+            let local = name.rsplit(':').next().unwrap_or(name);
+            if tags.contains(&local) {
+                if closing {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        out.push('\n');
+                    }
+                } else if !self_closing {
+                    depth += 1;
+                }
+            } else if depth > 0 && local == "tab" {
+                out.push('\t');
+            } else if depth > 0 && local == "br" && !closing {
+                out.push('\n');
+            }
+            i = end + 1;
+        } else {
+            let end = xml[i..].find('<').map(|x| i + x).unwrap_or(xml.len());
+            if depth > 0 {
+                out.push_str(&unescape(&xml[i..end]));
+            }
+            i = end;
+        }
+    }
+    out
+}
+
+fn read_zip(path: &Path, pick: impl Fn(&str) -> bool, tags: &[&str]) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut zip = zip::ZipArchive::new(file).ok()?;
+    let mut out = String::new();
+    let cap = 8 * 1024 * 1024;
+    for i in 0..zip.len() {
+        let Ok(mut f) = zip.by_index(i) else { continue };
+        if !pick(f.name()) {
+            continue;
+        }
+        let mut buf = Vec::new();
+        (&mut f).take(cap as u64).read_to_end(&mut buf).ok()?;
+        let xml = String::from_utf8_lossy(&buf);
+        out.push_str(&xml_text(&xml, tags));
+        out.push('\n');
+        if out.len() >= cap {
+            break;
+        }
+    }
+    Some(out)
+}
+
+/// RTF básico: quita controles y conserva el texto visible.
+fn rtf_text(raw: &str) -> String {
+    let mut out = String::new();
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '{' | '}' => {}
+            '\\' => match chars.next() {
+                Some('\\') | Some('{') | Some('}') => out.push(chars.clone().next().map_or('\\', |_| '\\')),
+                Some('\'') => {
+                    let hex: String = (0..2).filter_map(|_| chars.next()).collect();
+                    if let Ok(b) = u8::from_str_radix(&hex, 16) {
+                        out.push(b as char);
+                    }
+                }
+                Some('u') => {
+                    let mut num = String::new();
+                    while let Some(&d) = chars.peek() {
+                        if d == '-' || d.is_ascii_digit() {
+                            num.push(d);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if let Ok(n) = num.parse::<i32>() {
+                        out.push(char::from_u32(n as u32).unwrap_or('?'));
+                    }
+                    chars.next(); // delimiter
+                }
+                Some(d) if d.is_ascii_alphabetic() => {
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_alphabetic() {
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if matches!(chars.peek(), Some(' ')) {
+                        chars.next();
+                    }
+                }
+                _ => {}
+            },
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 /// Una coincidencia con contexto.
 #[derive(Clone, Debug)]
 pub struct Hit {
@@ -185,6 +393,10 @@ pub struct Report {
     pub elapsed_ms: u64,
     pub notes: Vec<String>,
     pub tools: Tools,
+    /// Textos servidos por el índice compartido (evita releer el archivo).
+    pub index_hits: u64,
+    pub index_writes: u64,
+    pub index_path: String,
 }
 
 /// Busca `query` dentro de los archivos bajo `root`.
@@ -201,10 +413,22 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
     if !deep {
         notes.push("Modo rápido: sin OCR; PDFs sólo primeras 3 páginas.".into());
     }
+    // Índice compartido con SortEverything: misma ruta, misma base.
+    let index = crate::content_index::open().ok();
+    let mut owner = false;
+    if let Some(c) = &index {
+        owner = crate::content_index::claim(c, crate::content_index::APP_WIZ).unwrap_or(false);
+        notes.push(format!("Índice compartido: {}", crate::content_index::display_path()));
+        if !owner {
+            notes.push("La otra app está indexando ahora; se usa lo que ya hay en la base compartida.".into());
+        }
+    }
     let mut hits = Vec::new();
     let mut scanned = 0u64;
     let mut bytes = 0u64;
     let mut partial = false;
+    let mut index_hits = 0u64;
+    let mut index_writes = 0u64;
     for id in t.files_under(root) {
         if hits.len() >= limit || scanned as usize >= max_files || started.elapsed().as_millis() > budget_ms {
             partial = true;
@@ -213,18 +437,61 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
         let p = t.full_path(id);
         let path = Path::new(&p);
         let ext = ext_of(path);
-        let supported = TEXT_EXT.contains(&ext.as_str()) || ext == "pdf" || (deep && IMAGE_EXT.contains(&ext.as_str()));
+        let supported = TEXT_EXT.contains(&ext.as_str())
+            || DOC_EXT.contains(&ext.as_str())
+            || PPT_EXT.contains(&ext.as_str())
+            || SHEET_EXT.contains(&ext.as_str())
+            || LEGACY_EXT.contains(&ext.as_str())
+            || ext == "pdf"
+            || (deep && IMAGE_EXT.contains(&ext.as_str()));
         if !supported {
             continue;
         }
         scanned += 1;
-        bytes += t.nodes[id as usize].size;
-        let Some(ex) = extract(path, deep, &tools) else { continue };
+        let size = t.nodes[id as usize].size;
+        let modified = t.nodes[id as usize].modified as i64;
+        bytes += size;
+        let cached = index
+            .as_ref()
+            .and_then(|c| crate::content_index::get(c, &p, size, modified));
+        let ex = match cached {
+            Some((kind, text)) => {
+                index_hits += 1;
+                Extracted { text, kind: if kind == "text" { "text" } else { "document" }, note: String::new() }
+            }
+            None => {
+                let Some(ex) = extract(path, deep, &tools) else { continue };
+                if owner
+                    && let Some(c) = &index
+                    && !ex.text.is_empty()
+                    && crate::content_index::put(c, &p, size, modified, ex.kind, &ex.text).is_ok()
+                {
+                    index_writes += 1;
+                }
+                ex
+            }
+        };
         if let Some(sn) = snippet(&ex.text, query) {
-            hits.push(Hit { path: p, size: t.nodes[id as usize].size, kind: ex.kind, snippet: sn });
+            hits.push(Hit { path: p, size, kind: ex.kind, snippet: sn });
         }
     }
-    Report { hits, scanned, bytes, partial, elapsed_ms: started.elapsed().as_millis() as u64, notes, tools }
+    if owner
+        && let Some(c) = &index
+    {
+        let _ = crate::content_index::release(c, crate::content_index::APP_WIZ);
+    }
+    Report {
+        hits,
+        scanned,
+        bytes,
+        partial,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        notes,
+        tools,
+        index_hits,
+        index_writes,
+        index_path: crate::content_index::display_path(),
+    }
 }
 
 impl Report {
@@ -239,6 +506,9 @@ impl Report {
             "elapsed_ms": self.elapsed_ms,
             "pdftotext": self.tools.pdftotext,
             "tesseract": self.tools.tesseract,
+            "index_hits": self.index_hits,
+            "index_writes": self.index_writes,
+            "index_path": self.index_path,
             "notes": self.notes,
             "top": self.hits.iter().take(limit).map(|h| serde_json::json!({
                 "path": h.path,
@@ -303,6 +573,33 @@ mod tests {
         assert!(snippet("nada", "zzz").is_none());
     }
 
+
+    #[test]
+    fn docx_and_xlsx_text_is_extracted() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("wzfmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let docx = dir.join("a.docx");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&docx).unwrap());
+        z.start_file("word/document.xml", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(br#"<w:document><w:body><w:p><w:r><w:t>Hola documento</w:t></w:r></w:p></w:body></w:document>"#).unwrap();
+        z.finish().unwrap();
+        let tools = Tools::detect();
+        let d = extract(&docx, false, &tools).unwrap();
+        assert_eq!(d.kind, "document");
+        assert!(d.text.contains("Hola documento"));
+
+        let xlsx = dir.join("a.xlsx");
+        let mut z = zip::ZipWriter::new(std::fs::File::create(&xlsx).unwrap());
+        z.start_file("xl/sharedStrings.xml", zip::write::SimpleFileOptions::default()).unwrap();
+        z.write_all(br#"<sst><si><t>Factura enero</t></si></sst>"#).unwrap();
+        z.finish().unwrap();
+        let x = extract(&xlsx, false, &tools).unwrap();
+        assert_eq!(x.kind, "sheet");
+        assert!(x.text.contains("Factura enero"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     fn text_extensions_are_recognized() {
         assert_eq!(ext_of(Path::new("a.MD")), "md");

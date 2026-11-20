@@ -11,6 +11,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   tiempo. Nuevos tools MCP `content_search` y `content_estimate` y ventana/panel en la app.
   Corrige la detección de `pdftotext` (usa `-v`, no `--version`), limita la lectura en memoria y
   protege los fragmentos con Unicode.
+- **Documentos, presentaciones y planillas**: `.docx/.odt/.rtf/.epub`, `.pptx/.odp` y `.xlsx/.ods`
+  además de PDF y texto/código, extrayendo el XML/ZIP. Los formatos binarios antiguos
+  (`.doc/.ppt/.xls`) se detectan y se avisa que hay que convertirlos.
+- **Índice de contenido compartido con SortEverything** en
+  `%LOCALAPPDATA%\WizeShared\content-index.sqlite3`: esquema idempotente, WAL y un *lease* con
+  latido para que una sola app indexe a la vez; la otra lee el mismo índice. Contrato y API en
+  `docs/SHARED-CONTENT-INDEX.md`, replicado en ambos repos.
 
 ## [0.14.0] - 2026-11-20
 
