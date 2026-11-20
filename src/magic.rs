@@ -75,6 +75,18 @@ pub enum Verdict {
 }
 
 impl Verdict {
+    /// Texto corto para reportes (MCP/UI).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Okay => "ok",
+            Verdict::NotStructuredExt => "not_structured",
+            Verdict::AllZero => "all_zero",
+            Verdict::HtmlError => "html_error_page",
+            Verdict::Mismatch => "signature_mismatch",
+            Verdict::TooShort => "too_short",
+        }
+    }
+
     /// `true` si el archivo merece que el usuario lo revise.
     pub fn is_suspicious(self) -> bool {
         matches!(self, Verdict::AllZero | Verdict::HtmlError | Verdict::Mismatch)

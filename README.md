@@ -70,7 +70,8 @@ Every mutating operation runs as a dry-run first and writes a JSONL audit log be
 using the same Everything index. It can run alongside the desktop app.
 
 Tools: `drives`, `folder_sizes`, `largest_files`, `file_types`, `find_duplicates` (read-only;
-`verify: false` = name + size only, reads no file), `refresh`.
+`verify: false` = name + size only, reads no file), `dev_artifacts` (abandoned `node_modules`/`target`/…
+with reclaimable size), `scan_integrity` (corrupt / zero-filled / HTML-error files), `refresh`.
 
 Claude Code:
 

@@ -3,6 +3,13 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.9.1] - 2026-11-20
+
+### Added
+- MCP: two new read-only tools backed by the new engines:
+  - `dev_artifacts` — finds rebuildable dev artifacts (`node_modules`, `.venv`, `target`, `__pycache__`, `.gradle`, `.next`, `.terraform`, …) in abandoned projects, with reclaimable size (index only, reads no files).
+  - `scan_integrity` — checks structured files (pdf, zip, 7z, rar, mp4, mkv, jpg, png, sqlite, exe, dll…) for corruption: zero-filled files, HTML error pages saved as binaries, or signature mismatches (reads the first 32 bytes of each file).
+
 ## [0.9.0] - 2026-11-20
 
 ### Added

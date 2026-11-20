@@ -4,6 +4,7 @@
 //! the same in-memory index as the app. JSON-RPC 2.0, one message per line.
 
 use std::io::{BufRead, Write};
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -185,7 +186,129 @@ impl Server {
                     })).collect::<Vec<_>>(),
                 }))
             }
+            "dev_artifacts" => {
+                if root == ROOT && !a.get("all_drives").and_then(Value::as_bool).unwrap_or(false) {
+                    return Err("Give a 'path' to scan (or all_drives=true).".into());
+                }
+                let threshold = a
+                    .get("idle_days")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(crate::sweeper::DEFAULT_IDLE_DAYS);
+                let now = now_unix();
+                let mut found: Vec<crate::sweeper::SweepCandidate> = Vec::new();
+                walk_dirs(&t, root, &mut |id| {
+                    if id == root {
+                        return;
+                    }
+                    let node = &t.nodes[id as usize];
+                    if let Some(kind) = crate::sweeper::classify_dir(t.name(id)) {
+                        // La actividad del proyecto la marca su carpeta padre.
+                        let src = filetime_to_unix(t.nodes[node.parent as usize].modified);
+                        let bytes = node.alloc.max(node.size);
+                        found.push(crate::sweeper::evaluate(
+                            Path::new(&t.full_path(id)),
+                            kind,
+                            now,
+                            src,
+                            bytes,
+                            threshold,
+                        ));
+                    }
+                });
+                found.retain(|c| c.safe_to_delete);
+                found.sort_by(|x, y| y.bytes.cmp(&x.bytes));
+                let reclaimable: u64 = found.iter().map(|c| c.bytes).sum();
+                let top: Vec<Value> = found
+                    .iter()
+                    .take(limit)
+                    .map(|c| {
+                        json!({
+                            "path": c.path.to_string_lossy(),
+                            "kind": c.kind.label(),
+                            "idle_days": c.idle_days,
+                            "bytes": c.bytes,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "candidates": found.len(),
+                    "reclaimable": reclaimable,
+                    "idle_days_threshold": threshold,
+                    "top": top,
+                }))
+            }
+            "scan_integrity" => {
+                if root == ROOT && !a.get("all_drives").and_then(Value::as_bool).unwrap_or(false) {
+                    return Err(
+                        "Give a 'path' to scan (or all_drives=true; it reads the first bytes of many files)."
+                            .into(),
+                    );
+                }
+                let max_scan = a
+                    .get("max_scan")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(3000)
+                    .clamp(1, 50_000) as usize;
+                let files = t.files_under(root);
+                let mut scanned = 0usize;
+                let mut items: Vec<Value> = Vec::new();
+                for id in files {
+                    if scanned >= max_scan || items.len() >= limit {
+                        break;
+                    }
+                    let n = &t.nodes[id as usize];
+                    let ext = t.exts.get(n.ext as usize).map(|e| e.name.as_str()).unwrap_or("");
+                    if !crate::magic::is_structured_ext(ext) {
+                        continue;
+                    }
+                    scanned += 1;
+                    let path = t.full_path(id);
+                    if let Ok(v) = crate::magic::sniff(Path::new(&path)) {
+                        if v.is_suspicious() {
+                            items.push(json!({
+                                "path": path,
+                                "ext": ext,
+                                "size": n.size,
+                                "issue": v.as_str(),
+                            }));
+                        }
+                    }
+                }
+                Ok(json!({
+                    "scanned": scanned,
+                    "suspicious": items.len(),
+                    "scan_cap": max_scan,
+                    "items": items,
+                }))
+            }
             _ => Err(format!("Unknown tool: {name}")),
+        }
+    }
+}
+
+/// Segundos unix actuales.
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Convierte un FILETIME (100 ns desde 1601) a segundos unix; `None` si es 0.
+fn filetime_to_unix(ft: u64) -> Option<u64> {
+    const EPOCH_DIFF: u64 = 11_644_473_600; // segundos entre 1601 y 1970
+    if ft == 0 {
+        return None;
+    }
+    (ft / 10_000_000).checked_sub(EPOCH_DIFF)
+}
+
+/// Recorre todas las carpetas bajo `root` (incluida), sin bajar a archivos.
+fn walk_dirs(t: &Tree, root: u32, f: &mut impl FnMut(u32)) {
+    f(root);
+    for &c in t.children(root) {
+        if t.nodes[c as usize].is_dir() {
+            walk_dirs(t, c, f);
         }
     }
 }
@@ -213,6 +336,14 @@ pub fn tools() -> Value {
             "all_drives": { "type": "boolean", "description": "Search every included drive when no path is given." },
             "versions": { "type": "boolean", "description": "Old versions: same name and folder name on any drive, even if size/content differ. Index only." },
             "exclude": { "type": "array", "items": { "type": "string" }, "description": "Extra folders to skip (the app's saved exclusions always apply)." } } } },
+        { "name": "dev_artifacts", "description": "Find rebuildable dev artifacts (node_modules, .venv, target, __pycache__, .gradle, .next, .terraform, …) in abandoned projects, with reclaimable size. Index only, reads no files.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
+            "idle_days": { "type": "integer", "description": "Only report projects untouched for at least this many days (default 90)." } } } },
+        { "name": "scan_integrity", "description": "Check structured files (pdf, zip, 7z, rar, mp4, mkv, jpg, png, sqlite, exe, dll…) for corruption: zero-filled files, HTML error pages saved as binaries, or signature mismatches. Reads the first 32 bytes of each file. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
+            "max_scan": { "type": "integer", "description": "Max files to read (default 3000, max 50000)." } } } },
         { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])
@@ -238,5 +369,22 @@ pub fn serve() {
             let _ = writeln!(out, "{r}");
             let _ = out.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filetime_epoch_conversion() {
+        assert_eq!(filetime_to_unix(0), None);
+        // 1970-01-01 en FILETIME.
+        assert_eq!(filetime_to_unix(116_444_736_000_000_000), Some(0));
+        // Una hora después.
+        assert_eq!(
+            filetime_to_unix(116_444_736_000_000_000 + 10_000_000 * 3600),
+            Some(3600)
+        );
     }
 }
