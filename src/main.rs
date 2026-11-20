@@ -1,3 +1,4 @@
+#![recursion_limit = "1024"]
 #![windows_subsystem = "windows"]
 
 mod ai;
@@ -11,6 +12,7 @@ mod basket;
 mod catalog;
 mod cold;
 #[cfg(windows)]
+mod contents;
 mod dedup;
 mod dup;
 mod everything;

@@ -762,3 +762,37 @@ pub fn speed_test(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
 pub fn addons(_t: &Tree, _root: u32, _a: &Value) -> Result<Value, String> {
     Ok(crate::addons::to_json())
 }
+
+/// Buscar texto dentro de archivos (Fast: texto/PDF; Deep: OCR).
+pub fn content_search(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    let query = a
+        .get("query")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .ok_or("Give a 'query' to search for.")?;
+    need_path(root, a)?;
+    let deep = is_deep(a);
+    let max_files = a
+        .get("max_files")
+        .and_then(Value::as_u64)
+        .unwrap_or(if deep { 50_000 } else { 4_000 })
+        .clamp(1, 200_000) as usize;
+    let budget = a
+        .get("budget_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(if deep { 60_000 } else { 2_500 }) as u128;
+    let rep = crate::contents::search(t, root, query, deep, max_files, budget, limit);
+    let mut v = rep.to_json(query, limit);
+    v["mode"] = json!(mode_name(deep));
+    v["root"] = json!(t.full_path(root));
+    Ok(v)
+}
+
+/// Estimación de cuánto tardaría buscar dentro antes de lanzarlo.
+pub fn content_estimate(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
+    need_path(root, a)?;
+    let mut v = crate::contents::estimate(t, root);
+    v["root"] = json!(t.full_path(root));
+    Ok(v)
+}

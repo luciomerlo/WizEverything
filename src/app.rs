@@ -514,6 +514,9 @@ pub struct App {
     timeline_frames: Vec<crate::timeline::Meta>,
     timeline_sel: usize,
     timeline_deep: bool,
+    content_open: bool,
+    content_query: String,
+    content_deep: bool,
     ab: Option<crate::audio_ab::AbPlayer>,
     ab_error: Option<String>,
     ab_blind: bool,
@@ -629,6 +632,9 @@ impl App {
             timeline_frames: Vec::new(),
             timeline_sel: 0,
             timeline_deep: false,
+            content_open: false,
+            content_query: String::new(),
+            content_deep: false,
             ab: None,
             ab_error: None,
             ab_blind: false,
@@ -1342,6 +1348,17 @@ impl eframe::App for App {
                 });
             self.backup_open = open;
         }
+        if self.content_open {
+            let mut open = true;
+            egui::Window::new(tr("Buscar dentro de archivos (exp)", "Search inside files (exp)"))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([640.0, 220.0])
+                .show(&ctx, |ui| {
+                    self.content_ui(ui, &tree);
+                });
+            self.content_open = open;
+        }
         if self.timeline_open {
             let mut open = true;
             egui::Window::new(tr("Línea de tiempo (exp)", "Timeline (exp)"))
@@ -1737,6 +1754,16 @@ impl App {
                     );
                 }
                 if ui
+                    .button(tr("Buscar dentro de archivos (exp)", "Search inside files (exp)"))
+                    .on_hover_text(tr(
+                        "Busca texto en archivos de texto/código y PDFs (con pdftotext). Profundo agrega OCR con Tesseract. Antes podés ver cuánto tardaría. (Experimental)",
+                        "Searches text in text/code files and PDFs (via pdftotext). Deep adds OCR with Tesseract. You can estimate the time first. (Experimental)",
+                    ))
+                    .clicked()
+                {
+                    self.content_open = true;
+                }
+                if ui
                     .button(tr("Candidatos a compresión", "Compression candidates"))
                     .on_hover_text(tr(
                         "Archivos fríos que no están ya comprimidos y ganarían espacio con compresión LZX de Windows. Solo plan; no comprime todavía.",
@@ -1838,6 +1865,126 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Ventana para buscar dentro de archivos, con estimación previa.
+    fn content_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
+        ui.label(tr("Texto a buscar (sin distinguir mayúsculas)", "Text to find (case-insensitive)"));
+        ui.text_edit_singleline(&mut self.content_query);
+        ui.checkbox(&mut self.content_deep, tr(
+            "Profundo: OCR de imágenes y PDFs escaneados (más lento)",
+            "Deep: OCR for images and scanned PDFs (slower)",
+        ));
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.content_query.trim().is_empty(), egui::Button::new(tr("Buscar", "Search")))
+                .clicked()
+            {
+                let q = self.content_query.trim().to_string();
+                let budget = if self.content_deep { 15_000 } else { 2_500 };
+                let rep = crate::contents::search(tree, self.view_root, &q, self.content_deep, 20_000, budget, 100);
+                let mut v = rep.to_json(&q, 100);
+                v["mode"] = serde_json::json!(if self.content_deep { "deep" } else { "fast" });
+                v["root"] = serde_json::json!(tree.full_path(self.view_root));
+                self.set_report(tr("Buscar dentro de archivos (exp)", "Search inside files (exp)"), Ok(v));
+            }
+            if ui
+                .button(tr("Estimar antes", "Estimate first"))
+                .on_hover_text(tr(
+                    "Cuenta archivos de texto, PDF e imágenes y estima Fast/Deep sin leer el contenido.",
+                    "Counts text/PDF/image files and estimates Fast/Deep without reading content.",
+                ))
+                .clicked()
+            {
+                let mut v = crate::contents::estimate(tree, self.view_root);
+                v["root"] = serde_json::json!(tree.full_path(self.view_root));
+                self.set_report(tr("Estimación de búsqueda (exp)", "Search estimate (exp)"), Ok(v));
+            }
+        });
+        ui.separator();
+        ui.label(RichText::new(tr(
+            "Fast: texto/código y primeras páginas de PDF. Deep: OCR con Tesseract (si está instalado) e imágenes.",
+            "Fast: text/code and first PDF pages. Deep: OCR with Tesseract (if installed) and images.",
+        )).weak().size(10.0));
+    }
+
+    fn content_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Resultados", "Results"));
+        ui.label(RichText::new(format!(
+            "«{}»  ·  {} {}  ·  {} ms{}",
+            v["query"].as_str().unwrap_or(""),
+            v["matches"],
+            tr("coincidencias", "matches"),
+            v["elapsed_ms"].as_u64().unwrap_or(0),
+            if v["partial"].as_bool().unwrap_or(false) { tr(" · parcial", " · partial") } else { "" }
+        )).strong());
+        ui.label(RichText::new(format!(
+            "{} {}  ·  {} {}",
+            fmt_int(v["scanned"].as_u64().unwrap_or(0)),
+            tr("archivos revisados", "files scanned"),
+            fmt_size(v["bytes_scanned"].as_u64().unwrap_or(0)),
+            tr("leídos", "read")
+        )).weak().size(10.0));
+        ui.separator();
+        if let Some(top) = v["top"].as_array() {
+            egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                for h in top {
+                    ui.label(RichText::new(h["path"].as_str().unwrap_or("")).monospace().size(11.0));
+                    ui.label(RichText::new(h["snippet"].as_str().unwrap_or("")).size(11.0));
+                    ui.label(RichText::new(format!(
+                        "{} · {}",
+                        fmt_size(h["size"].as_u64().unwrap_or(0)),
+                        h["kind"].as_str().unwrap_or("")
+                    )).weak().size(9.0));
+                    ui.separator();
+                }
+            });
+        }
+        if let Some(notes) = v["notes"].as_array() {
+            for n in notes {
+                if let Some(n) = n.as_str() { ui.label(RichText::new(format!("• {n}")).weak().size(10.0)); }
+            }
+        }
+    }
+
+    fn content_estimate_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Cuánto tardaría", "How long it would take"));
+        ui.label(RichText::new(v["root"].as_str().unwrap_or("")).monospace().size(10.0));
+        egui::Grid::new("content_est").num_columns(3).spacing([16.0, 4.0]).show(ui, |ui| {
+            ui.label(RichText::new(tr("Tipo", "Type")).strong());
+            ui.label(RichText::new(tr("Archivos", "Files")).strong());
+            ui.label(RichText::new(tr("Tamaño", "Size")).strong());
+            ui.end_row();
+            for k in ["text", "pdf", "images"] {
+                if let Some(x) = v.get(k) {
+                    ui.label(k);
+                    ui.label(fmt_int(x["files"].as_u64().unwrap_or(0)));
+                    ui.label(fmt_size(x["bytes"].as_u64().unwrap_or(0)));
+                    ui.end_row();
+                }
+            }
+        });
+        ui.add_space(6.0);
+        ui.label(RichText::new(format!(
+            "{}: {} s",
+            tr("Fast estimado", "Estimated fast"),
+            v["estimated_seconds_fast"]
+        )).strong());
+        ui.label(RichText::new(format!(
+            "{}: {} s",
+            tr("Deep estimado", "Estimated deep"),
+            v["estimated_seconds_deep"]
+        )).strong());
+        ui.label(RichText::new(format!(
+            "pdftotext: {}  ·  tesseract: {}",
+            if v["pdftotext"].as_bool().unwrap_or(false) { "sí" } else { "no" },
+            if v["tesseract"].as_bool().unwrap_or(false) { "sí" } else { "no" }
+        )).weak().size(10.0));
+        if let Some(notes) = v["notes"].as_array() {
+            for n in notes {
+                if let Some(n) = n.as_str() { ui.label(RichText::new(format!("• {n}")).weak().size(10.0)); }
+            }
+        }
     }
 
     /// Línea de tiempo: elegir dos snapshots y compararlos.
@@ -4386,6 +4533,8 @@ impl App {
             Some("provenance") => self.provenance_report_ui(ui, v),
             Some("speed") => self.speed_report_ui(ui, v),
             Some("addons") => self.addons_report_ui(ui, v),
+            Some("content") => self.content_report_ui(ui, v),
+            Some("content_estimate") => self.content_estimate_report_ui(ui, v),
             _ => {
                 ui.add(
                     egui::Label::new(

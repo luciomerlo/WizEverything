@@ -314,6 +314,8 @@ impl Server {
             "quarantine_list" => crate::mcp_tools::quarantine_list(&t, root, &a, limit),
             "speed_test" => crate::mcp_tools::speed_test(&t, root, &a),
             "addons" => crate::mcp_tools::addons(&t, root, &a),
+            "content_search" => crate::mcp_tools::content_search(&t, root, &a, limit),
+            "content_estimate" => crate::mcp_tools::content_estimate(&t, root, &a),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -467,6 +469,14 @@ pub fn tools() -> Value {
             "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast uses classes and local percentages; deep measures read/download (and write if asked)." } } } },
         { "name": "addons", "description": "Detects optional external tools (rclone and gphotos-sync for Google Photos, Tesseract OCR, pdftotext) and returns setup steps and commands. Read-only; no credentials. Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "content_search", "description": "Search inside files under 'path'. Fast reads text/code and the first pages of PDFs via pdftotext; deep adds OCR for images and scanned PDFs via tesseract and reads more pages. Returns snippets, elapsed_ms and partial. Uses external tools if installed; read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "query": { "type": "string", "description": "Text to find (case-insensitive)." },
+            "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) or deep with OCR." },
+            "max_files": { "type": "integer", "description": "Safety cap (default 4000 fast / 50000 deep)." },
+            "budget_ms": { "type": "integer", "description": "Wall-clock budget (default 2500 fast / 60000 deep)." },
+            "limit": limit }, "required": ["path", "query"] } },
+        { "name": "content_estimate", "description": "Estimates how many text/PDF/image files are under a folder and how long a fast or deep content search would take, before running it. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path } } },
         { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])

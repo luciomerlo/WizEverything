@@ -549,7 +549,7 @@ fn mcp_handshake_and_tools() {
     assert!(s.handle(&serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
     let list = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
     let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["drives", "folder_sizes", "largest_files", "file_types", "find_duplicates", "dev_artifacts", "scan_integrity", "cloud_audit", "hardlink_plan", "cold_files", "cold_folders", "compression_candidates", "snapshot_save", "snapshot_diff", "catalog_save", "catalog_check", "similar_images", "similar_audio", "github_mode", "why_full", "growth", "advice", "backup_check", "volumes", "volume_duplicates", "volume_lookup", "provenance", "timeline", "quarantine_list", "speed_test", "addons", "refresh"]);
+    assert_eq!(names, ["drives", "folder_sizes", "largest_files", "file_types", "find_duplicates", "dev_artifacts", "scan_integrity", "cloud_audit", "hardlink_plan", "cold_files", "cold_folders", "compression_candidates", "snapshot_save", "snapshot_diff", "catalog_save", "catalog_check", "similar_images", "similar_audio", "github_mode", "why_full", "growth", "advice", "backup_check", "volumes", "volume_duplicates", "volume_lookup", "provenance", "timeline", "quarantine_list", "speed_test", "addons", "content_search", "content_estimate", "refresh"]);
     let writers = ["snapshot_save", "catalog_save"];
     assert!(
         list["result"]["tools"].as_array().unwrap().iter().all(|t| {

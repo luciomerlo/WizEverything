@@ -3,6 +3,15 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.15.0] - 2026-11-20
+
+### Added
+- **Buscar dentro de archivos (exp)**: texto/código y PDFs vía `pdftotext` en modo rápido; OCR de
+  imágenes y PDFs escaneados vía `tesseract` en modo profundo, con estimación previa de archivos y
+  tiempo. Nuevos tools MCP `content_search` y `content_estimate` y ventana/panel en la app.
+  Corrige la detección de `pdftotext` (usa `-v`, no `--version`), limita la lectura en memoria y
+  protege los fragmentos con Unicode.
+
 ## [0.14.0] - 2026-11-20
 
 ### Added

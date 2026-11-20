@@ -138,7 +138,8 @@ Tools (all read-only except `snapshot_save`/`catalog_save`, which write only int
 `scan_integrity`, `cloud_audit`, `hardlink_plan`, `cold_files`, `cold_folders`, `compression_candidates`,
 `similar_images`, `similar_audio`, `github_mode`, `why_full`, `growth`, `advice`, `backup_check`,
 `snapshot_save`, `snapshot_diff`, `catalog_save`, `catalog_check`, `volumes`, `volume_duplicates`,
-`volume_lookup`, `provenance`, `timeline`, `quarantine_list`, `speed_test`, `refresh`. Tools with a
+`volume_lookup`, `provenance`, `timeline`, `quarantine_list`, `speed_test`, `content_search`,
+`content_estimate`, `addons`, `refresh`. Tools with a
 thorough variant accept `mode: "fast" | "deep"` (or `deep: true`).
 
 Claude Code:
