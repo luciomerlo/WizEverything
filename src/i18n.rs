@@ -40,6 +40,8 @@ pub enum Theme {
     System,
     Light,
     Dark,
+    /// Claro de alto contraste: fondo papel, texto negro y bordes marcados.
+    Contrast,
 }
 
 pub struct Settings {
@@ -96,6 +98,7 @@ impl Settings {
                 ("lang", "en") => s.lang = Lang::En,
                 ("theme", "light") => s.theme = Theme::Light,
                 ("theme", "dark") => s.theme = Theme::Dark,
+                ("theme", "contrast") => s.theme = Theme::Contrast,
                 ("theme", "system") => s.theme = Theme::System,
                 ("show_treemap", v) => s.show_treemap = v != "0",
                 ("show_exts", v) => s.show_exts = v != "0",
@@ -123,6 +126,7 @@ impl Settings {
                 Theme::System => "system",
                 Theme::Light => "light",
                 Theme::Dark => "dark",
+                Theme::Contrast => "contrast",
             },
             self.show_treemap as u8,
             self.show_exts as u8,
@@ -145,6 +149,14 @@ impl Settings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contrast_theme_round_trips() {
+        let mut s = Settings::parse("", Lang::Es);
+        s.theme = Theme::Contrast;
+        let back = Settings::parse(&s.to_text(), Lang::En);
+        assert_eq!(back.theme, Theme::Contrast);
+    }
 
     #[test]
     fn settings_roundtrip() {

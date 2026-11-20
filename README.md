@@ -7,6 +7,22 @@ without administrator rights.
 
 Written in Rust with [egui](https://github.com/emilk/egui).
 
+> **A tribute to Everything, not a replacement.**
+> WizEverything is an independent **homage to [Everything](https://www.voidtools.com/) by voidtools**.
+> It is not affiliated with, endorsed by, or shipped by voidtools.
+>
+> It is meant to **complement Everything**: Everything keeps the index and does the searching;
+> WizEverything reads that in-memory index (via IPC) and adds disk-usage visualization, duplicate
+> analysis and storage forensics on top. Everything 1.4 or later must be running with file sizes indexed.
+>
+> If you prefer a smaller, self-contained tool, use **Census**, a reduced version of this approach
+> (less surface area, same idea of looking at what already exists instead of walking the disk again).
+>
+> *En español: WizEverything es un homenaje independiente a Everything de voidtools, sin relación
+> oficial con sus autores. Está pensado para complementarlo, no para reemplazarlo: Everything mantiene
+> el índice y busca; WizEverything lo lee y agrega visualización y análisis. Si querés algo más
+> chico, usá **Census**, una versión reducida.*
+
 ## Features
 
 ### Disk usage
@@ -39,7 +55,7 @@ Written in Rust with [egui](https://github.com/emilk/egui).
   export to CSV.
 
 ### App
-- Light / dark / system theme, English / Spanish UI (defaults to the Windows language).
+- Light / dark / **high-contrast** / system theme, English / Spanish UI (defaults to the Windows language).
 - System tray, single instance, **close to tray** option, **Start with Windows** (`--background`, index preloaded).
 
 ## Advanced storage analysis (in the app and via MCP)

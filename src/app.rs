@@ -416,12 +416,64 @@ impl TrayItems {
     }
 }
 
+/// Claro de alto contraste: fondo papel, tinta negra y bordes gruesos.
+/// Pensado para pantallas con brillo bajo, monitores viejos o vista cansada.
+fn contrast_visuals() -> egui::Visuals {
+    use egui::{Color32, Stroke};
+    let mut v = egui::Visuals::light();
+    v.dark_mode = false;
+    v.override_text_color = Some(Color32::from_rgb(8, 8, 8));
+    v.panel_fill = Color32::from_rgb(252, 252, 247);
+    v.window_fill = Color32::WHITE;
+    v.faint_bg_color = Color32::from_rgb(238, 238, 230);
+    v.extreme_bg_color = Color32::WHITE;
+    v.text_edit_bg_color = Some(Color32::WHITE);
+    v.code_bg_color = Color32::from_rgb(240, 240, 232);
+    v.hyperlink_color = Color32::from_rgb(0, 60, 150);
+    v.warn_fg_color = Color32::from_rgb(150, 70, 0);
+    v.error_fg_color = Color32::from_rgb(170, 0, 0);
+    v.window_stroke = Stroke::new(1.5, Color32::from_gray(55));
+    v.selection = egui::style::Selection {
+        bg_fill: Color32::from_rgb(0, 70, 160),
+        stroke: Stroke::new(1.0, Color32::WHITE),
+    };
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_gray(85));
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_gray(10));
+    v.widgets.inactive.bg_fill = Color32::from_rgb(232, 232, 224);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(244, 244, 236);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(90));
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_gray(10));
+    v.widgets.hovered.bg_fill = Color32::from_rgb(214, 228, 248);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(224, 235, 250);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.5, Color32::from_rgb(0, 70, 160));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::BLACK);
+    v.widgets.active.bg_fill = Color32::from_rgb(190, 212, 242);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(200, 220, 245);
+    v.widgets.active.bg_stroke = Stroke::new(2.0, Color32::from_rgb(0, 55, 130));
+    v.widgets.active.fg_stroke = Stroke::new(2.0, Color32::BLACK);
+    v
+}
+
 fn apply_theme(ctx: &egui::Context, t: Theme) {
-    ctx.set_theme(match t {
-        Theme::System => egui::ThemePreference::System,
-        Theme::Light => egui::ThemePreference::Light,
-        Theme::Dark => egui::ThemePreference::Dark,
-    });
+    match t {
+        Theme::System => {
+            ctx.set_visuals_of(egui::Theme::Light, egui::Visuals::light());
+            ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals::dark());
+            ctx.set_theme(egui::ThemePreference::System);
+        }
+        Theme::Light => {
+            ctx.set_visuals_of(egui::Theme::Light, egui::Visuals::light());
+            ctx.set_theme(egui::ThemePreference::Light);
+        }
+        Theme::Dark => {
+            ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals::dark());
+            ctx.set_theme(egui::ThemePreference::Dark);
+        }
+        Theme::Contrast => {
+            ctx.set_visuals_of(egui::Theme::Light, contrast_visuals());
+            ctx.set_theme(egui::ThemePreference::Light);
+        }
+    }
 }
 
 pub struct App {
@@ -1556,6 +1608,11 @@ impl App {
                 ui.selectable_value(&mut theme, Theme::System, tr("Sistema", "System"));
                 ui.selectable_value(&mut theme, Theme::Light, tr("☀ Claro", "☀ Light"));
                 ui.selectable_value(&mut theme, Theme::Dark, tr("☾ Oscuro", "☾ Dark"));
+                ui.selectable_value(&mut theme, Theme::Contrast, tr("◑ Alto contraste", "◑ High contrast"))
+                    .on_hover_text(tr(
+                        "Fondo claro, texto negro y bordes marcados. Más fácil de ver con brillo bajo o vista cansada.",
+                        "Light background, black text and strong borders. Easier on low brightness or tired eyes.",
+                    ));
             });
             if theme != self.settings.theme {
                 self.settings.theme = theme;
