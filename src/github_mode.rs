@@ -211,7 +211,11 @@ pub fn inspect(start: &Path, sizes: Option<&TreeSizes>, opts: &Opts) -> Value {
     }
     if remote.is_empty() {
         // nothing
-    } else if fetched {
+    } else {
+        // Fast mode reads the local origin refs; deep mode has just refreshed them.
+        if !fetched {
+            notes.push("Sin fetch: se compara contra la última copia conocida de origin. Usá profundo para actualizar.".into());
+        }
         let mut up = git(&root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
             .unwrap_or_default();
         if up.is_empty() || git(&root, &["rev-parse", "--verify", "--quiet", &up]).is_err() {
@@ -240,12 +244,6 @@ pub fn inspect(start: &Path, sizes: Option<&TreeSizes>, opts: &Opts) -> Value {
         }
         upstream = up;
         remote_sha = git(&root, &["rev-parse", "--verify", &upstream]).unwrap_or_default();
-    } else if opts.fetch {
-        // Cheap remote probe without touching refs.
-        if let Ok(o) = git(&root, &["ls-remote", "origin", &format!("refs/heads/{branch}")]) {
-            remote_sha = o.split_whitespace().next().unwrap_or("").to_string();
-            upstream = format!("origin/{branch}");
-        }
     }
 
     let mut ahead = 0u64;
@@ -254,7 +252,7 @@ pub fn inspect(start: &Path, sizes: Option<&TreeSizes>, opts: &Opts) -> Value {
     if !remote_sha.is_empty() {
         if remote_sha == head {
             verified = true;
-        } else if fetched {
+        } else {
             if let Ok(c) = git(&root, &["rev-list", "--left-right", "--count", &format!("HEAD...{upstream}")]) {
                 let mut parts = c.split_whitespace();
                 ahead = parts.next().and_then(|x| x.parse().ok()).unwrap_or(0);

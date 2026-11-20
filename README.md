@@ -42,11 +42,11 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 - Light / dark / system theme, English / Spanish UI (defaults to the Windows language).
 - System tray, single instance, **close to tray** option, **Start with Windows** (`--background`, index preloaded).
 
-## Advanced storage analysis (engines ready, in-app panels in progress)
+## Advanced storage analysis (in the app and via MCP)
 
 A suite of analyzers that lean entirely on Everything's in-memory index (no directory walking)
-and on Win32 metadata, minimizing physical disk I/O. The engines are implemented and unit-tested;
-the in-app panels that drive them are being wired up.
+and on Win32 metadata, minimizing physical disk I/O. Every engine is implemented, unit-tested and
+exposed both in the desktop app and through the MCP server.
 
 - **Deduplication & hardlinks** — 3-stage exact match (size → NTFS file id → partial BLAKE3 of 3 blocks → full
   BLAKE3), plus atomic same-volume hardlink merging that keeps every path. Plans are dry-run by default.
@@ -61,15 +61,72 @@ the in-app panels that drive them are being wired up.
   HTML error pages saved with binary extensions.
 - **Portable offline catalogs (`.ecat`)** — a Zstd-compressed inventory of external/offline volumes,
   cross-referenced against local files.
-- **GitHub mode** — for any chosen folder: is the local copy up to date with the web, newer than it
+- **GitHub mode** (experimental) — for any chosen folder: is the local copy up to date with the web, newer than it
   (unpushed commits), behind or diverged? Then explains commits, changed files, size and per-folder gaps.
   Read-only; `git fetch` is optional (`fetch=false` stays offline).
-- **Similar files (images & audio)** — finds near-duplicates that are not byte-identical: perceptual
+- **Similar files (images & audio)** (experimental) — finds near-duplicates that are not byte-identical: perceptual
   hashes (dHash + aHash, LSH-banded) for photos resized/recompressed/re-exported, and tag + duration
   matching for the same track across FLAC/MP3/M4A. Each group suggests which copy to keep by quality
   and offers reversible alternatives (quarantine, keep both edits, archive).
+  For copies that differ in processing (e.g. `Song.wav` vs `Song (denoised).wav`), it decodes a bounded
+  20 s window per candidate (with a wall-clock budget) and measures the real noise floor, SNR, digital silence, high-frequency content
+  and spectral stability: it tells a clean denoise from an over-filtered one (dull or "musical noise")
+  and explains the difference in plain language. Denoise markers are ignored when matching names. Results open in a visual
+  panel with thumbnails, the copy to keep and the candidates, not as raw JSON.
+  It also includes **audio A/B**: both copies play from the same frame position (up to two minutes)
+  and the app alternates which one is audible every 0.5–4 s, with blind mode, manual A/B, side swap
+  and a position slider. For images, **zoom comparison**: the same normalised area of both side by
+  side at 1×–16×, panned by the mouse, so a lower-resolution copy shows its blur immediately.
+- **Visual GitHub panel** — the repo status becomes a colored headline plus a size-per-folder table
+  (disk vs tracked vs delta) and collapsible commit/file lists, instead of JSON text.
+- **Type filter in the left explorer** — the baobab/rings view can send the highlighted type to the
+  explorer with one click (↙): the tree rescales to that type's bytes and the files list keeps only
+  that type, with a removable chip in the tab bar.
+- **"Why is it full?"** — top folders/files with percentages, free space and the chain of biggest
+  children down to the leaf that actually holds the space. Read-only.
+- **"What grew?"** — diffs the two newest snapshots and attributes every new/grown file to its parent
+  folder, so growth arrives as a ranked folder list. Snapshots see what the index sees: refresh (F5)
+  before saving if files were just created.
+- **"Can I delete this?"** — second opinion for any file/folder: safe / caution / keep, with reasons
+  (regenerable build output, git-tracked, hard links, cloud placeholder, system folder, personal data,
+  age), the real reclaimable bytes and the action to stage it in the basket.
+- **"Is it backed up?"** — compares a folder against another copy by relative path and size: coverage %,
+  missing bytes, same-name-different-size and extras only in the backup. Both folders must be indexed.
+- **Action basket** (experimental) — stages hardlink merges, LZX compression and reversible quarantine,
+  shows a dry-run estimate, and only executes after an explicit "I understand this modifies files"
+  checkbox. Writes one JSONL line per operation to `%LOCALAPPDATA%\WizEverythingudit.jsonl` and keeps
+  a manifest so quarantined files can be restored.
+
+Audio A/B and the image zoom comparison are local only: audio is decoded and played through the
+default output device (`cpal`); images never leave the machine.
 
 Every mutating operation runs as a dry-run first and writes a JSONL audit log before touching the disk.
+
+## Fast and deep
+
+Every analyzer that can afford a thorough pass answers in two explicit modes:
+
+- **Fast (default)** — a budget or a cap instead of a stall. It always returns an answer and marks the
+  result `partial` when the budget cut it short, with `elapsed_ms` and percentages where exactness is
+  expensive. Git comparisons use the last known `origin` refs without touching the network.
+- **Deep** — no budget: every candidate is analysed (`mode: "deep"` in MCP, or the **profundo** button in
+  the app). Slower by design, for when the answer matters more than the wait.
+
+Both modes are listed in the MCP schema (`mode: "fast" | "deep"`, and `deep: true` as an alias) and the
+result repeats which one produced it. In the app, after a fast run the **profundo** button's hover shows
+how long the fast one took and the estimated deep time, so the slower choice is informed.
+
+## Fast by design
+
+- Everything comes from Everything's in-memory index: no directory walking, no re-reading files for sizes.
+- Anything that would need per-file work has a budget and degrades gracefully: audio noise analysis decodes
+  at most 20 s per copy, stops after ~1.2 s of wall clock or 120 files, and reports `elapsed_ms`, how many
+  groups were measured and whether the result is partial. Deep mode raises that to 120 s per copy and 60 s
+  of wall clock, so it can measure the whole library when you ask for it.
+- When the exact answer would be slow, the app gives a **percentage** instead of stalling: perceptual
+  image similarity, acoustic similarity, backup coverage, growth attribution, deletion confidence.
+- Expensive detail is opt-in: A/B playback decodes up to two minutes only when you press play; the zoom
+  comparison loads full images only when you open it.
 
 ## Use it from an AI (MCP server)
 
@@ -78,8 +135,11 @@ using the same Everything index. It can run alongside the desktop app.
 
 Tools (all read-only except `snapshot_save`/`catalog_save`, which write only into `%LOCALAPPDATA%\WizEverything`):
 `drives`, `folder_sizes`, `largest_files`, `file_types`, `find_duplicates`, `dev_artifacts`,
-`scan_integrity`, `cloud_audit`, `hardlink_plan`, `cold_files`, `compression_candidates`,
-`similar_images`, `similar_audio`, `github_mode`, `snapshot_save`, `snapshot_diff`, `catalog_save`, `catalog_check`, `refresh`.
+`scan_integrity`, `cloud_audit`, `hardlink_plan`, `cold_files`, `cold_folders`, `compression_candidates`,
+`similar_images`, `similar_audio`, `github_mode`, `why_full`, `growth`, `advice`, `backup_check`,
+`snapshot_save`, `snapshot_diff`, `catalog_save`, `catalog_check`, `volumes`, `volume_duplicates`,
+`volume_lookup`, `provenance`, `timeline`, `quarantine_list`, `speed_test`, `refresh`. Tools with a
+thorough variant accept `mode: "fast" | "deep"` (or `deep: true`).
 
 Claude Code:
 

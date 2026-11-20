@@ -549,7 +549,7 @@ fn mcp_handshake_and_tools() {
     assert!(s.handle(&serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
     let list = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
     let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["drives", "folder_sizes", "largest_files", "file_types", "find_duplicates", "dev_artifacts", "scan_integrity", "cloud_audit", "hardlink_plan", "cold_files", "cold_folders", "compression_candidates", "snapshot_save", "snapshot_diff", "catalog_save", "catalog_check", "similar_images", "similar_audio", "github_mode", "refresh"]);
+    assert_eq!(names, ["drives", "folder_sizes", "largest_files", "file_types", "find_duplicates", "dev_artifacts", "scan_integrity", "cloud_audit", "hardlink_plan", "cold_files", "cold_folders", "compression_candidates", "snapshot_save", "snapshot_diff", "catalog_save", "catalog_check", "similar_images", "similar_audio", "github_mode", "why_full", "growth", "advice", "backup_check", "volumes", "volume_duplicates", "volume_lookup", "provenance", "timeline", "quarantine_list", "speed_test", "addons", "refresh"]);
     let writers = ["snapshot_save", "catalog_save"];
     assert!(
         list["result"]["tools"].as_array().unwrap().iter().all(|t| {
@@ -767,4 +767,36 @@ fn smart_keep_prefers_the_official_copy() {
     assert!(s("C:\\Users\\me\\Pictures\\x.png") > s("C:\\Users\\me\\AppData\\Local\\Temp\\x.png"));
     // The preferred drive beats everything else.
     assert!(keep_score("H:\\Mi unidad\\Backup\\a.mp3", "h:\\").0 > keep_score("C:\\Users\\me\\Music\\a.mp3", "h:\\").0);
+}
+#[test]
+fn fast_and_deep_modes_are_explicit() {
+    use crate::mcp_tools::{is_deep, mode_name};
+    assert!(!is_deep(&serde_json::json!({})));
+    assert!(!is_deep(&serde_json::json!({ "mode": "fast" })));
+    assert!(is_deep(&serde_json::json!({ "mode": "deep" })));
+    assert!(is_deep(&serde_json::json!({ "deep": true })));
+    assert!(!is_deep(&serde_json::json!({ "deep": false, "mode": "fast" })));
+    assert_eq!(mode_name(true), "deep");
+    assert_eq!(mode_name(false), "fast");
+}
+
+#[test]
+fn deep_estimates_scale_from_the_fast_run() {
+    use crate::app::estimate_deep;
+    use serde_json::json;
+    // Audio: deep decodes 6x the window (20 s -> 120 s).
+    let audio = json!({ "files": 10, "analyzed": 10, "skipped": 0, "partial": false });
+    assert_eq!(estimate_deep("audio", 300, &audio), 1_800);
+    // Images: fast stopped at half, deep repeats the work it could not finish.
+    let imgs = json!({ "files": 4_000, "analyzed": 2_000, "partial": true });
+    assert_eq!(estimate_deep("images", 5_000, &imgs), 10_000);
+    // Growth: only half the changes were attributed -> ~2x.
+    let growth = json!({ "added": 500, "removed": 200, "grown": 200, "shrunk": 100, "attributed_pct": 50.0 });
+    assert_eq!(estimate_deep("growth", 1_000, &growth), 2_000);
+    // Backup: truncated at the fast cap -> 5x (50k -> 250k).
+    let backup = json!({ "truncated": true });
+    assert_eq!(estimate_deep("backup", 100, &backup), 500);
+    // Never below the measured fast time.
+    let clean = json!({ "files": 10, "analyzed": 10, "partial": false });
+    assert_eq!(estimate_deep("images", 1_200, &clean), 1_200);
 }

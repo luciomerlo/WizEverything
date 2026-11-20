@@ -21,6 +21,8 @@ pub enum Op {
     Compress { path: PathBuf },
     /// Deshidratar un placeholder de nube (Módulo 2).
     Dehydrate { path: PathBuf },
+    /// Mover a la cuarentena de la app (reversible, con manifiesto).
+    Quarantine { path: PathBuf },
 }
 
 impl Op {
@@ -33,6 +35,7 @@ impl Op {
             Op::Delete { path } => format!("delete {}", path.display()),
             Op::Compress { path } => format!("compress-lzx {}", path.display()),
             Op::Dehydrate { path } => format!("dehydrate {}", path.display()),
+            Op::Quarantine { path } => format!("quarantine {}", path.display()),
         }
     }
 
@@ -43,6 +46,7 @@ impl Op {
             Op::Delete { .. } => "delete",
             Op::Compress { .. } => "compress_lzx",
             Op::Dehydrate { .. } => "dehydrate",
+            Op::Quarantine { .. } => "quarantine",
         }
     }
 }

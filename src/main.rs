@@ -1,8 +1,13 @@
 #![windows_subsystem = "windows"]
 
 mod ai;
+mod addons;
 mod app;
+mod audio_ab;
+mod advice;
 mod autostart;
+mod backup;
+mod basket;
 mod catalog;
 mod cold;
 #[cfg(windows)]
@@ -17,19 +22,28 @@ mod hashcache;
 #[cfg(windows)]
 mod hardlink;
 mod i18n;
+mod img_ab;
 mod magic;
+mod noise;
 mod mcp;
 mod mcp_tools;
 mod reparse;
 mod similar;
 mod snapshot;
+mod throughput;
+mod timeline;
 mod tree;
 mod sunburst;
 mod sweeper;
 mod treemap;
+mod provenance;
+mod quarantine;
+mod volumes;
+mod volinfo;
 
 #[cfg(windows)]
 mod winphys;
+mod why;
 #[cfg(windows)]
 mod wof;
 #[cfg(test)]
@@ -160,7 +174,10 @@ fn main() -> eframe::Result {
         let groq = ai::Groq::new(key);
         let excluded = settings.excluded_drives.clone();
         let mut server = mcp::Server::new(Box::new(move || {
-            tree::load(std::sync::Arc::new(tree::Progress::default()), &excluded).map(std::sync::Arc::new)
+            let saved = volumes::Store::default().enabled_full();
+            let offline = volumes::offline_drives(&saved);
+            tree::load_with_offline(std::sync::Arc::new(tree::Progress::default()), &excluded, &offline)
+                .map(std::sync::Arc::new)
         }));
         let spanish = settings.lang == i18n::Lang::Es;
         match ai::ask_auto(&groq, None, &question, &mut server, spanish, &|m: &str| eprintln!("[trying {m}]")) {

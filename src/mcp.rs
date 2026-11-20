@@ -68,6 +68,12 @@ impl Server {
             let t = self.tree()?;
             return Ok(json!({ "items": t.nodes.len() - 1, "load_ms": t.load_ms }));
         }
+        // Estos dos no exigen que la ruta exista en el índice (puede ser de un
+        // disco guardado que ya no está conectado).
+        if name == "volume_lookup" {
+            let t = self.tree()?;
+            return crate::mcp_tools::volume_lookup(&t, ROOT, a);
+        }
         let t = self.tree()?;
         let root = match a.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()) {
             // Accept C:/Users/... as well as C:\Users\...
@@ -154,11 +160,12 @@ impl Server {
                 if root == ROOT && !a.get("all_drives").and_then(Value::as_bool).unwrap_or(false) {
                     return Err("Give a 'path' to search (or all_drives=true; that can read a lot of data).".into());
                 }
+                let deep = crate::mcp_tools::is_deep(&a);
                 let opt = DupOptions {
                     root,
                     min_size: (a.get("min_size_mb").and_then(Value::as_f64).unwrap_or(1.0) * 1024.0 * 1024.0) as u64,
                     same_name: a.get("same_name").and_then(Value::as_bool).unwrap_or(true),
-                    verify: a.get("verify").and_then(Value::as_bool).unwrap_or(true),
+                    verify: a.get("verify").and_then(Value::as_bool).unwrap_or(deep),
                     versions: a.get("versions").and_then(Value::as_bool).unwrap_or(false),
                     // The app's saved exclusions plus any given here.
                     exclude: crate::i18n::Settings::load()
@@ -173,6 +180,7 @@ impl Server {
                 let groups = dup::find(t.clone(), opt, prog.clone());
                 let reclaimable: u64 = groups.iter().map(|g| g.wasted()).sum();
                 Ok(json!({
+                    "mode": if deep { "deep" } else { "fast" },
                     "groups": groups.len(),
                     "bytes_read_from_disk": prog.bytes_read.load(std::sync::atomic::Ordering::Relaxed),
                     "files_from_hash_cache": prog.cache_hits.load(std::sync::atomic::Ordering::Relaxed),
@@ -244,10 +252,11 @@ impl Server {
                             .into(),
                     );
                 }
+                let deep = crate::mcp_tools::is_deep(&a);
                 let max_scan = a
                     .get("max_scan")
                     .and_then(Value::as_u64)
-                    .unwrap_or(3000)
+                    .unwrap_or(if deep { 50_000 } else { 3_000 })
                     .clamp(1, 50_000) as usize;
                 let files = t.files_under(root);
                 let mut scanned = 0usize;
@@ -275,6 +284,7 @@ impl Server {
                     }
                 }
                 Ok(json!({
+                    "mode": if deep { "deep" } else { "fast" },
                     "scanned": scanned,
                     "suspicious": items.len(),
                     "scan_cap": max_scan,
@@ -293,6 +303,17 @@ impl Server {
             "similar_images" => crate::mcp_tools::similar_images(&t, root, &a, limit),
             "similar_audio" => crate::mcp_tools::similar_audio(&t, root, &a, limit),
             "github_mode" => crate::mcp_tools::github_mode(&t, root, &a, limit),
+            "why_full" => crate::mcp_tools::why_full(&t, root, &a, limit),
+            "growth" => crate::mcp_tools::growth_report(&t, root, &a, limit),
+            "advice" => crate::mcp_tools::advice(&t, root, &a),
+            "backup_check" => crate::mcp_tools::backup_check(&t, root, &a, limit),
+            "volumes" => crate::mcp_tools::volumes(&t, root, &a, limit),
+            "volume_duplicates" => crate::mcp_tools::volume_duplicates(&t, root, &a, limit),
+            "provenance" => crate::mcp_tools::provenance(&t, root, &a),
+            "timeline" => crate::mcp_tools::timeline(&t, root, &a, limit),
+            "quarantine_list" => crate::mcp_tools::quarantine_list(&t, root, &a, limit),
+            "speed_test" => crate::mcp_tools::speed_test(&t, root, &a),
+            "addons" => crate::mcp_tools::addons(&t, root, &a),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -344,7 +365,7 @@ pub fn tools() -> Value {
         { "name": "find_duplicates", "description": "Find duplicate files and folders (verified by content) under a folder. Read-only.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "min_size_mb": { "type": "number", "description": "Ignore files smaller than this (default 1)." },
-            "same_name": { "type": "boolean", "description": "Only compare files with the same name (default true, faster)." },
+            "same_name": { "type": "boolean", "description": "Only compare files with the same name (default true, faster)." }, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) uses budgets/caps; deep does the thorough pass." },
             "verify": { "type": "boolean", "description": "Confirm by content hashes (default true). false = name + size only, reads nothing (safe for cloud drives)." },
             "all_drives": { "type": "boolean", "description": "Search every included drive when no path is given." },
             "versions": { "type": "boolean", "description": "Old versions: same name and folder name on any drive, even if size/content differ. Index only." },
@@ -356,7 +377,7 @@ pub fn tools() -> Value {
         { "name": "scan_integrity", "description": "Check structured files (pdf, zip, 7z, rar, mp4, mkv, jpg, png, sqlite, exe, dll…) for corruption: zero-filled files, HTML error pages saved as binaries, or signature mismatches. Reads the first 32 bytes of each file. Read-only.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
-            "max_scan": { "type": "integer", "description": "Max files to read (default 3000, max 50000)." } } } },
+            "max_scan": { "type": "integer", "description": "Max files to read (default 3000 fast / 50000 deep, max 50000)." }, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) uses budgets/caps; deep does the thorough pass." }, } } },
         { "name": "cloud_audit", "description": "Audit sparse/offline/cloud files and reparse points: shows logical vs real on-disk size and the space that could be recovered. Read-only.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
@@ -395,18 +416,57 @@ pub fn tools() -> Value {
             "all_drives": { "type": "boolean", "description": "Check every included drive when no path is given." },
             "catalog": { "type": "string", "description": "Path to the .ecat file." },
             "max_entries": { "type": "integer", "description": "Safety cap (default 500000)." } }, "required": ["catalog"] } },
-        { "name": "similar_images", "description": "Finds near-duplicate images (same photo resized, recompressed or exported twice) using perceptual hashes, and suggests which copy to keep by quality. Read-only.", "annotations": ro,
+        { "name": "similar_images", "description": "Finds near-duplicate images (same photo resized, recompressed or exported twice) using perceptual hashes, and suggests which copy to keep by quality. Read-only. Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
             "max_files": { "type": "integer", "description": "Analyse at most this many images, largest first (default 4000)." },
-            "threshold": { "type": "integer", "description": "Hamming threshold 2–20 (default 10)." } } } },
-        { "name": "similar_audio", "description": "Groups the same track across formats/bitrates (FLAC vs MP3, etc.) by tags + duration and suggests which copy to keep by quality. Read-only.", "annotations": ro,
+            "threshold": { "type": "integer", "description": "Hamming threshold 2–20 (default 10)." }, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) uses budgets/caps; deep does the thorough pass." },
+            "budget_ms": { "type": "integer", "description": "Fast-first wall-clock budget (default 5000 ms in fast, 120000 ms in deep; max 120000). When reached, the result is partial and reports how many images were analysed." } } } },
+        { "name": "similar_audio", "description": "Groups the same track across formats/bitrates (FLAC vs MP3, etc.) even when tags differ (album vs TV/YouTube rip) using fuzzy title + duration, and suggests which copy to keep by quality. Decodes a bounded 20 s (fast) or 120 s (deep) window per copy under a time budget to compare noise floor, SNR, digital silence, high-frequency content and spectral stability, so denoised copies are matched with the original and rated on how they actually sound (clean vs over-filtered/musical noise). Results include similarity percentages and report elapsed_ms; when the budget is reached the rest is metadata-only and marked as partial. Read-only. Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
-            "max_files": { "type": "integer", "description": "Analyse at most this many audio files (default 20000)." } } } },
-        { "name": "github_mode", "description": "GitHub mode for any chosen folder: is the local copy up to date with the web, newer than it, behind or diverged? Then explains the differences by commits, changed files, size and top folders. Read-only; may run git fetch (fetch=false to stay offline).", "annotations": ro,
+            "max_files": { "type": "integer", "description": "Analyse at most this many audio files (default 20000)." }, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) uses budgets/caps; deep does the thorough pass." }, } } },
+        { "name": "github_mode", "description": "GitHub mode for any chosen folder: is the local copy up to date with the web, newer than it, behind or diverged? Then explains the differences by commits, changed files, size and top folders. Read-only; may run git fetch (fetch=false to stay offline). Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
-            "fetch": { "type": "boolean", "description": "Query the remote with git fetch (default true)." } }, "required": ["path"] } },
+            "fetch": { "type": "boolean", "description": "Query the remote with git fetch (default: deep only)." }, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) uses budgets/caps; deep does the thorough pass." } }, "required": ["path"] } },
+        { "name": "why_full", "description": "Explains why a folder is full: top folders and files with percentages, plus the chain of biggest children down to the leaf that really holds the space. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Analyse every included drive when no path is given." } } } },
+        { "name": "growth", "description": "What grew since the previous snapshot: compares the two newest .wzsnap files and ranks folders by net change, with new and grown files. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": {
+            "old": { "type": "string", "description": "Older .wzsnap (default: second newest in the app data folder)." },
+            "new": { "type": "string", "description": "Newer .wzsnap (default: newest)." }, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) uses budgets/caps; deep does the thorough pass." },
+            "limit": limit } } },
+        { "name": "advice", "description": "Second opinion before deleting: safe / caution / keep, with reasons (dev artifact, git-tracked, hard links, cloud placeholder, system path, personal data, age) and the real reclaimable bytes. Never deletes. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) uses budgets/caps; deep does the thorough pass." } } } },
+        { "name": "backup_check", "description": "Is this folder backed up? Compares source and target by relative path and size: coverage %, missing bytes, files that differ and extras only in the backup. Both folders must be in the index. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": {
+            "source": { "type": "string", "description": "Folder to verify (default: path/root)." },
+            "target": { "type": "string", "description": "Folder that should contain the backup copy." },
+            "path": path, "limit": limit, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) uses budgets/caps; deep does the thorough pass." } }, "required": ["target"] } },
+        { "name": "volumes", "description": "Saved disks: brand, model, device serial, volume serial, bus, last update date, retention mode and how many files have a fast semihash. These are volumes that were connected before and may be offline now. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "id": { "type": "string", "description": "Only this saved volume." } } } },
+        { "name": "volume_duplicates", "description": "Finds copies between files under 'path' and the inventories of saved (possibly disconnected) disks, using size + a sampled semihash (8 KiB fast / 48 KiB deep). Also reports duplicates between saved disks without touching any disk. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path,
+            "volume": { "type": "string", "description": "Only this saved volume id." },
+            "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast (default) samples 64 KiB+ files under a 3 s budget; deep samples everything." },
+            "limit": limit } } },
+        { "name": "volume_lookup", "description": "Is this file on a saved disk? Checks its size and sampled semihash against every saved inventory, even if the disk is disconnected. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": { "type": "string", "description": "Local file path." }, "deep": { "type": "boolean", "description": "Use the 48 KiB sampled hash." } }, "required": ["path"] } },
+        { "name": "provenance", "description": "Where did this file come from? Reads the Zone.Identifier ADS (download URL), matches the install folder against the Windows Uninstall registry and Steam libraries, and in deep mode adds run_count from Everything. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": { "type": "string", "description": "File or folder in the index." }, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "Deep also asks Everything for run_count." } } } },
+        { "name": "timeline", "description": "Saved snapshots in chronological order: date and entry count, to see how far back the disk history goes. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "limit": limit } } },
+        { "name": "quarantine_list", "description": "Files the app moved to quarantine: original path, size, date and whether the saved copy still exists. Restore/delete happen in the app. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "limit": limit } } },
+        { "name": "speed_test", "description": "Measures the real speed of a disk and/or Google Drive before estimating a task. Detects NVMe/SSD/HDD/USB by bus and seek penalty, reads a real file (deep), measures the actual Google Drive download by reading a cloud placeholder (hydrates that file), reports how many bytes are already local/pinned, and returns ETA for 'bytes'/'files'. Read-only except the opt-in hydration/benchmark file. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": { "type": "string", "description": "Folder whose disk/source to measure." },
+            "bytes": { "type": "integer", "description": "Task size to estimate (default 1 GB)." },
+            "files": { "type": "integer", "description": "Number of files in the task (default 1)." },
+            "write": { "type": "boolean", "description": "Deep only: also benchmark writes with a temporary file (default false)." },
+            "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast uses classes and local percentages; deep measures read/download (and write if asked)." } } } },
+        { "name": "addons", "description": "Detects optional external tools (rclone and gphotos-sync for Google Photos, Tesseract OCR, pdftotext) and returns setup steps and commands. Read-only; no credentials. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": {} } },
         { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])
@@ -415,7 +475,10 @@ pub fn tools() -> Value {
 /// Serve MCP on stdin/stdout until stdin closes.
 pub fn serve() {
     let mut server = Server::new(Box::new(|| {
-        tree::load(Arc::new(Progress::default()), &crate::i18n::Settings::load().excluded_drives).map(Arc::new)
+        let excluded = crate::i18n::Settings::load().excluded_drives;
+        let saved = crate::volumes::Store::default().enabled_full();
+        let offline = crate::volumes::offline_drives(&saved);
+        tree::load_with_offline(Arc::new(Progress::default()), &excluded, &offline).map(Arc::new)
     }));
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();

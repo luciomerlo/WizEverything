@@ -3,17 +3,102 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.14.0] - 2026-11-20
+
+### Added
+- **Addons externos**: detección de rclone y gphotos-sync para Google Photos, y de Tesseract/pdftotext
+  para OCR/PDF, con pasos de instalación y comandos en la app (Opciones → Addons) y en el MCP (`addons`).
+  La app no pide credenciales ni sube/borra nada.
+- **Discos guardados (offline)**: registro de unidades que se conectan y desaparecen, con marca,
+  modelo, número de serie del disco, serial de volumen, bus, tamaño y fecha de última actualización.
+  Dos modos de retención: **Completa** (rutas, tamaños, fechas y huella; navegable) y **Resumen**
+  (totales, carpetas, tipos y archivos grandes). Los discos habilitados aparecen como una unidad más;
+  se pueden borrar los datos guardados sin tocar el disco real.
+- **Semihash de muestra**: 8 KiB (rápido) o 48 KiB (profundo) por archivo, con el tamaño incluido.
+  No es un hash completo; sirve para reconocer copias renombradas y buscar duplicados sin leer el
+  disco entero. Cobertura y presupuesto declarados.
+- **Cuarentena navegable**: listar, restaurar a la ruta original (sin sobrescribir) y borrar la copia
+  guardada, con auditoría. El MCP expone `quarantine_list` de sólo lectura.
+- **Procedencia**: zona de Internet/URL desde `Zone.Identifier`, aplicación instalada por Registro
+  (Uninstall 64/32/HKCU), bibliotecas de Steam y `run_count` en modo profundo. MCP `provenance`.
+- **Línea de tiempo**: lista de snapshots y comparación de cualquier intervalo con slider; reusa el
+  informe de "¿Qué creció?". MCP `timeline`.
+- **Velocidad y ETA**: detecta NVMe/SSD/HDD/USB por bus y penalidad de seek, mide lectura (y escritura
+  opcional), detecta Google Drive streaming/clone y el porcentaje ya local/fijado, mide la descarga
+  real leyendo un placeholder (profundo, lo hidrata) y estima la tarea con velocidad efectiva y costo
+  por archivo. MCP `speed_test`.
+
+## [0.13.0] - 2026-11-20
+
+### Added
+- Explicit **fast / deep** answers everywhere a thorough pass exists. Fast is the default: it uses a
+  budget or cap, always returns an answer and marks it `partial` with `elapsed_ms` and percentages when
+  it had to stop early. Deep removes the budget and analyses every candidate.
+  - MCP: `mode: "fast" | "deep"` (or `deep: true`) on `find_duplicates`, `scan_integrity`,
+    `similar_images`, `similar_audio`, `github_mode`, `growth`, `advice` and `backup_check`; every
+    result repeats the `mode` that produced it. `find_duplicates` no longer hashes by default (fast =
+    name + size; deep = content), and `github_mode` fast compares against the local `origin` refs with a
+    note instead of fetching.
+  - GUI: paired **rápido / profundo** buttons for similar images, similar audio, "what grew", backup
+    comparison and the "can I delete this?" context menu; reports show the mode they used. After a fast
+    run, the deep button's hover shows an estimate built from that measurement (audio ×6 for the longer
+    window, images by the unfinished fraction, growth by the unattributed share, backup ×5 when
+    truncated), e.g. `Última corrida rápida: 340 ms → profundo ≈ 2,0 s`.
+  - Deep audio raises the measured window from 20 s to 120 s per copy and the wall-clock budget to
+    60 s; deep images allow the full 120 s budget; deep growth resolves every changed entry (fast caps
+    at the 2,000 largest); deep backup compares up to 250,000 files (fast 50,000); deep integrity scans
+    50,000 files (fast 3,000).
+
+### Changed
+- `growth` and `advice` now accept `deep`; `advice` deep checks git tracking, fast explains that it did
+  not and lowers `confidence` accordingly.
+
+## [0.12.0] - 2026-11-20
+
+### Added
+- "Why is it full?" — top folders/files with percentages, free space and the chain of biggest
+  children down to the leaf that holds the space.
+- "What grew?" — diffs the two newest snapshots (`.wzsnap`) and attributes each new/grown file to
+  its parent folder, returning a ranked folder list plus the biggest new/grown files. Exposed as the
+  `growth` MCP tool; the GUI reuses `Guardar snapshot` and warns that the index must be refreshed first.
+- "Can I delete this?" — per-file/folder verdict (safe / caution / keep) with reasons: regenerable
+  build output/artifacts, temp/cache, git-tracked, hard links, cloud placeholders, system folders,
+  personal data, age and size; reports the real reclaimable bytes and stages the path in the basket.
+- "Is it backed up?" — compares a folder against another copy by relative path and size: coverage %,
+  missing bytes, same-name-different-size and extras only in the backup.
+- Audio A/B comparison (experimental): decodes both copies to the same rate, plays them from the
+  same frame position and alternates which one is audible (0.5–4 s or manual A/B), with blind mode,
+  side swap and a position slider. Up to two minutes per file.
+- Image zoom comparison (experimental): shows the same normalised region of both copies side by side
+  at 1×–16×; moving the mouse pans both, so resized/recompressed copies reveal their real detail.
+- Four new read-only MCP tools: `why_full`, `growth`, `advice`, `backup_check`.
+- Visual result panels instead of raw JSON:
+  - Similar files: groups with the copy to keep, candidates, quality score, reasons, AI markers and
+    thumbnails for images ("CONSERVAR" / "CANDIDATO").
+  - GitHub mode: colored status headline, disk vs tracked vs delta per folder, collapsible commit
+    and changed-file lists, notes and alternatives.
+- Type filter sent to the left explorer from the baobab/rings view (↙ button): the tree rescales to
+  the type's bytes, the files list keeps only that type, and a chip in the tab bar removes it.
+- Similar audio now judges the actual sound, not only tags: up to two minutes per copy are decoded to
+  compare noise floor, SNR, digital silence, high-frequency content and spectral stability. Denoised
+  copies are matched with the original (markers such as `(denoised)` or `noise reduced` are ignored for
+  grouping) and the result explains which copy is cleaner, which kept more air and which shows denoise
+  artifacts. Bounded to 8 copies per group; WMA/APE/WV fall back to metadata only.
+- Action basket (experimental) with dry-run, explicit confirmation and JSONL audit: stages hardlink
+  merges (content verified), WOF LZX compression and reversible quarantine (moved to
+  `%LOCALAPPDATA%\WizEverything\quarantine` with a manifest). Failures stay in the basket and are listed.
+
 ## [0.11.0] - 2026-11-20
 
 ### Added
-- "Similar files" analysis (MCP `similar_images`, `similar_audio` + Space analysis menu):
+- "Similar files" analysis (experimental) (MCP `similar_images`, `similar_audio` + Space analysis menu):
   - Images: perceptual hashes (dHash + aHash) with LSH banding to find the same photo resized,
     recompressed or exported twice, and a quality score that suggests which copy to keep.
   - Audio: groups the same track across formats/bitrates by artist + title (or filename) and
     duration, splits live/remix versions, and ranks lossless over lossy.
   - Both are read-only and return per-group keep/candidates reasons plus reversible alternatives
     (quarantine, keep both edits, archive, hardlink when byte-identical).
-- GitHub mode (`github_mode` + Space analysis menu) for any chosen folder: up to date / local newer /
+- GitHub mode (`github_mode` + Space analysis menu, experimental) for any chosen folder: up to date / local newer /
   behind / diverged headline, plus commits, changed files, size and per-folder gaps. Read-only;
   `git fetch` is optional.
 

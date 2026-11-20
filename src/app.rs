@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, channel};
@@ -391,6 +392,13 @@ struct ExportJob {
     done: Arc<AtomicU64>,
 }
 
+struct VolumeJob {
+    rx: Receiver<Result<crate::volumes::VolumeRecord, String>>,
+    progress: Arc<crate::volumes::CaptureProgress>,
+    label: String,
+    started: Instant,
+}
+
 /// Tray menu entries, kept so their labels can follow the UI language.
 pub struct TrayItems {
     pub open: tray_icon::menu::MenuItem,
@@ -469,13 +477,54 @@ pub struct App {
     ext_cats: Vec<(usize, u64, u64)>,
     ext_open: HashSet<usize>,
     highlight_ext: Option<u32>,
+    /// Extension/category filter applied to the left panel.
+    type_filter: Option<u32>,
     /// Report shown in the Analysis window (title, text).
     analysis: Option<(String, String)>,
+    /// Structured report (similar files / GitHub mode) rendered as tables, not JSON.
+    report: Option<(String, serde_json::Value)>,
+    /// Thumbnail textures for the similar-images panel.
+    thumbs: HashMap<String, Option<egui::TextureHandle>>,
+    /// Action basket (mutating ops staged for dry-run + confirmation).
+    basket: Vec<crate::executor::Op>,
+    basket_bytes: u64,
+    basket_report: Option<crate::executor::Report>,
+    basket_open: bool,
+    basket_armed: bool,
+    basket_note: Option<String>,
+    backup_open: bool,
+    backup_source: String,
+    backup_target: String,
+    backup_deep: bool,
+    /// Last fast run per analysis: (fast_ms, estimated_deep_ms), for the deep hover.
+    deep_eta: HashMap<&'static str, (u64, u64)>,
+    /// Saved disconnected disks (headers only; inventories load on demand).
+    volumes: crate::volumes::Store,
+    volume_metas: Vec<crate::volumes::VolumeRecord>,
+    volume_job: Option<VolumeJob>,
+    capture_open: bool,
+    capture_drive: Option<(String, u32)>,
+    capture_retention: crate::volumes::Retention,
+    capture_deep: bool,
+    volume_delete_armed: Option<String>,
+    quarantine_open: bool,
+    quarantine_entries: Vec<crate::quarantine::QEntry>,
+    quarantine_armed: Option<std::path::PathBuf>,
+    timeline_open: bool,
+    timeline_frames: Vec<crate::timeline::Meta>,
+    timeline_sel: usize,
+    timeline_deep: bool,
+    ab: Option<crate::audio_ab::AbPlayer>,
+    ab_error: Option<String>,
+    ab_blind: bool,
+    ab_swapped: bool,
+    img_ab: Option<crate::img_ab::ImgAb>,
+    img_ab_tex: Option<(egui::TextureHandle, egui::TextureHandle)>,
 
     tab: Tab,
     file_filter: String,
     files: Vec<u32>,
-    files_key: (u32, u64, String, Sort),
+    files_key: (u32, u64, String, Sort, Option<u32>),
 
     tree_sort: Sort,
     files_sort: Sort,
@@ -508,6 +557,8 @@ impl App {
         // row sees them; rows must get them for selection and the context menu.
         style.interaction.selectable_labels = false;
         ctx.set_global_style(style);
+        let volumes = crate::volumes::Store::default();
+        let volume_metas = volumes.scan();
         let mut app = Self {
             tree: None,
             epoch: 0,
@@ -548,11 +599,46 @@ impl App {
             ext_cats: Vec::new(),
             ext_open: HashSet::new(),
             highlight_ext: None,
+            type_filter: None,
             analysis: None,
+            report: None,
+            thumbs: HashMap::new(),
+            basket: Vec::new(),
+            basket_bytes: 0,
+            basket_report: None,
+            basket_open: false,
+            basket_armed: false,
+            basket_note: None,
+            backup_open: false,
+            backup_source: String::new(),
+            backup_target: String::new(),
+            backup_deep: false,
+            deep_eta: HashMap::new(),
+            volumes,
+            volume_metas,
+            volume_job: None,
+            capture_open: false,
+            capture_drive: None,
+            capture_retention: crate::volumes::Retention::Full,
+            capture_deep: false,
+            volume_delete_armed: None,
+            quarantine_open: false,
+            quarantine_entries: Vec::new(),
+            quarantine_armed: None,
+            timeline_open: false,
+            timeline_frames: Vec::new(),
+            timeline_sel: 0,
+            timeline_deep: false,
+            ab: None,
+            ab_error: None,
+            ab_blind: false,
+            ab_swapped: false,
+            img_ab: None,
+            img_ab_tex: None,
             tab: Tab::Tree,
             file_filter: String::new(),
             files: Vec::new(),
-            files_key: (u32::MAX, u64::MAX, String::new(), None),
+            files_key: (u32::MAX, u64::MAX, String::new(), None, None),
             tree_sort: None,
             files_sort: None,
             ext_sort: None,
@@ -625,7 +711,10 @@ impl App {
                         std::thread::sleep(Duration::from_millis(150));
                     }
                 });
-                let r = tree::load(p.clone(), &excluded);
+                // Los discos guardados habilitados se suman como unidades offline.
+                let saved = crate::volumes::Store::default().enabled_full();
+                let offline = crate::volumes::offline_drives(&saved);
+                let r = tree::load_with_offline(p.clone(), &excluded, &offline);
                 drop(p);
                 let _ = tx.send(r);
                 ctx.request_repaint();
@@ -643,6 +732,7 @@ impl App {
             Err(e) => self.set_error(e),
             Ok(new) => {
                 self.error = None;
+                self.volume_metas = self.volumes.scan();
                 self.sync_stamp = new.sync_stamp.clone();
                 self.last_sync = Instant::now();
                 let new = Arc::new(new);
@@ -657,6 +747,9 @@ impl App {
                     self.expanded.insert(self.view_root);
                     // Extension ids are reassigned on every load: re-resolve by name.
                     self.highlight_ext = self.highlight_ext.and_then(|e| {
+                        if e & CAT_FLAG != 0 { Some(e) } else { old.exts.get(e as usize).and_then(|x| new.find_ext(&x.name)) }
+                    });
+                    self.type_filter = self.type_filter.and_then(|e| {
                         if e & CAT_FLAG != 0 { Some(e) } else { old.exts.get(e as usize).and_then(|x| new.find_ext(&x.name)) }
                     });
                     // An open right-click menu keeps pointing at the same path.
@@ -832,6 +925,30 @@ impl App {
                 Ok((path, rows)) => self.set_info(format!("{} {} → {path}", fmt_int(rows), tr("filas exportadas", "rows exported"))),
                 Err(e) if e.is_empty() => {}
                 Err(e) => self.set_error(e),
+            }
+        }
+
+        if let Some(job) = &self.volume_job
+            && let Ok(r) = job.rx.try_recv()
+        {
+            let label = job.label.clone();
+            self.volume_job = None;
+            match r {
+                Ok(rec) => {
+                    let id = rec.id.clone();
+                    let show = rec.retention == crate::volumes::Retention::Full && rec.enabled;
+                    match self.volumes.save(rec) {
+                        Ok(()) => {
+                            self.volume_metas = self.volumes.scan();
+                            self.set_info(format!("{} {label} → {id}", tr("Copia guardada:", "Saved copy:")));
+                            if show {
+                                self.start_load(ctx);
+                            }
+                        }
+                        Err(e) => self.set_error(format!("{label}: {e}")),
+                    }
+                }
+                Err(e) => self.set_error(format!("{label}: {e}")),
             }
         }
 
@@ -1142,6 +1259,25 @@ impl eframe::App for App {
                 if self.tab == Tab::Files && self.files_sort.is_some() && ui.small_button(clear).clicked() {
                     self.files_sort = None;
                 }
+                if let Some(code) = self.type_filter {
+                    let label = if code & CAT_FLAG != 0 {
+                        category_name((code & !CAT_FLAG) as usize).to_string()
+                    } else if tree.exts.get(code as usize).is_some_and(|x| x.name.is_empty()) {
+                        tree.ext_label(code).to_string()
+                    } else {
+                        format!(".{}", tree.ext_label(code))
+                    };
+                    let h = self.ext_bytes_for(&tree, code);
+                    let total = h.bytes.get(self.view_root as usize).copied().unwrap_or(0);
+                    let text = format!("{} {label} · {} ✕", tr("Filtro:", "Filter:"), fmt_size(total));
+                    if ui
+                        .small_button(text)
+                        .on_hover_text(tr("Quitar filtro de tipo", "Clear type filter"))
+                        .clicked()
+                    {
+                        self.type_filter = None;
+                    }
+                }
             });
             ui.separator();
             match self.tab {
@@ -1167,6 +1303,104 @@ impl eframe::App for App {
                 });
             if !open {
                 self.analysis = None;
+            }
+        }
+        if let Some((title, v)) = self.report.clone() {
+            let mut open = true;
+            egui::Window::new(title)
+                .open(&mut open)
+                .resizable(true)
+                .default_size([820.0, 560.0])
+                .show(&ctx, |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.report_body(ui, &v);
+                    });
+                });
+            if !open {
+                self.report = None;
+            }
+        }
+        if self.basket_open {
+            let mut open = true;
+            egui::Window::new(tr("Canasta de acciones (exp)", "Action basket (exp)"))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([780.0, 560.0])
+                .show(&ctx, |ui| {
+                    self.basket_ui(ui, &tree);
+                });
+            self.basket_open = open;
+        }
+        if self.backup_open {
+            let mut open = true;
+            egui::Window::new(tr("¿Está respaldado? (exp)", "Is it backed up? (exp)"))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([640.0, 300.0])
+                .show(&ctx, |ui| {
+                    self.backup_ui(ui, &tree);
+                });
+            self.backup_open = open;
+        }
+        if self.timeline_open {
+            let mut open = true;
+            egui::Window::new(tr("Línea de tiempo (exp)", "Timeline (exp)"))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([680.0, 460.0])
+                .show(&ctx, |ui| {
+                    self.timeline_ui(ui, &tree);
+                });
+            self.timeline_open = open;
+        }
+        if self.quarantine_open {
+            let mut open = true;
+            egui::Window::new(tr("Cuarentena (exp)", "Quarantine (exp)"))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([760.0, 520.0])
+                .show(&ctx, |ui| {
+                    self.quarantine_ui(ui);
+                });
+            self.quarantine_open = open;
+        }
+        if self.capture_open {
+            let mut open = true;
+            egui::Window::new(tr("Guardar disco para uso offline", "Save disk for offline use"))
+                .open(&mut open)
+                .resizable(false)
+                .default_size([560.0, 280.0])
+                .show(&ctx, |ui| {
+                    self.capture_ui(ui, &ctx);
+                });
+            self.capture_open = open;
+        }
+        if self.ab.is_some() || self.ab_error.is_some() {
+            let mut open = true;
+            egui::Window::new(tr("Comparar audio A/B (exp)", "A/B audio compare (exp)"))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([640.0, 240.0])
+                .show(&ctx, |ui| {
+                    self.audio_ab_ui(ui);
+                });
+            if !open {
+                self.ab = None;
+                self.ab_error = None;
+            }
+        }
+        if self.img_ab.is_some() {
+            let mut open = true;
+            egui::Window::new(tr("Comparar imágenes en zoom (exp)", "Zoom image compare (exp)"))
+                .open(&mut open)
+                .resizable(true)
+                .default_size([900.0, 460.0])
+                .show(&ctx, |ui| {
+                    self.img_ab_ui(ui);
+                });
+            if !open {
+                self.img_ab = None;
+                self.img_ab_tex = None;
             }
         }
         // Sorting / expanding marks the rows dirty during this frame: draw the
@@ -1245,6 +1479,18 @@ impl App {
                     }
                 }
             });
+        if drive != ROOT
+            && let Some(rec) = self.offline_record(tree.name(drive))
+        {
+            ui.colored_label(
+                Color32::from_rgb(255, 176, 32),
+                format!("🔌 {} · {}", tr("sin conexión", "offline"), crate::volumes::fmt_date(rec.updated)),
+            )
+            .on_hover_text(tr(
+                "Estos datos son una copia guardada; el disco no está conectado. La fecha es la última actualización.",
+                "This is a saved copy; the disk is not connected. The date is the last update.",
+            ));
+        }
         if self.view_root != ROOT
             && ui.small_button("⬆").on_hover_text(tr("Subir un nivel (Retroceso)", "Up one level (Backspace)")).clicked()
         {
@@ -1324,14 +1570,43 @@ impl App {
                     let name = tree.name(d).to_string();
                     let mut inc = !self.settings.excluded_drives.iter().any(|x| x.eq_ignore_ascii_case(&name));
                     let text = format!("{}  ·  {}", tree.drive_label(d), fmt_size(tree.nodes[d as usize].size));
-                    if ui.checkbox(&mut inc, text).changed() {
-                        self.settings.excluded_drives.retain(|x| !x.eq_ignore_ascii_case(&name));
-                        if !inc {
-                            self.settings.excluded_drives.push(name);
+                    ui.horizontal(|ui| {
+                        if ui.checkbox(&mut inc, text).changed() {
+                            self.settings.excluded_drives.retain(|x| !x.eq_ignore_ascii_case(&name));
+                            if !inc {
+                                self.settings.excluded_drives.push(name.clone());
+                            }
+                            self.exclusion_dirty = true;
+                            self.settings.save();
                         }
-                        self.exclusion_dirty = true;
-                        self.settings.save();
-                    }
+                        if self.offline_record(&name).is_none()
+                            && ui
+                                .small_button("💾")
+                                .on_hover_text(tr(
+                                    "Guardar este disco para consultarlo cuando esté desconectado (marca, modelo, serie, rutas y huella rápida).",
+                                    "Save this disk to consult it while disconnected (brand, model, serial, paths and fast semihash).",
+                                ))
+                                .clicked()
+                        {
+                            self.capture_drive = Some((name.clone(), d));
+                            self.capture_deep = false;
+                            self.capture_retention = crate::volumes::Retention::Full;
+                            self.capture_open = true;
+                        }
+                    });
+                }
+                self.saved_disks_ui(ui, ctx);
+                if ui
+                    .button(tr("Abrir cuarentena (exp)", "Open quarantine (exp)"))
+                    .on_hover_text(tr(
+                        "Archivos que la app movió a un lugar seguro: se pueden restaurar a su ruta original o borrar definitivamente. (Experimental)",
+                        "Files the app moved to a safe place: restore them to their original path or delete them for good. (Experimental)",
+                    ))
+                    .clicked()
+                {
+                    self.quarantine_entries = crate::quarantine::scan();
+                    self.quarantine_armed = None;
+                    self.quarantine_open = true;
                 }
             }
             // Storage analysis (read-only engines).
@@ -1351,10 +1626,10 @@ impl App {
                     "max_entries": 20000
                 });
                 if ui
-                    .button(tr("Modo GitHub (carpeta actual)", "GitHub mode (current folder)"))
+                    .button(tr("Modo GitHub (carpeta actual) (exp)", "GitHub mode (current folder) (exp)"))
                     .on_hover_text(tr(
-                        "Analiza la carpeta actual como repo: dice si está al día con la web, si el local es más nuevo (commits sin subir), o si está atrasado/divergido; y explica las diferencias por commits, archivos y tamaño.",
-                        "Treats the current folder as a repo: says whether it is up to date with the web, newer than it (unpushed commits), behind or diverged; then explains differences by commits, files and size.",
+                        "Analiza la carpeta actual como repo: dice si está al día con la web, si el local es más nuevo (commits sin subir), o si está atrasado/divergido; y explica las diferencias por commits, archivos y tamaño. (Experimental)",
+                        "Treats the current folder as a repo: says whether it is up to date with the web, newer than it (unpushed commits), behind or diverged; then explains differences by commits, files and size. (Experimental)",
                     ))
                     .clicked()
                 {
@@ -1363,7 +1638,7 @@ impl App {
                         Ok(v) => v.get("title_es").and_then(|x| x.as_str()).unwrap_or("Modo GitHub").to_string(),
                         Err(_) => "Modo GitHub".to_string(),
                     };
-                    self.analysis = Some((format!("GitHub · {title}"), fmt(res)));
+                    self.set_report(&format!("GitHub (exp) · {title}"), res);
                 }
                 if ui
                     .button(tr("Auditoría cloud / sparse", "Cloud / sparse audit"))
@@ -1395,25 +1670,71 @@ impl App {
                 {
                     self.analysis = Some(("Cold folders".into(), fmt(crate::mcp_tools::cold_folders(tree, root, &caps, 30))));
                 }
-                if ui
-                    .button(tr("Imágenes parecidas", "Similar images"))
-                    .on_hover_text(tr(
-                        "Agrupa la misma foto en distintas resoluciones o recompresiones (hash perceptual) y sugiere cuál conservar por calidad. Solo lectura.",
-                        "Groups the same photo at different resolutions or recompressions (perceptual hash) and suggests which copy to keep by quality. Read-only.",
-                    ))
-                    .clicked()
-                {
-                    self.analysis = Some(("Similar images".into(), fmt(crate::mcp_tools::similar_images(tree, root, &caps, 30))));
+                if let Some(deep) = analysis_pair(
+                    ui,
+                    tr("Imágenes parecidas (exp)", "Similar images (exp)"),
+                    tr(
+                        "Agrupa la misma foto en distintas resoluciones o recompresiones (hash perceptual) y sugiere cuál conservar por calidad. Rápido usa un presupuesto; profundo analiza todas. (Experimental)",
+                        "Groups the same photo at different resolutions or recompressions (perceptual hash) and suggests which copy to keep by quality. Fast uses a budget; deep analyses all. (Experimental)",
+                    ),
+                    self.deep_eta.get("images").copied(),
+                ) {
+                    let mut a = caps.clone();
+                    a["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
+                    let t0 = Instant::now();
+                    let res = crate::mcp_tools::similar_images(tree, root, &a, 30);
+                    if !deep {
+                        self.remember_eta("images", t0.elapsed().as_millis() as u64, &res);
+                    }
+                    self.set_report(tr("Imágenes parecidas (exp)", "Similar images (exp)"), res);
+                }
+                if let Some(deep) = analysis_pair(
+                    ui,
+                    tr("Audio parecido (exp)", "Similar audio (exp)"),
+                    tr(
+                        "Agrupa el mismo tema aunque las etiquetas difieran (álbum vs grabación de TV/YouTube), separa versiones y sugiere cuál conservar. Rápido mide 20 s por copia; profundo, hasta 2 min. (Experimental)",
+                        "Groups the same track even when tags differ (album vs TV/YouTube), splits versions and suggests which copy to keep. Fast measures 20 s per copy; deep up to 2 min. (Experimental)",
+                    ),
+                    self.deep_eta.get("audio").copied(),
+                ) {
+                    let mut a = caps.clone();
+                    a["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
+                    let t0 = Instant::now();
+                    let res = crate::mcp_tools::similar_audio(tree, root, &a, 30);
+                    if !deep {
+                        self.remember_eta("audio", t0.elapsed().as_millis() as u64, &res);
+                    }
+                    self.set_report(tr("Audio parecido (exp)", "Similar audio (exp)"), res);
+                }
+                if let Some(deep) = analysis_pair(
+                    ui,
+                    tr("Velocidad y ETA (exp)", "Speed and ETA (exp)"),
+                    tr(
+                        "Mide el disco (NVMe/SSD/HDD/USB), detecta Google Drive streaming/clone y qué parte ya está local, y estima cuánto tarda una tarea. Profundo mide la descarga real leyendo un archivo de la nube (lo hidrata). (Experimental)",
+                        "Measures the disk (NVMe/SSD/HDD/USB), detects Google Drive stream/clone and how much is already local, and estimates a task. Deep measures the real download by reading a cloud file (hydrates it). (Experimental)",
+                    ),
+                    None,
+                ) {
+                    let mut a = caps.clone();
+                    a["path"] = serde_json::json!(tree.full_path(root));
+                    a["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
+                    self.set_report(
+                        tr("Velocidad y ETA (exp)", "Speed and ETA (exp)"),
+                        crate::mcp_tools::speed_test(tree, root, &a),
+                    );
                 }
                 if ui
-                    .button(tr("Audio parecido", "Similar audio"))
+                    .button(tr("Addons / Google Photos (exp)", "Addons / Google Photos (exp)"))
                     .on_hover_text(tr(
-                        "Agrupa el mismo tema en FLAC/MP3/etc. por etiquetas y duración, separa versiones y sugiere cuál conservar por calidad. Solo lectura.",
-                        "Groups the same track across FLAC/MP3/etc. by tags and duration, splits versions and suggests which copy to keep by quality. Read-only.",
+                        "Detecta rclone, gphotos-sync, Tesseract y pdftotext, y muestra cómo usarlos. La app no pide credenciales ni sube nada. (Experimental)",
+                        "Detects rclone, gphotos-sync, Tesseract and pdftotext, and shows how to use them. The app asks for no credentials and uploads nothing. (Experimental)",
                     ))
                     .clicked()
                 {
-                    self.analysis = Some(("Similar audio".into(), fmt(crate::mcp_tools::similar_audio(tree, root, &caps, 30))));
+                    self.set_report(
+                        tr("Addons / Google Photos (exp)", "Addons / Google Photos (exp)"),
+                        Ok(crate::addons::to_json()),
+                    );
                 }
                 if ui
                     .button(tr("Candidatos a compresión", "Compression candidates"))
@@ -1436,6 +1757,64 @@ impl App {
                     self.analysis = Some(("Hardlink plan".into(), fmt(crate::mcp_tools::hardlink_plan(tree, root, &caps, 30))));
                 }
                 if ui
+                    .button(tr("Canasta de acciones (exp)", "Action basket (exp)"))
+                    .on_hover_text(tr(
+                        "Prepara operaciones (hardlinks, compresión LZX, cuarentena) y muéstralas en dry-run antes de confirmar. (Experimental)",
+                        "Stages operations (hardlinks, LZX compression, quarantine) and shows them in dry-run before confirming. (Experimental)",
+                    ))
+                    .clicked()
+                {
+                    self.basket_open = true;
+                }
+                if ui
+                    .button(tr("¿Por qué está lleno?", "Why is it full?"))
+                    .on_hover_text(tr(
+                        "Carpetas y archivos más grandes, el camino que explica el espacio y el espacio libre del disco.",
+                        "Largest folders and files, the chain that explains the space and the drive's free space.",
+                    ))
+                    .clicked()
+                {
+                    self.set_report(
+                        tr("¿Por qué está lleno?", "Why is it full?"),
+                        crate::mcp_tools::why_full(tree, root, &caps, 10),
+                    );
+                }
+                if let Some(deep) = analysis_pair(
+                    ui,
+                    tr("¿Qué creció?", "What grew?"),
+                    tr(
+                        "Compara los dos snapshots más nuevos y atribuye el crecimiento a carpetas. Rápido resuelve los cambios más grandes; profundo, todos.",
+                        "Compares the two newest snapshots and attributes growth to folders. Fast resolves the biggest changes; deep resolves all.",
+                    ),
+                    self.deep_eta.get("growth").copied(),
+                ) {
+                    let mut a = caps.clone();
+                    a["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
+                    let t0 = Instant::now();
+                    let res = crate::mcp_tools::growth_report(tree, root, &a, 12);
+                    if !deep {
+                        self.remember_eta("growth", t0.elapsed().as_millis() as u64, &res);
+                    }
+                    self.set_report(tr("¿Qué creció?", "What grew?"), res);
+                }
+                if let Some(deep) = analysis_pair(
+                    ui,
+                    tr("¿Está respaldado? (exp)", "Is it backed up? (exp)"),
+                    tr(
+                        "Compara esta carpeta contra otra copia por ruta relativa y tamaño. Rápido cubre hasta 50.000 archivos; profundo, 250.000. (Experimental)",
+                        "Compares this folder against another copy by relative path and size. Fast covers up to 50,000 files; deep up to 250,000. (Experimental)",
+                    ),
+                    self.deep_eta.get("backup").copied(),
+                ) {
+                    self.backup_source = self
+                        .selected
+                        .map(|id| tree.full_path(id))
+                        .unwrap_or_else(|| tree.full_path(root));
+                    self.backup_target.clear();
+                    self.backup_deep = deep;
+                    self.backup_open = true;
+                }
+                if ui
                     .button(tr("Guardar snapshot", "Save snapshot"))
                     .on_hover_text(tr(
                         "Guarda una foto compacta del índice para comparar después y ver qué creció o desapareció. Se guarda en la carpeta de datos de la app.",
@@ -1445,8 +1824,332 @@ impl App {
                 {
                     self.analysis = Some(("Snapshot".into(), fmt(crate::mcp_tools::snapshot_save(tree, root, &caps))));
                 }
+                if ui
+                    .button(tr("Línea de tiempo (exp)", "Timeline (exp)"))
+                    .on_hover_text(tr(
+                        "Snapshots guardados en orden: elegí un intervalo y compará qué apareció, qué desapareció y qué carpeta creció. (Experimental)",
+                        "Saved snapshots in order: pick an interval and compare what appeared, disappeared and which folder grew. (Experimental)",
+                    ))
+                    .clicked()
+                {
+                    self.timeline_frames = crate::timeline::list();
+                    self.timeline_sel = self.timeline_frames.len().saturating_sub(2);
+                    self.timeline_open = true;
+                }
             }
         });
+    }
+
+    /// Línea de tiempo: elegir dos snapshots y compararlos.
+    fn timeline_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
+        let frames = self.timeline_frames.clone();
+        if frames.is_empty() {
+            ui.label(tr(
+                "Todavía no hay snapshots. Usá «Guardar snapshot» y repetilo en otro momento para ver el cambio.",
+                "No snapshots yet. Use Save snapshot and repeat later to see the change.",
+            ));
+            return;
+        }
+        ui.label(RichText::new(format!("{} snapshots", frames.len())).strong());
+        if frames.len() < 2 {
+            ui.label(tr("Hace falta al menos un segundo snapshot.", "At least a second snapshot is needed."));
+            return;
+        }
+        let max = frames.len() - 2;
+        self.timeline_sel = self.timeline_sel.min(max);
+        ui.add(egui::Slider::new(&mut self.timeline_sel, 0..=max).text(tr("intervalo", "interval")));
+        let (old, new) = (frames[self.timeline_sel].clone(), frames[self.timeline_sel + 1].clone());
+        ui.label(format!(
+            "{}  →  {}   ({} {})",
+            crate::volumes::fmt_date(old.created),
+            crate::volumes::fmt_date(new.created),
+            (((new.created - old.created) as f64 / 86_400.0) * 10.0).round() / 10.0,
+            tr("días", "days")
+        ));
+        ui.horizontal(|ui| {
+            if ui.button(tr("Comparar este intervalo", "Compare this interval")).clicked() {
+                let res = crate::timeline::compare(tree, &old, &new, 20, self.timeline_deep).map(|mut v| {
+                    v["mode"] = serde_json::json!(if self.timeline_deep { "deep" } else { "fast" });
+                    v
+                });
+                self.set_report(tr("Línea de tiempo (exp)", "Timeline (exp)"), res);
+            }
+            ui.checkbox(&mut self.timeline_deep, tr("Profundo", "Deep"));
+        });
+        ui.separator();
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            for (i, f) in frames.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(crate::volumes::fmt_date(f.created)).monospace().size(11.0));
+                    ui.label(RichText::new(format!("{} {}", fmt_int(f.entries as u64), tr("entradas", "entries"))).weak().size(10.0));
+                    if i > 0 && ui.small_button(tr("vs anterior", "vs previous")).clicked() {
+                        let prev = frames[i - 1].clone();
+                        let res = crate::timeline::compare(tree, &prev, f, 20, false).map(|mut v| {
+                            v["mode"] = serde_json::json!("fast");
+                            v
+                        });
+                        self.set_report(tr("Línea de tiempo (exp)", "Timeline (exp)"), res);
+                    }
+                });
+            }
+        });
+    }
+
+    /// Cuarentena: restaurar o borrar copias guardadas por la app.
+    fn quarantine_ui(&mut self, ui: &mut egui::Ui) {
+        let total: u64 = self.quarantine_entries.iter().map(|e| e.bytes).sum();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!(
+                "{} {}  ·  {}",
+                self.quarantine_entries.len(),
+                tr("archivos", "files"),
+                fmt_size(total)
+            )).strong());
+            if ui.button(tr("Actualizar", "Refresh")).clicked() {
+                self.quarantine_entries = crate::quarantine::scan();
+                self.quarantine_armed = None;
+            }
+        });
+        ui.label(RichText::new(format!(
+            "{}: {}",
+            tr("Ubicación", "Location"),
+            crate::quarantine::root().display()
+        )).weak().size(10.0));
+        ui.label(RichText::new(tr(
+            "Restaurar devuelve el archivo a su ruta original (no sobrescribe). Borrar elimina sólo la copia guardada.",
+            "Restore puts the file back at its original path (never overwrites). Delete removes only the saved copy.",
+        )).weak());
+        ui.separator();
+        if self.quarantine_entries.is_empty() {
+            ui.label(tr("No hay archivos en cuarentena.", "No files in quarantine."));
+            return;
+        }
+        egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+            let mut restore: Option<usize> = None;
+            let mut purge: Option<usize> = None;
+            for (i, e) in self.quarantine_entries.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(crate::volumes::fmt_date(e.at)).weak().size(10.0));
+                    ui.label(RichText::new(fmt_size(e.bytes)).monospace().size(10.0));
+                    ui.label(RichText::new(e.original.to_string_lossy()).monospace().size(11.0));
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .small_button(tr("Restaurar", "Restore"))
+                        .on_hover_text(tr("Vuelve a la ruta original", "Back to the original path"))
+                        .clicked()
+                    {
+                        restore = Some(i);
+                    }
+                    let armed = self.quarantine_armed.as_ref() == Some(&e.original);
+                    let label = if armed { tr("¿Borrar copia?", "Delete copy?") } else { tr("Borrar copia", "Delete copy") };
+                    if ui
+                        .small_button(label)
+                        .on_hover_text(tr(
+                            "Borra la copia en cuarentena; el archivo original ya no existe. No se puede deshacer.",
+                            "Deletes the quarantined copy; the original file no longer exists. Cannot be undone.",
+                        ))
+                        .clicked()
+                    {
+                        if armed {
+                            purge = Some(i);
+                        } else {
+                            self.quarantine_armed = Some(e.original.clone());
+                        }
+                    }
+                    if !e.exists() {
+                        ui.colored_label(Color32::from_rgb(220, 160, 60), tr("copia ausente", "copy missing"));
+                    }
+                });
+                ui.separator();
+            }
+            if let Some(i) = restore {
+                let e = self.quarantine_entries[i].clone();
+                match crate::quarantine::restore(&e) {
+                    Ok(()) => {
+                        self.quarantine_entries.remove(i);
+                        self.set_info(format!("{} {}", tr("Restaurado:", "Restored:"), e.original.display()));
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+            if let Some(i) = purge {
+                let e = self.quarantine_entries[i].clone();
+                match crate::quarantine::purge(&e) {
+                    Ok(()) => {
+                        self.quarantine_entries.remove(i);
+                        self.quarantine_armed = None;
+                        self.set_info(format!("{} {}", tr("Copia borrada:", "Copy deleted:"), e.stored.display()));
+                    }
+                    Err(err) => self.set_error(err),
+                }
+            }
+        });
+    }
+
+    /// Lista de discos guardados: mostrar, abrir, borrar y ver la fecha.
+    fn saved_disks_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        if self.volume_metas.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.label(RichText::new(tr("Discos guardados (offline)", "Saved disks (offline)")).strong());
+        let metas = self.volume_metas.clone();
+        for m in metas {
+            ui.horizontal(|ui| {
+                let mut en = m.enabled;
+                if ui
+                    .checkbox(&mut en, "")
+                    .on_hover_text(tr("Mostrar como unidad aunque esté desconectado", "Show as a drive even while disconnected"))
+                    .changed()
+                {
+                    if let Err(e) = self.volumes.set_enabled(&m.id, en) {
+                        self.set_error(e);
+                    } else {
+                        self.volume_metas = self.volumes.scan();
+                        self.start_load(ctx);
+                    }
+                }
+                ui.label(format!(
+                    "{}  ·  {}  ·  {}",
+                    m.display(),
+                    m.retention.label().0,
+                    crate::volumes::fmt_date(m.updated)
+                ));
+                if m.retention == crate::volumes::Retention::Full {
+                    if ui.small_button(tr("Abrir", "Open")).clicked()
+                        && let Some(t) = self.tree.clone()
+                        && let Some(id) = t.drives.iter().copied().find(|&d| t.name(d) == m.name)
+                    {
+                        self.set_root(ctx, id);
+                    }
+                } else if ui
+                    .small_button(tr("Resumen", "Summary"))
+                    .on_hover_text(tr(
+                        "La retención Resumen guarda totales, carpetas y archivos grandes, pero no se puede navegar.",
+                        "Digest retention keeps totals, folders and largest files, but is not browsable.",
+                    ))
+                    .clicked()
+                {
+                    self.set_report(tr("Disco guardado (resumen)", "Saved disk (digest)"), Ok(m.to_json(false)));
+                }
+                let armed = self.volume_delete_armed.as_deref() == Some(m.id.as_str());
+                let label = if armed { tr("¿Borrar datos?", "Delete data?") } else { tr("Borrar", "Delete") };
+                if ui
+                    .small_button(label)
+                    .on_hover_text(tr(
+                        "Borra el inventario guardado de la app. No toca el disco real.",
+                        "Deletes the app's saved inventory. Does not touch the real disk.",
+                    ))
+                    .clicked()
+                {
+                    if armed {
+                        match self.volumes.delete(&m.id) {
+                            Ok(()) => {
+                                self.volume_delete_armed = None;
+                                self.volume_metas = self.volumes.scan();
+                                self.start_load(ctx);
+                            }
+                            Err(e) => self.set_error(e),
+                        }
+                    } else {
+                        self.volume_delete_armed = Some(m.id.clone());
+                    }
+                }
+            });
+            ui.label(RichText::new(format!(
+                "{} {}  ·  {}  ·  {} {:.0}% ({})",
+                tr("actualizado", "updated"),
+                crate::volumes::fmt_date(m.updated),
+                fmt_size(m.total_logical),
+                tr("huella", "semihash"),
+                m.semihash_pct(),
+                tr("archivos con huella", "files hashed"),
+            )).weak().size(10.0));
+        }
+    }
+
+    /// Guarda una copia del disco conectado en segundo plano.
+    fn start_volume_capture(&mut self, ctx: &egui::Context, drive: u32) {
+        let Some(tree) = self.tree.clone() else { return };
+        let name = tree.name(drive).to_string();
+        let retention = self.capture_retention;
+        let deep = self.capture_deep;
+        let progress = Arc::new(crate::volumes::CaptureProgress::default());
+        let p = progress.clone();
+        let (tx, rx) = channel();
+        let ctx2 = ctx.clone();
+        std::thread::Builder::new()
+            .name("volume-capture".into())
+            .spawn(move || {
+                let mut opts = if deep { crate::volumes::CaptureOpts::deep() } else { crate::volumes::CaptureOpts::fast() };
+                opts.retention = retention;
+                let r = crate::volumes::capture(&tree, drive, &opts, &p);
+                let _ = tx.send(r);
+                ctx2.request_repaint();
+            })
+            .expect("thread");
+        self.volume_job = Some(VolumeJob { rx, progress, label: name, started: Instant::now() });
+        self.capture_open = false;
+        self.set_info(tr(
+            "Guardando el disco… podés seguir usando la app.",
+            "Saving the disk… you can keep using the app.",
+        ).into());
+    }
+
+    /// Contenido de la ventana "Guardar disco".
+    fn capture_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some((name, drive)) = self.capture_drive.clone() else { return };
+        ui.label(RichText::new(format!("{} {name}", tr("Guardar copia de", "Save a copy of"))).strong());
+        ui.label(RichText::new(tr(
+            "Se guarda en la carpeta de datos de la app, no en el disco. Después de desconectarlo aparece como unidad offline.",
+            "Stored in the app's data folder, not on the disk. After disconnecting it it appears as an offline drive.",
+        )).weak());
+        ui.add_space(4.0);
+        ui.radio_value(&mut self.capture_retention, crate::volumes::Retention::Full, tr(
+            "Retención completa — todas las rutas, tamaños y fechas; navegable y comparable",
+            "Full retention — every path, size and date; browsable and comparable",
+        ));
+        ui.radio_value(&mut self.capture_retention, crate::volumes::Retention::Digest, tr(
+            "Retención resumen — totales, carpetas y archivos más grandes; ocupa poco, no navega",
+            "Digest retention — totals, folders and largest files; small, not browsable",
+        ));
+        ui.add_space(4.0);
+        ui.checkbox(&mut self.capture_deep, tr(
+            "Huella profunda (48 KiB por archivo; el rápido usa 8 KiB)",
+            "Deep semihash (48 KiB per file; fast uses 8 KiB)",
+        ));
+        ui.label(RichText::new(tr(
+            "La huella es una muestra, no un hash completo: reconoce copias y busca duplicados sin leer el disco entero.",
+            "The semihash is a sample, not a full hash: it recognizes copies and finds duplicates without reading the whole disk.",
+        )).weak());
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button(tr("Guardar copia", "Save copy")).clicked() {
+                self.start_volume_capture(ctx, drive);
+            }
+            if ui.button(tr("Cancelar", "Cancel")).clicked() {
+                self.capture_open = false;
+            }
+        });
+    }
+
+    /// Registro de un disco guardado cuyo nombre coincide con el nodo del árbol.
+    fn offline_record(&self, drive_name: &str) -> Option<&crate::volumes::VolumeRecord> {
+        self.volume_metas.iter().find(|r| r.name == drive_name)
+    }
+
+    /// Learns the deep estimate from a completed fast run, for the next deep hover.
+    fn remember_eta(
+        &mut self,
+        kind: &'static str,
+        fast_ms: u64,
+        res: &Result<serde_json::Value, String>,
+    ) {
+        if let Ok(v) = res {
+            let deep = estimate_deep(kind, fast_ms, v);
+            self.deep_eta.insert(kind, (fast_ms.max(1), deep.max(1)));
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui, tree: Option<&Tree>) {
@@ -1474,6 +2177,21 @@ impl App {
                     tr("Tamaño en disco real…", "Real on-disk size…"),
                     fmt_int(j.done.load(Ordering::Relaxed)),
                     fmt_int(j.total)
+                ));
+                ui.separator();
+            }
+            if let Some(j) = &self.volume_job {
+                ui.spinner();
+                let hashed = j.progress.hashed.load(Ordering::Relaxed);
+                let total = j.progress.total.load(Ordering::Relaxed);
+                ui.label(format!(
+                    "{} {}  ·  {} {}/{}  ({} s)",
+                    tr("Guardando disco", "Saving disk"),
+                    j.label,
+                    tr("huellas", "semihashes"),
+                    fmt_int(hashed),
+                    fmt_int(total),
+                    fmt_dec(j.started.elapsed().as_secs_f64())
                 ));
                 ui.separator();
             }
@@ -1706,6 +2424,50 @@ impl App {
                 };
                 self.set_info(format!("{msg} {path}"));
             }
+            MenuAction::Advice(path, deep) => {
+                if let Some(tree) = self.tree.clone() {
+                    let a = serde_json::json!({
+                        "path": path,
+                        "mode": if deep { "deep" } else { "fast" },
+                    });
+                    let t0 = Instant::now();
+                    let res = crate::mcp_tools::advice(&tree, self.view_root, &a);
+                    if !deep {
+                        self.remember_eta("advice", t0.elapsed().as_millis() as u64, &res);
+                    }
+                    self.set_report(
+                        if deep {
+                            tr("¿Puedo borrar esto? (profundo)", "Can I delete this? (deep)")
+                        } else {
+                            tr("¿Puedo borrar esto? (rápido)", "Can I delete this? (fast)")
+                        },
+                        res,
+                    );
+                }
+            }
+            MenuAction::Provenance(path, deep) => {
+                if let Some(tree) = self.tree.clone() {
+                    let a = serde_json::json!({
+                        "path": path,
+                        "mode": if deep { "deep" } else { "fast" },
+                    });
+                    let res = crate::mcp_tools::provenance(&tree, self.view_root, &a);
+                    self.set_report(
+                        if deep {
+                            tr("Procedencia (profundo)", "Provenance (deep)")
+                        } else {
+                            tr("Procedencia (rápido)", "Provenance (fast)")
+                        },
+                        res,
+                    );
+                }
+            }
+            MenuAction::Quarantine(path) => {
+                self.basket_push(crate::executor::Op::Quarantine {
+                    path: std::path::PathBuf::from(path),
+                });
+                self.basket_open = true;
+            }
             MenuAction::Reveal(path) => {
                 if let Some(tree) = self.tree.clone()
                     && let Some(id) = tree.find_path(&path)
@@ -1735,7 +2497,7 @@ impl App {
             .order(egui::Order::Foreground)
             .fixed_pos(pos)
             .constrain(true)
-            .show(ctx, |ui| egui::Frame::popup(ui.style()).show(ui, |ui| context_menu(ui, tree.as_deref(), &target, excluded)).inner);
+            .show(ctx, |ui| egui::Frame::popup(ui.style()).show(ui, |ui| context_menu(ui, tree.as_deref(), &target, excluded, self.deep_eta.get("advice").copied())).inner);
         let (action, mut close) = area.inner;
         let clicked_outside = ctx.input(|i| i.pointer.any_pressed())
             && ctx.pointer_latest_pos().is_some_and(|p| !area.response.rect.contains(p));
@@ -1756,10 +2518,16 @@ impl App {
             ui.text_edit_singleline(&mut self.file_filter);
             ui.label(RichText::new(tr("los 1000 archivos más grandes de la vista", "the 1000 largest files in view")).weak());
         });
-        let key = (self.view_root, self.revision, self.file_filter.clone(), self.files_sort);
+        let key = (self.view_root, self.revision, self.file_filter.clone(), self.files_sort, self.type_filter);
         if key != self.files_key {
-            if (key.0, key.1, &key.2) != (self.files_key.0, self.files_key.1, &self.files_key.2) {
-                self.files = tree.largest_files(self.view_root, &self.file_filter, 1000);
+            if (key.0, key.1, &key.2, key.4) != (self.files_key.0, self.files_key.1, &self.files_key.2, self.files_key.4) {
+                let cap = if self.type_filter.is_some() { 20_000 } else { 1000 };
+                self.files = tree.largest_files(self.view_root, &self.file_filter, cap);
+                if let Some(code) = self.type_filter {
+                    let h = self.ext_bytes_for(tree, code);
+                    self.files.retain(|&id| h.bytes.get(id as usize).copied().unwrap_or(0) > 0);
+                    self.files.truncate(1000);
+                }
             }
             match self.files_sort {
                 Some((Col::Path, asc)) => {
@@ -2734,6 +3502,1376 @@ impl App {
         }
     }
 
+    fn basket_caps(&self) -> serde_json::Value {
+        serde_json::json!({
+            "all_drives": true,
+            "max_scan": 2000,
+            "max_files": 5000,
+            "min_score": 40,
+            "max_entries": 20000
+        })
+    }
+
+    fn op_bytes(op: &crate::executor::Op) -> u64 {
+        match op {
+            crate::executor::Op::HardlinkMerge { duplicate, .. }
+            | crate::executor::Op::Quarantine { path: duplicate } => {
+                crate::winphys::physical_size(duplicate).unwrap_or(0)
+            }
+            crate::executor::Op::Compress { path } => {
+                std::fs::metadata(path).map(|m| m.len() / 2).unwrap_or(0)
+            }
+            _ => 0,
+        }
+    }
+
+    fn basket_push(&mut self, op: crate::executor::Op) {
+        let d = op.describe();
+        if self.basket.iter().any(|o| o.describe() == d) {
+            return;
+        }
+        self.basket_bytes += Self::op_bytes(&op);
+        self.basket.push(op);
+    }
+
+    fn basket_recount(&mut self) {
+        self.basket_bytes = self.basket.iter().map(Self::op_bytes).sum();
+    }
+
+    fn basket_load_hardlinks(&mut self, tree: &Tree) {
+        let caps = self.basket_caps();
+        match crate::mcp_tools::hardlink_plan(tree, self.view_root, &caps, 200) {
+            Ok(v) => {
+                let mut n = 0;
+                let empty: Vec<serde_json::Value> = Vec::new();
+                for g in v["top"].as_array().unwrap_or(&empty) {
+                    let paths: Vec<String> = g["paths"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(|x| x.as_str()).map(String::from).collect())
+                        .unwrap_or_default();
+                    if paths.len() < 2 {
+                        continue;
+                    }
+                    let master = PathBuf::from(&paths[0]);
+                    let drive: String = paths[0].chars().take(2).collect();
+                    for d in &paths[1..] {
+                        let dd: String = d.chars().take(2).collect();
+                        if !dd.eq_ignore_ascii_case(&drive) {
+                            continue;
+                        }
+                        self.basket_push(crate::executor::Op::HardlinkMerge {
+                            master: master.clone(),
+                            duplicate: PathBuf::from(d),
+                        });
+                        n += 1;
+                    }
+                }
+                self.basket_note = Some(format!("{n} hardlinks agregados / added"));
+            }
+            Err(e) => self.basket_note = Some(format!("Error: {e}")),
+        }
+    }
+
+    fn basket_load_compression(&mut self, tree: &Tree) {
+        let caps = self.basket_caps();
+        match crate::mcp_tools::compression_candidates(tree, self.view_root, &caps, 100) {
+            Ok(v) => {
+                let empty: Vec<serde_json::Value> = Vec::new();
+                for x in v["top"].as_array().unwrap_or(&empty) {
+                    if let Some(p) = x["path"].as_str() {
+                        self.basket_push(crate::executor::Op::Compress { path: PathBuf::from(p) });
+                    }
+                }
+                self.basket_note = Some(tr("Candidatos a compresión agregados", "Compression candidates added").to_string());
+            }
+            Err(e) => self.basket_note = Some(format!("Error: {e}")),
+        }
+    }
+
+    fn basket_load_similar(&mut self, tree: &Tree) {
+        let caps = self.basket_caps();
+        let mut n = 0;
+        for kind in ["images", "audio"] {
+            let r = if kind == "images" {
+                crate::mcp_tools::similar_images(tree, self.view_root, &caps, 50)
+            } else {
+                crate::mcp_tools::similar_audio(tree, self.view_root, &caps, 50)
+            };
+            let Ok(v) = r else { continue };
+            let empty: Vec<serde_json::Value> = Vec::new();
+            for g in v["top"].as_array().unwrap_or(&empty) {
+                // Only clean groups: no review note and no AI-modified variant.
+                if !g["note"].is_null() || g["ai_modified"].as_bool().unwrap_or(false) {
+                    continue;
+                }
+                let others: Vec<serde_json::Value> = Vec::new();
+                for o in g["others"].as_array().unwrap_or(&others) {
+                    if let Some(p) = o["path"].as_str() {
+                        self.basket_push(crate::executor::Op::Quarantine { path: PathBuf::from(p) });
+                        n += 1;
+                    }
+                }
+            }
+        }
+        self.basket_note = Some(format!("{n} candidatos a cuarentena agregados / added"));
+    }
+
+    fn basket_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
+        ui.label(
+            RichText::new(tr(
+                "Nada se toca hasta que simules y confirmes. La cuarentena mueve a la carpeta de datos de la app (reversible); los hardlinks verifican contenido idéntico; LZX es reversible.",
+                "Nothing is touched until you simulate and confirm. Quarantine moves files to the app data folder (reversible); hardlinks verify identical content; LZX is reversible.",
+            ))
+            .weak(),
+        );
+        ui.horizontal(|ui| {
+            if ui
+                .button(tr("Cargar hardlinks", "Load hardlinks"))
+                .on_hover_text(tr(
+                    "Agrega pares duplicados exactos del mismo disco listos para fusionar como hardlink.",
+                    "Adds exact duplicate pairs from the same volume ready to merge as hardlinks.",
+                ))
+                .clicked()
+            {
+                self.basket_load_hardlinks(tree);
+            }
+            if ui
+                .button(tr("Cargar compresión", "Load compression"))
+                .on_hover_text(tr(
+                    "Agrega archivos fríos candidatos a compresión LZX de Windows.",
+                    "Adds cold files that are LZX compression candidates.",
+                ))
+                .clicked()
+            {
+                self.basket_load_compression(tree);
+            }
+            if ui
+                .button(tr("Cargar similares", "Load similar files"))
+                .on_hover_text(tr(
+                    "Agrega a cuarentena los candidatos de grupos limpios (sin nota de revisión ni variantes IA).",
+                    "Adds quarantine entries for candidates in clean groups (no review note, no AI variants).",
+                ))
+                .clicked()
+            {
+                self.basket_load_similar(tree);
+            }
+            if ui.button(tr("Vaciar", "Clear")).clicked() {
+                self.basket.clear();
+                self.basket_bytes = 0;
+                self.basket_report = None;
+                self.basket_armed = false;
+                self.basket_note = None;
+            }
+        });
+        if let Some(n) = &self.basket_note {
+            ui.label(RichText::new(n).weak());
+        }
+        ui.separator();
+        let (mut hl, mut cp, mut qu) = (0, 0, 0);
+        for op in &self.basket {
+            match op {
+                crate::executor::Op::HardlinkMerge { .. } => hl += 1,
+                crate::executor::Op::Compress { .. } => cp += 1,
+                crate::executor::Op::Quarantine { .. } => qu += 1,
+                _ => {}
+            }
+        }
+        ui.label(format!(
+            "{} operaciones · {} recuperables · {hl} hardlinks · {cp} LZX · {qu} cuarentena",
+            self.basket.len(),
+            fmt_size(self.basket_bytes)
+        ));
+        let mut remove: Option<usize> = None;
+        egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+            for (i, op) in self.basket.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    if ui.small_button("✕").on_hover_text(tr("Quitar", "Remove")).clicked() {
+                        remove = Some(i);
+                    }
+                    ui.label(RichText::new(op.describe()).monospace().size(11.0));
+                });
+            }
+        });
+        if let Some(i) = remove {
+            let b = Self::op_bytes(&self.basket[i]);
+            self.basket.remove(i);
+            self.basket_bytes = self.basket_bytes.saturating_sub(b);
+        }
+        ui.separator();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(!self.basket.is_empty(), egui::Button::new(tr("Simular (dry-run)", "Simulate (dry-run)")))
+                .on_hover_text(tr(
+                    "Calcula qué se recuperaría sin tocar nada y sin escribir auditoría.",
+                    "Estimates what would be reclaimed without touching anything and without writing audit entries.",
+                ))
+                .clicked()
+            {
+                match crate::basket::RealBackend::new() {
+                    Ok(mut be) => {
+                        let plan = crate::executor::ExecutionPlan::dry_run(self.basket.clone());
+                        self.basket_report = Some(crate::executor::run(&plan, &mut be, None));
+                    }
+                    Err(e) => self.basket_note = Some(format!("Error: {e}")),
+                }
+            }
+            if let Some(r) = &self.basket_report {
+                ui.label(format!(
+                    "{} · {} operaciones · {} · {} fallos",
+                    if r.dry_run { tr("Simulación", "Simulation") } else { tr("Ejecutado", "Executed") },
+                    r.outcomes.len(),
+                    fmt_size(if r.dry_run { r.potential } else { r.recovered }),
+                    r.failures
+                ));
+            }
+        });
+        if let Some(r) = &self.basket_report {
+            let failures: Vec<&crate::executor::OpOutcome> =
+                r.outcomes.iter().filter(|o| o.status.is_failure()).collect();
+            if !failures.is_empty() {
+                egui::CollapsingHeader::new(format!("Fallos ({})", failures.len())).show(ui, |ui| {
+                    for o in failures.iter().take(50) {
+                        if let crate::executor::OpStatus::Failed(why) = &o.status {
+                            ui.colored_label(
+                                Color32::from_rgb(210, 90, 90),
+                                format!("{} — {why}", o.description),
+                            );
+                        }
+                    }
+                });
+            }
+        }
+        ui.add_space(4.0);
+        ui.checkbox(
+            &mut self.basket_armed,
+            tr(
+                "Entiendo que esto modifica archivos (fusiona hardlinks, mueve a cuarentena o comprime).",
+                "I understand this modifies files (merges hardlinks, moves to quarantine or compresses).",
+            ),
+        );
+        let can_run = self.basket_armed && !self.basket.is_empty();
+        if ui
+            .add_enabled(can_run, egui::Button::new(tr("Ejecutar de verdad", "Execute for real")))
+            .on_hover_text(tr(
+                "Ejecuta las operaciones y deja una línea por operación en %LOCALAPPDATA%\\WizEverything\\audit.jsonl.",
+                "Runs the operations and writes one line per operation to %LOCALAPPDATA%\\WizEverything\\audit.jsonl.",
+            ))
+            .clicked()
+        {
+            match crate::basket::RealBackend::new() {
+                Ok(mut be) => {
+                    let log_path = be.log.clone();
+                    let mut audit = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&log_path)
+                        .ok();
+                    let plan = crate::executor::ExecutionPlan::live(self.basket.clone());
+                    let rep = crate::executor::run(
+                        &plan,
+                        &mut be,
+                        audit.as_mut().map(|f| f as &mut dyn std::io::Write),
+                    );
+                    let failed: Vec<crate::executor::Op> = rep
+                        .outcomes
+                        .iter()
+                        .zip(self.basket.iter())
+                        .filter(|(o, _)| o.status.is_failure())
+                        .map(|(_, op)| op.clone())
+                        .collect();
+                    self.basket = failed;
+                    self.basket_armed = false;
+                    self.basket_report = Some(rep);
+                    self.basket_recount();
+                }
+                Err(e) => self.basket_note = Some(format!("Error: {e}")),
+            }
+        }
+    }
+
+    fn why_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        let total = v["total_bytes"].as_u64().unwrap_or(0);
+        ui.heading(tr("¿Por qué está lleno?", "Why is it full?"));
+        ui.label(format!(
+            "{} · {} archivos · {} carpetas",
+            fmt_size(total),
+            v["files"],
+            v["folders"]
+        ));
+        if let Some(d) = v.get("drive").and_then(|x| x.as_object()) {
+            let free = d["free"].as_u64().unwrap_or(0);
+            let tot = d["total"].as_u64().unwrap_or(0);
+            let frac = if tot > 0 { free as f32 / tot as f32 } else { 0.0 };
+            ui.add(
+                egui::ProgressBar::new(frac)
+                    .desired_width(280.0)
+                    .text(format!("libre {}", fmt_size(free))),
+            );
+        }
+        ui.separator();
+        ui.label(RichText::new(tr("Carpetas más grandes", "Largest folders")).strong());
+        let empty: Vec<serde_json::Value> = Vec::new();
+        for f in v["top_folders"].as_array().unwrap_or(&empty) {
+            let p = f["pct"].as_f64().unwrap_or(0.0);
+            ui.horizontal(|ui| {
+                ui.label(f["name"].as_str().unwrap_or(""));
+                ui.add(egui::ProgressBar::new((p / 100.0) as f32).desired_width(140.0));
+                ui.label(format!("{} · {p:.1}%", fmt_size(f["bytes"].as_u64().unwrap_or(0))));
+                if let Some(path) = f["path"].as_str() {
+                    ui.label(RichText::new(path).weak().size(10.0));
+                }
+            });
+        }
+        if let Some(chain) = v["chain"].as_array()
+            && !chain.is_empty()
+        {
+            ui.separator();
+            ui.label(RichText::new(tr("El camino al fondo", "The path to the bottom")).strong());
+            let names: Vec<&str> = chain.iter().filter_map(|c| c["name"].as_str()).collect();
+            ui.label(RichText::new(names.join("  →  ")).monospace());
+            for c in chain {
+                ui.label(format!(
+                    "{}  {} · {:.1}%",
+                    if c["is_dir"].as_bool().unwrap_or(false) { "📁" } else { "📄" },
+                    fmt_size(c["bytes"].as_u64().unwrap_or(0)),
+                    c["pct"].as_f64().unwrap_or(0.0)
+                ));
+            }
+        }
+        if let Some(files) = v["top_files"].as_array()
+            && !files.is_empty()
+        {
+            ui.separator();
+            ui.label(RichText::new(tr("Archivos más grandes", "Largest files")).strong());
+            for f in files {
+                ui.label(format!(
+                    "{} · {:.1}%  {}",
+                    fmt_size(f["bytes"].as_u64().unwrap_or(0)),
+                    f["pct"].as_f64().unwrap_or(0.0),
+                    f["path"].as_str().unwrap_or("")
+                ));
+            }
+        }
+    }
+
+    fn growth_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        let net = v["net_bytes"].as_i64().unwrap_or(0);
+        ui.heading(tr("¿Qué creció?", "What grew?"));
+        let (sign, color) = if net >= 0 {
+            ("+", Color32::from_rgb(210, 90, 90))
+        } else {
+            ("", Color32::from_rgb(90, 170, 100))
+        };
+        ui.colored_label(
+            color,
+            format!(
+                "{sign}{} neto · {} nuevos · {} borrados · {} crecieron · {} se achicaron",
+                fmt_size(net.unsigned_abs()),
+                v["added"],
+                v["removed"],
+                v["grown"],
+                v["shrunk"]
+            ),
+        );
+        if let Some(a) = v["attributed_pct"].as_f64() {
+            ui.label(RichText::new(format!(
+                "atribuido {a:.0}% del cambio · modo {} · {} ms",
+                mode_es(v),
+                v["elapsed_ms"].as_u64().unwrap_or(0)
+            )).weak());
+        }
+        ui.separator();
+        ui.label(RichText::new(tr("Carpetas que más cambiaron", "Folders that changed most")).strong());
+        let empty: Vec<serde_json::Value> = Vec::new();
+        let folders = v["folders"].as_array().unwrap_or(&empty);
+        if folders.is_empty() {
+            ui.label(RichText::new(tr(
+                "Sin cambios entre los dos snapshots (o son consecutivos sin actividad).",
+                "No changes between the two snapshots (or they are consecutive with no activity).",
+            )).weak());
+        }
+        let max = folders
+            .iter()
+            .map(|f| f["bytes"].as_i64().unwrap_or(0).unsigned_abs())
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        for f in folders {
+            let b = f["bytes"].as_i64().unwrap_or(0);
+            let frac = b.unsigned_abs() as f32 / max as f32;
+            let col = if b >= 0 {
+                Color32::from_rgb(210, 90, 90)
+            } else {
+                Color32::from_rgb(90, 170, 100)
+            };
+            ui.horizontal(|ui| {
+                ui.add(egui::ProgressBar::new(frac).desired_width(120.0).fill(col));
+                ui.colored_label(
+                    col,
+                    format!(
+                        "{}{}",
+                        if b >= 0 { "+" } else { "-" },
+                        fmt_size(b.unsigned_abs())
+                    ),
+                );
+                ui.label(RichText::new(f["folder"].as_str().unwrap_or("")).size(10.0));
+            });
+        }
+        for (key, title) in [
+            ("new_files", tr("Archivos nuevos más grandes", "Largest new files")),
+            ("grown_files", tr("Archivos que más crecieron", "Files that grew most")),
+        ] {
+            if let Some(arr) = v[key].as_array()
+                && !arr.is_empty()
+            {
+                ui.separator();
+                ui.label(RichText::new(title).strong());
+                for f in arr {
+                    let extra = if key == "grown_files" {
+                        format!(" (+{})", fmt_size(f["delta"].as_i64().unwrap_or(0).unsigned_abs()))
+                    } else {
+                        format!(" ({})", fmt_size(f["bytes"].as_u64().unwrap_or(0)))
+                    };
+                    ui.label(RichText::new(format!("{}{extra}", f["path"].as_str().unwrap_or(""))).size(10.0));
+                }
+            }
+        }
+    }
+
+    fn advice_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        let verdict = v["verdict"].as_str().unwrap_or("caution");
+        let (label, color) = match verdict {
+            "safe" => (tr("SEGURO DE BORRAR", "SAFE TO DELETE"), Color32::from_rgb(90, 170, 100)),
+            "keep" => (tr("MEJOR NO BORRAR", "BETTER KEEP IT"), Color32::from_rgb(210, 90, 90)),
+            _ => (tr("PRECAUCIÓN", "CAUTION"), Color32::from_rgb(220, 160, 70)),
+        };
+        ui.heading(RichText::new(label).color(color));
+        ui.label(RichText::new(v["path"].as_str().unwrap_or("")).monospace().size(11.0));
+        ui.label(RichText::new(format!(
+            "modo {} · confianza {}",
+            mode_es(v),
+            v["confidence"].as_str().unwrap_or("media")
+        )).weak().size(10.0));
+        ui.label(format!(
+            "{} · {} archivos · modificado hace {} días · se recuperarían {}",
+            fmt_size(v["bytes"].as_u64().unwrap_or(0)),
+            v["files"],
+            v["modified_days"],
+            fmt_size(v["reclaim_bytes"].as_u64().unwrap_or(0))
+        ));
+        ui.separator();
+        let empty: Vec<serde_json::Value> = Vec::new();
+        for r in v["reasons"].as_array().unwrap_or(&empty) {
+            ui.label(format!("• {}", r.as_str().unwrap_or("")));
+        }
+        if let Some(tags) = v.get("tags").and_then(|t| t.as_object()) {
+            let mut chips: Vec<String> = Vec::new();
+            if tags.get("git_tracked").and_then(|x| x.as_bool()).unwrap_or(false) {
+                chips.push("git".into());
+            }
+            if let Some(a) = tags.get("artifact").and_then(|x| x.as_str()) {
+                chips.push(a.to_string());
+            }
+            if tags.get("temp").and_then(|x| x.as_bool()).unwrap_or(false) {
+                chips.push("temp".into());
+            }
+            if tags.get("system").and_then(|x| x.as_bool()).unwrap_or(false) {
+                chips.push("sistema".into());
+            }
+            if tags.get("personal").and_then(|x| x.as_bool()).unwrap_or(false) {
+                chips.push("personal".into());
+            }
+            let hl = tags.get("hard_links").and_then(|x| x.as_u64()).unwrap_or(0);
+            if hl > 1 {
+                chips.push(format!("{hl} hard links"));
+            }
+            if !chips.is_empty() {
+                ui.label(RichText::new(chips.join(" · ")).weak());
+            }
+        }
+        if let Some(actions) = v["actions"].as_array()
+            && !actions.is_empty()
+        {
+            ui.separator();
+            ui.label(RichText::new(tr("Qué hacer", "What to do")).strong());
+            for a in actions {
+                ui.label(format!("→ {}", a.as_str().unwrap_or("")));
+            }
+        }
+    }
+
+    fn backup_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        let cov = v["coverage_pct"].as_f64().unwrap_or(0.0);
+        let color = if cov >= 99.9 {
+            Color32::from_rgb(90, 170, 100)
+        } else if cov >= 80.0 {
+            Color32::from_rgb(220, 160, 70)
+        } else {
+            Color32::from_rgb(210, 90, 90)
+        };
+        ui.heading(tr("¿Está respaldado?", "Is it backed up?"));
+        ui.colored_label(color, format!("{cov:.1}% cubierto por tamaño · modo {}", mode_es(v)));
+        ui.add(
+            egui::ProgressBar::new((cov / 100.0) as f32)
+                .desired_width(320.0)
+                .fill(color)
+                .text(format!(
+                    "{} de {}",
+                    fmt_size(v["covered_bytes"].as_u64().unwrap_or(0)),
+                    fmt_size(v["source_bytes"].as_u64().unwrap_or(0))
+                )),
+        );
+        ui.label(format!(
+            "{} archivos en origen · {} faltan ({} ) · {} difieren ({} ) · {} solo en el backup ({})",
+            v["source_files"],
+            v["missing"],
+            fmt_size(v["missing_bytes"].as_u64().unwrap_or(0)),
+            v["differs"],
+            fmt_size(v["differs_bytes"].as_u64().unwrap_or(0)),
+            v["extra"],
+            fmt_size(v["extra_bytes"].as_u64().unwrap_or(0))
+        ));
+        if let (Some(s), Some(t)) = (v["source"].as_str(), v["target"].as_str()) {
+            ui.label(RichText::new(format!("{s}  →  {t}")).weak().size(10.0));
+        }
+        if v["truncated"].as_bool().unwrap_or(false) {
+            ui.colored_label(
+                Color32::from_rgb(220, 160, 70),
+                tr(
+                    "Muestra limitada (250.000 archivos): la cobertura es sobre esa muestra.",
+                    "Sample capped (250,000 files): coverage is over that sample.",
+                ),
+            );
+        }
+        let empty: Vec<serde_json::Value> = Vec::new();
+        if let Some(arr) = v["top_missing"].as_array()
+            && !arr.is_empty()
+        {
+            ui.separator();
+            ui.label(RichText::new(tr("Faltan en el backup", "Missing from the backup")).strong());
+            egui::Grid::new("bk_missing").striped(true).num_columns(2).show(ui, |ui| {
+                for f in arr.iter().take(25) {
+                    ui.label(RichText::new(f["rel"].as_str().unwrap_or("")).size(10.0));
+                    ui.label(fmt_size(f["bytes"].as_u64().unwrap_or(0)));
+                    ui.end_row();
+                }
+            });
+        }
+        if let Some(arr) = v["top_differs"].as_array()
+            && !arr.is_empty()
+        {
+            ui.separator();
+            ui.label(RichText::new(tr("Mismo nombre, distinto tamaño", "Same name, different size")).strong());
+            egui::Grid::new("bk_differs").striped(true).num_columns(3).show(ui, |ui| {
+                for f in arr.iter().take(25) {
+                    ui.label(RichText::new(f["rel"].as_str().unwrap_or("")).size(10.0));
+                    ui.label(fmt_size(f["source"].as_u64().unwrap_or(0)));
+                    ui.label(fmt_size(f["target"].as_u64().unwrap_or(0)));
+                    ui.end_row();
+                }
+            });
+        }
+    }
+
+    fn backup_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
+        ui.label(RichText::new(tr(
+            "Compara el origen contra una copia por ruta relativa y tamaño (no por fecha). Las dos carpetas tienen que estar en el índice.",
+            "Compares the source against a copy by relative path and size (not by date). Both folders must be in the index.",
+        )).weak());
+        ui.add_space(4.0);
+        ui.label(tr("Origen", "Source"));
+        ui.text_edit_singleline(&mut self.backup_source);
+        ui.label(tr("Copia / backup", "Copy / backup"));
+        ui.text_edit_singleline(&mut self.backup_target);
+        ui.checkbox(
+            &mut self.backup_deep,
+            tr("Profundo (250.000 archivos)", "Deep (250,000 files)"),
+        );
+        ui.add_space(4.0);
+        if ui
+            .add_enabled(!self.backup_target.trim().is_empty(), egui::Button::new(tr("Comparar", "Compare")))
+            .clicked()
+        {
+            let a = serde_json::json!({
+                "source": self.backup_source,
+                "target": self.backup_target,
+                "mode": if self.backup_deep { "deep" } else { "fast" },
+            });
+            let t0 = Instant::now();
+            let res = crate::mcp_tools::backup_check(tree, self.view_root, &a, 30);
+            if !self.backup_deep {
+                self.remember_eta("backup", t0.elapsed().as_millis() as u64, &res);
+            }
+            self.set_report(tr("¿Está respaldado? (exp)", "Is it backed up? (exp)"), res);
+        }
+        if ui.button(tr("Usar la carpeta actual como origen", "Use current folder as source")).clicked() {
+            self.backup_source = tree.full_path(self.view_root);
+        }
+    }
+
+    fn open_audio_ab(&mut self, a: &str, b: &str) {
+        self.ab_error = None;
+        self.ab = None;
+        self.ab_blind = false;
+        self.ab_swapped = false;
+        match crate::audio_ab::AbPlayer::open(std::path::Path::new(a), std::path::Path::new(b)) {
+            Ok(p) => self.ab = Some(p),
+            Err(e) => self.ab_error = Some(e),
+        }
+    }
+
+    fn audio_ab_ui(&mut self, ui: &mut egui::Ui) {
+        if let Some(err) = self.ab_error.clone() {
+            ui.colored_label(Color32::from_rgb(210, 90, 90), err);
+            if ui.button(tr("Cerrar", "Close")).clicked() {
+                self.ab_error = None;
+            }
+            return;
+        }
+        let Some(p) = self.ab.as_ref() else { return };
+        let mut blind = self.ab_blind;
+        let mut swap = self.ab_swapped;
+        let (name_a, name_b) = if swap {
+            (&p.b_name, &p.a_name)
+        } else {
+            (&p.a_name, &p.b_name)
+        };
+        if blind {
+            ui.label(RichText::new("A / B (ciego)").strong());
+        } else {
+            ui.label(format!("A: {name_a}"));
+            ui.label(format!("B: {name_b}"));
+        }
+        ui.label(RichText::new(tr(
+            "Misma posición en ambos; solo cambia cuál se oye. Se decodifican hasta 2 minutos desde el inicio. Ideal con auriculares.",
+            "Same position in both; only which one is heard changes. Up to two minutes are decoded from the start. Best with headphones.",
+        )).weak());
+        ui.separator();
+        let mut ms = p.interval_ms();
+        let mut close = false;
+        ui.horizontal(|ui| {
+            if ui
+                .button(if p.is_playing() {
+                    tr("⏸ Pausa", "⏸ Pause")
+                } else {
+                    tr("▶ Reproducir", "▶ Play")
+                })
+                .clicked()
+            {
+                p.toggle_play();
+            }
+            let side = p.side();
+            if ui.selectable_label(side == 0, "A").clicked() {
+                p.set_side(0);
+            }
+            if ui.selectable_label(side == 1, "B").clicked() {
+                p.set_side(1);
+            }
+            let mut auto = p.auto();
+            if ui.checkbox(&mut auto, tr("Auto", "Auto")).changed() {
+                p.set_auto(auto);
+            }
+            egui::ComboBox::from_id_salt("ab_interval")
+                .selected_text(format!("{:.1}s", ms as f32 / 1000.0))
+                .show_ui(ui, |ui| {
+                    for v in [500u32, 1000, 1500, 2000, 4000] {
+                        if ui
+                            .selectable_label(ms == v, format!("{:.1}s", v as f32 / 1000.0))
+                            .clicked()
+                        {
+                            ms = v;
+                        }
+                    }
+                });
+            if ui.checkbox(&mut blind, tr("Ciego", "Blind")).changed() {
+                self.ab_blind = blind;
+            }
+            if ui
+                .button(tr("Permutar A/B", "Swap A/B"))
+                .on_hover_text(tr(
+                    "Intercambia qué archivo es A y cuál B, para no dejarte llevar por el nombre.",
+                    "Swaps which file is A and which is B, so the name does not bias you.",
+                ))
+                .clicked()
+            {
+                swap = !swap;
+                p.set_swapped(swap);
+                self.ab_swapped = swap;
+            }
+            if ui.button(tr("Cerrar", "Close")).clicked() {
+                close = true;
+            }
+        });
+        if ms != p.interval_ms() {
+            p.set_interval_ms(ms);
+        }
+        let dur = p.duration();
+        let mut pos = p.pos_secs();
+        if ui
+            .add(egui::Slider::new(&mut pos, 0.0..=dur).text(tr("posición", "position")))
+            .changed()
+        {
+            p.seek_secs(pos);
+        }
+        ui.label(format!(
+            "{:.1} / {:.1} s · {:.0} kHz · escuchando {}",
+            p.pos_secs(),
+            dur,
+            p.rate as f32 / 1000.0,
+            if p.side() == 0 { "A" } else { "B" }
+        ));
+        if close {
+            self.ab = None;
+        }
+    }
+
+    fn open_img_ab(&mut self, a: &str, b: &str) {
+        let dim = |p: &str| image::image_dimensions(p).unwrap_or((0, 0));
+        let bytes = |p: &str| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        self.img_ab = Some(crate::img_ab::ImgAb::new(
+            a,
+            b,
+            dim(a),
+            dim(b),
+            bytes(a),
+            bytes(b),
+        ));
+        self.img_ab_tex = None;
+    }
+
+    fn img_ab_ui(&mut self, ui: &mut egui::Ui) {
+        let (ap, bp) = match &self.img_ab {
+            Some(s) => (s.a_path.clone(), s.b_path.clone()),
+            None => return,
+        };
+        if self.img_ab_tex.is_none() {
+            let ctx = ui.ctx().clone();
+            if let (Some((ta, da)), Some((tb, db))) = (load_full(&ctx, &ap), load_full(&ctx, &bp)) {
+                if let Some(st) = &mut self.img_ab {
+                    st.a_dim = da;
+                    st.b_dim = db;
+                }
+                self.img_ab_tex = Some((ta, tb));
+            } else {
+                ui.colored_label(
+                    Color32::from_rgb(210, 90, 90),
+                    tr("No se pudieron cargar las imágenes.", "The images could not be loaded."),
+                );
+                return;
+            }
+        }
+        let Some(st) = self.img_ab.as_mut() else { return };
+        let Some((ta, tb)) = self.img_ab_tex.as_ref() else { return };
+
+        if ui.rect_contains_pointer(ui.max_rect()) {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll.abs() > 0.01 {
+                st.zoom = (st.zoom * (1.0 + scroll * 0.002)).clamp(1.0, 16.0);
+            }
+        }
+        ui.horizontal(|ui| {
+            ui.label(format!("Zoom {:.1}×", st.zoom));
+            for z in [1.0f32, 2.0, 4.0, 8.0] {
+                if ui.selectable_label((st.zoom - z).abs() < 0.01, format!("{z:.0}×")).clicked() {
+                    st.zoom = z;
+                }
+            }
+            if ui
+                .button("1:1")
+                .on_hover_text(tr(
+                    "Un píxel de la imagen por píxel de pantalla.",
+                    "One image pixel per screen pixel.",
+                ))
+                .clicked()
+            {
+                st.zoom = 1.0;
+            }
+            let mut z = st.zoom;
+            if ui.add(egui::Slider::new(&mut z, 1.0..=16.0).show_value(false)).changed() {
+                st.zoom = z;
+            }
+        });
+
+        let size = egui::vec2((ui.available_width() - 16.0).max(120.0) / 2.0, 320.0);
+        let mp = |d: (u32, u32)| d.0 as f64 * d.1 as f64 / 1_000_000.0;
+        let size_a = st.a_dim;
+        let size_b = st.b_dim;
+        let zoom = st.zoom;
+        let mut center = st.center;
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new(format!(
+                    "A · {}×{} ({:.1} MP) · {}",
+                    size_a.0,
+                    size_a.1,
+                    mp(size_a),
+                    fmt_size(st.a_bytes)
+                ))
+                .strong());
+                paint_crop(ui, ta, size_a, &mut center, zoom, size);
+            });
+            ui.add_space(8.0);
+            ui.vertical(|ui| {
+                ui.label(RichText::new(format!(
+                    "B · {}×{} ({:.1} MP) · {}",
+                    size_b.0,
+                    size_b.1,
+                    mp(size_b),
+                    fmt_size(st.b_bytes)
+                ))
+                .strong());
+                paint_crop(ui, tb, size_b, &mut center, zoom, size);
+            });
+        });
+        st.center = center;
+        ui.label(RichText::new(format!(
+            "Misma zona de las dos: {:.1}% del ancho · mové el mouse sobre cualquiera para recorrerla · rueda para zoom",
+            100.0 / zoom
+        )).weak().size(10.0));
+        if size_a != size_b {
+            let (hi, lo) = if size_a.0 * size_a.1 >= size_b.0 * size_b.1 {
+                ("A", "B")
+            } else {
+                ("B", "A")
+            };
+            ui.label(RichText::new(format!(
+                "{hi} tiene más resolución: a este zoom {lo} se ve más blanda (esa es la diferencia real)."
+            )).weak());
+        }
+    }
+
+    fn set_report(&mut self, title: &str, r: Result<serde_json::Value, String>) {
+        let v = match r {
+            Ok(v) => v,
+            Err(e) => serde_json::json!({ "error": e }),
+        };
+        self.report = Some((title.to_string(), v));
+    }
+
+    /// Small cached thumbnail for the similar-images panel.
+    fn thumb(&mut self, ctx: &egui::Context, path: &str) -> Option<egui::TextureHandle> {
+        if let Some(t) = self.thumbs.get(path) {
+            return t.clone();
+        }
+        let img = image::ImageReader::open(path)
+            .ok()
+            .and_then(|r| r.with_guessed_format().ok())
+            .and_then(|r| r.decode().ok())
+            .map(|im| im.thumbnail(96, 96));
+        let tex = img.map(|im| {
+            let rgba = im.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let color = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+            ctx.load_texture(format!("thumb:{path}"), color, egui::TextureOptions::LINEAR)
+        });
+        self.thumbs.insert(path.to_string(), tex.clone());
+        tex
+    }
+
+    fn report_body(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        if let Some(err) = v.get("error").and_then(|x| x.as_str()) {
+            ui.colored_label(Color32::from_rgb(200, 80, 80), err);
+            return;
+        }
+        if v.get("status").is_some() {
+            self.github_report_ui(ui, v);
+            return;
+        }
+        match v.get("kind").and_then(|x| x.as_str()) {
+            Some("images") | Some("audio") => self.similar_report_ui(ui, v),
+            Some("why") => self.why_report_ui(ui, v),
+            Some("growth") => self.growth_report_ui(ui, v),
+            Some("advice") => self.advice_report_ui(ui, v),
+            Some("backup") => self.backup_report_ui(ui, v),
+            Some("provenance") => self.provenance_report_ui(ui, v),
+            Some("speed") => self.speed_report_ui(ui, v),
+            Some("addons") => self.addons_report_ui(ui, v),
+            _ => {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(serde_json::to_string_pretty(v).unwrap_or_default()).monospace(),
+                    )
+                    .wrap(),
+                );
+            }
+        }
+    }
+
+    fn addons_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Addons externos", "External addons"));
+        ui.label(RichText::new(tr(
+            "Herramientas que ya resuelven Google Photos u OCR. WizEverything sólo las detecta y muestra cómo usarlas; no maneja credenciales.",
+            "Tools that already solve Google Photos or OCR. WizEverything only detects them and shows how to use them; it handles no credentials.",
+        )).weak());
+        ui.separator();
+        if let Some(list) = v["addons"].as_array() {
+            for a in list {
+                let ok = a["installed"].as_bool().unwrap_or(false);
+                ui.horizontal(|ui| {
+                    ui.colored_label(
+                        if ok { Color32::from_rgb(90, 170, 100) } else { Color32::from_rgb(200, 120, 90) },
+                        if ok { "●" } else { "○" },
+                    );
+                    ui.label(RichText::new(a["name"].as_str().unwrap_or("")).strong());
+                    if ok {
+                        ui.label(RichText::new(a["version"].as_str().unwrap_or("")).weak().size(10.0));
+                    } else {
+                        ui.label(RichText::new(tr("no instalado", "not installed")).weak().size(10.0));
+                    }
+                });
+                ui.label(RichText::new(a["purpose"].as_str().unwrap_or("")).size(11.0));
+                if let Some(setup) = a["setup"].as_array() {
+                    for (i, s) in setup.iter().enumerate() {
+                        if let Some(s) = s.as_str() {
+                            ui.label(RichText::new(format!("{}. {s}", i + 1)).weak().size(10.0));
+                        }
+                    }
+                }
+                if let Some(cmds) = a["commands"].as_array() {
+                    for c in cmds {
+                        if let Some(c) = c.as_str() {
+                            ui.label(RichText::new(c).monospace().size(10.0));
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+            }
+        }
+        if let Some(dirs) = v["local_photo_dirs"].as_array().filter(|d| !d.is_empty()) {
+            ui.separator();
+            ui.label(RichText::new(tr("Carpetas locales detectadas", "Detected local folders")).strong());
+            for d in dirs {
+                ui.label(RichText::new(d["path"].as_str().unwrap_or("")).monospace().size(10.0));
+            }
+        }
+        ui.separator();
+        if let Some(notes) = v["notes"].as_array() {
+            for n in notes {
+                if let Some(n) = n.as_str() {
+                    ui.label(RichText::new(format!("• {n}")).weak().size(10.0));
+                }
+            }
+        }
+    }
+
+    fn speed_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Velocidad y tiempo estimado", "Speed and estimated time"));
+        ui.label(RichText::new(v["path"].as_str().unwrap_or("")).monospace().size(10.0));
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(format!(
+                "{}: {}",
+                tr("Disco", "Disk"),
+                v["disk_class_label"].as_str().unwrap_or("?")
+            )).strong());
+            if let Some(g) = v["google_drive"].as_str() {
+                ui.colored_label(
+                    Color32::from_rgb(90, 160, 220),
+                    format!("Google Drive · {g}"),
+                );
+            }
+        });
+        egui::Grid::new("speed_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            let row = |ui: &mut egui::Ui, k: &str, val: Option<&serde_json::Value>| {
+                if let Some(b) = val {
+                    ui.label(k);
+                    ui.label(format!("{} MB/s  ({} MB, {} ms)", b["mbps"], b["bytes"].as_u64().unwrap_or(0) / 1_000_000, b["ms"]));
+                    ui.end_row();
+                }
+            };
+            row(ui, tr("Descarga", "Download"), v.get("download"));
+            row(ui, tr("Lectura", "Read"), v.get("read"));
+            row(ui, tr("Escritura", "Write"), v.get("write"));
+        });
+        if let Some(c) = v.get("cloud").filter(|c| !c.is_null()) {
+            ui.add_space(4.0);
+            ui.label(format!(
+                "{} {:.1}%  ·  {} / {}",
+                tr("Ya local:", "Already local:"),
+                c["local_pct"].as_f64().unwrap_or(0.0),
+                fmt_size(c["local_bytes"].as_u64().unwrap_or(0)),
+                fmt_size(c["bytes"].as_u64().unwrap_or(0)),
+            ));
+            if c["partial"].as_bool().unwrap_or(false) {
+                ui.colored_label(Color32::from_rgb(220, 160, 60), tr("muestra parcial", "partial sample"));
+            }
+        }
+        ui.add_space(6.0);
+        if let Some(e) = v.get("eta") {
+            ui.label(RichText::new(format!(
+                "{} {}  ({})",
+                tr("ETA:", "ETA:"),
+                e["human"].as_str().unwrap_or("?"),
+                tr("velocidad efectiva", "effective speed")
+            )).strong());
+            ui.label(RichText::new(format!(
+                "{} {} MB/s · {} MB/s → {} MB/s",
+                tr("efectiva", "effective"),
+                e["effective_mbps"], e["source_mbps"], e["target_mbps"]
+            )).weak().size(10.0));
+        }
+        if let Some(notes) = v["notes"].as_array().filter(|a| !a.is_empty()) {
+            ui.add_space(4.0);
+            for n in notes {
+                if let Some(n) = n.as_str() {
+                    ui.label(RichText::new(format!("• {n}")).weak().size(10.0));
+                }
+            }
+        }
+    }
+
+    fn provenance_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Procedencia", "Provenance"));
+        ui.label(RichText::new(v["path"].as_str().unwrap_or("")).monospace().size(11.0));
+        ui.add_space(6.0);
+        if let Some(z) = v.get("zone").filter(|z| !z.is_null()) {
+            let id = z["zone_id"].as_u64().unwrap_or(0);
+            let (txt, color) = if id == 3 {
+                (tr("Descargado de Internet", "Downloaded from the Internet"), Color32::from_rgb(220, 150, 60))
+            } else {
+                (tr("Zona de Internet", "Internet zone"), Color32::from_rgb(140, 160, 190))
+            };
+            ui.colored_label(color, txt);
+            if let Some(u) = z["host_url"].as_str().filter(|u| !u.is_empty()) {
+                ui.label(RichText::new(u).monospace().size(10.0));
+            }
+            if let Some(r) = z["referrer_url"].as_str().filter(|u| !u.is_empty()) {
+                ui.label(RichText::new(format!("{} {r}", tr("Referencia:", "Referrer:"))).weak().size(10.0));
+            }
+            if let Some(p) = z["package"].as_str().filter(|u| !u.is_empty()) {
+                ui.label(RichText::new(format!("{} {p}", tr("Paquete:", "Package:"))).monospace().size(10.0));
+            }
+        } else {
+            ui.label(RichText::new(tr(
+                "Sin Zone.Identifier: no vino de Internet o la marca se perdió al copiarlo.",
+                "No Zone.Identifier: it did not come from the Internet or the mark was lost when copied.",
+            )).weak());
+        }
+        ui.separator();
+        if let Some(i) = v.get("install").filter(|i| !i.is_null()) {
+            ui.label(RichText::new(format!(
+                "{} {}",
+                tr("Instalado por", "Installed by"),
+                i["name"].as_str().unwrap_or("")
+            )).strong());
+            let mut line = String::new();
+            if let Some(x) = i["version"].as_str().filter(|x| !x.is_empty()) { line.push_str(&format!("v{x}  ")); }
+            if let Some(x) = i["publisher"].as_str().filter(|x| !x.is_empty()) { line.push_str(x); }
+            if !line.is_empty() { ui.label(RichText::new(line).weak()); }
+            ui.label(RichText::new(i["location"].as_str().unwrap_or("")).monospace().size(10.0));
+        } else {
+            ui.label(RichText::new(tr("No pertenece a una aplicación instalada conocida.", "Not inside a known installed application.")).weak());
+        }
+        if let Some(s) = v.get("steam_library").and_then(|x| x.as_str()) {
+            ui.label(RichText::new(format!("{} {s}", tr("Biblioteca de Steam:", "Steam library:"))).monospace().size(10.0));
+        }
+        if let Some(n) = v.get("run_count").and_then(|x| x.as_u64()) {
+            ui.label(format!("{} {}", tr("Veces abierto:", "Times opened:"), n));
+        }
+        if let Some(src) = v.get("sources").and_then(|x| x.as_array()).filter(|a| !a.is_empty()) {
+            ui.add_space(4.0);
+            ui.label(RichText::new(tr("Origen", "Source")).strong());
+            for s in src {
+                if let Some(s) = s.as_str() { ui.label(format!("• {s}")); }
+            }
+        }
+    }
+
+    fn similar_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        let kind = v["kind"].as_str().unwrap_or("");
+        let reclaim = v["reclaim_bytes"].as_u64().unwrap_or(0);
+        ui.horizontal(|ui| {
+            ui.heading(if kind == "images" { "Imágenes parecidas" } else { "Audio parecido" });
+            ui.label(format!(
+                "{} archivos · {} grupos · {} recuperables",
+                v["analyzed"],
+                v["groups"],
+                fmt_size(reclaim)
+            ));
+        });
+        ui.label(RichText::new(format!(
+            "modo {} · {} ms{}",
+            mode_es(v),
+            v["elapsed_ms"].as_u64().unwrap_or(0),
+            if v["partial"].as_bool().unwrap_or(false) { " · parcial" } else { "" }
+        )).weak().size(10.0));
+        if let Some(notes) = v["notes"].as_array() {
+            for n in notes {
+                ui.label(RichText::new(n.as_str().unwrap_or("")).weak());
+            }
+        }
+        ui.separator();
+        let empty: Vec<serde_json::Value> = Vec::new();
+        for g in v["top"].as_array().unwrap_or(&empty) {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(g["key"].as_str().unwrap_or(""));
+                    let r = g["reclaim_bytes"].as_u64().unwrap_or(0);
+                    if r > 0 {
+                        ui.label(format!("· {} recuperables", fmt_size(r)));
+                    }
+                });
+                if let Some(note) = g["note"].as_str() {
+                    ui.colored_label(Color32::from_rgb(210, 150, 60), note);
+                }
+                self.similar_item_ui(ui, kind, &g["keep"], true);
+                if let Some(others) = g["others"].as_array() {
+                    for o in others {
+                        self.similar_item_ui(ui, kind, o, false);
+                    }
+                }
+                let kp = g["keep"]["path"].as_str();
+                let op = g["others"]
+                    .as_array()
+                    .and_then(|a| a.first())
+                    .and_then(|x| x["path"].as_str());
+                if let (Some(kp), Some(op)) = (kp, op) {
+                    if kind == "audio" {
+                        if ui
+                            .button(tr("▶ Escuchar A/B", "▶ A/B listen"))
+                            .on_hover_text(tr(
+                                "Reproduce las dos copias en la misma posición y alterna cuál se oye (se puede fijar A o B). (Experimental)",
+                                "Plays both copies at the same position and alternates which one is heard (A or B can be pinned). (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            self.open_audio_ab(kp, op);
+                        }
+                    } else if kind == "images" {
+                        if ui
+                            .button(tr("🔍 Comparar zoom (A/B)", "🔍 Zoom compare (A/B)"))
+                            .on_hover_text(tr(
+                                "Muestra la misma zona de las dos imágenes al mismo zoom; mové el mouse para recorrerlas. (Experimental)",
+                                "Shows the same area of both images at the same zoom; move the mouse to inspect. (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            self.open_img_ab(kp, op);
+                        }
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        }
+        if let Some(alts) = v["alternatives"].as_array() {
+            ui.separator();
+            ui.label(RichText::new("Alternativas").strong());
+            for a in alts {
+                ui.label(format!("· {}", a.as_str().unwrap_or("")));
+            }
+        }
+    }
+
+    fn similar_item_ui(&mut self, ui: &mut egui::Ui, kind: &str, item: &serde_json::Value, keep: bool) {
+        ui.horizontal(|ui| {
+            if keep
+                && kind == "images"
+                && let Some(path) = item["path"].as_str()
+                && let Some(tex) = self.thumb(ui.ctx(), path)
+            {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    tex.id(),
+                    egui::vec2(72.0, 72.0),
+                )));
+            }
+            ui.vertical(|ui| {
+                let (label, color) = if keep {
+                    ("CONSERVAR", Color32::from_rgb(90, 170, 100))
+                } else {
+                    ("CANDIDATO", Color32::from_rgb(200, 150, 60))
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, label);
+                    ui.label(format!(
+                        "{} · score {:.1}",
+                        fmt_size(item["bytes"].as_u64().unwrap_or(0)),
+                        item["score"].as_f64().unwrap_or(0.0)
+                    ));
+                    if let Some(sim) = item["similarity_pct"].as_f64() {
+                        ui.label(format!("· similitud {sim:.0}%"));
+                    }
+                });
+                ui.label(item["path"].as_str().unwrap_or(""));
+                if let Some(rs) = item["reasons"].as_array() {
+                    let s: Vec<&str> = rs.iter().filter_map(|x| x.as_str()).collect();
+                    ui.label(RichText::new(s.join(" · ")).weak());
+                }
+                if let Some(ai) = item["ai"].as_array() {
+                    let s: Vec<&str> = ai.iter().filter_map(|x| x.as_str()).collect();
+                    if !s.is_empty() {
+                        ui.colored_label(Color32::from_rgb(200, 120, 220), format!("IA: {}", s.join(", ")));
+                    }
+                }
+                if let Some(n) = item["noise"].as_object() {
+                    let summary = n.get("summary").and_then(|x| x.as_str()).unwrap_or("");
+                    if !summary.is_empty() {
+                        let bad = n.get("artifacts").and_then(|x| x.as_bool()).unwrap_or(false)
+                            || n.get("dull").and_then(|x| x.as_bool()).unwrap_or(false);
+                        ui.colored_label(
+                            if bad {
+                                Color32::from_rgb(210, 120, 70)
+                            } else {
+                                Color32::from_gray(150)
+                            },
+                            format!("ruido: {summary}"),
+                        );
+                    }
+                }
+            });
+        });
+    }
+
+    fn github_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        let status = v["status"].as_str().unwrap_or("");
+        let title = v["title_es"].as_str().or_else(|| v["title"].as_str()).unwrap_or("");
+        let color = match status {
+            "up_to_date" => Color32::from_rgb(90, 170, 100),
+            "local_newer" => Color32::from_rgb(90, 150, 220),
+            "behind" => Color32::from_rgb(220, 160, 70),
+            "diverged" => Color32::from_rgb(210, 90, 90),
+            _ => Color32::from_gray(150),
+        };
+        ui.heading(RichText::new(title).color(color).size(20.0));
+        if status == "not_repo" {
+            ui.label(v["path"].as_str().unwrap_or(""));
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Rama: {}", v["branch"].as_str().unwrap_or("")));
+            ui.label(format!("· HEAD {}", v["head"].as_str().unwrap_or("")));
+            ui.label(format!("· {}", v["upstream"].as_str().unwrap_or("—")));
+            ui.label(format!("· {} adelante / {} atrás", v["ahead"], v["behind"]));
+            if v["dirty"].as_u64().unwrap_or(0) > 0 {
+                ui.colored_label(
+                    Color32::from_rgb(210, 150, 60),
+                    format!("· {} sin commitear", v["dirty"]),
+                );
+            }
+        });
+        if let Some(notes) = v["notes"].as_array() {
+            for n in notes {
+                ui.label(RichText::new(n.as_str().unwrap_or("")).weak());
+            }
+        }
+        ui.separator();
+        if let Some(s) = v.get("size") {
+            ui.horizontal_wrapped(|ui| {
+                for (key, label) in [
+                    ("local_alloc", "Disco"),
+                    ("tracked", "Versionado"),
+                    ("git_loose", ".git suelto"),
+                    ("git_pack", ".git pack"),
+                ] {
+                    ui.label(format!("{label}: {}", fmt_size(s[key].as_u64().unwrap_or(0))));
+                    ui.label("·");
+                }
+                if let Some(kb) = s["github_kb"].as_u64() {
+                    ui.label(format!("GitHub: {kb} KB"));
+                }
+            });
+            if let Some(e) = s["explanation"].as_str() {
+                ui.label(RichText::new(e).weak());
+            }
+        }
+        ui.add_space(6.0);
+        if let Some(folders) = v["folders"].as_array()
+            && !folders.is_empty()
+        {
+            ui.label(RichText::new("Tamaño por carpeta").strong());
+            egui::Grid::new("gh_folders").striped(true).num_columns(5).show(ui, |ui| {
+                for h in ["Carpeta", "Disco", "Versionado", "Delta", "%"] {
+                    ui.strong(h);
+                }
+                ui.end_row();
+                for f in folders {
+                    ui.label(f["folder"].as_str().unwrap_or(""));
+                    ui.label(fmt_size(f["local_bytes"].as_u64().unwrap_or(0)));
+                    ui.label(fmt_size(f["tracked_bytes"].as_u64().unwrap_or(0)));
+                    let d = f["delta_bytes"].as_i64().unwrap_or(0);
+                    ui.label(if d >= 0 {
+                        format!("+{}", fmt_size(d as u64))
+                    } else {
+                        format!("-{}", fmt_size((-d) as u64))
+                    });
+                    ui.label(format!("{:.1}%", f["percent"].as_f64().unwrap_or(0.0)));
+                    ui.end_row();
+                }
+            });
+        }
+        for (key, label) in [
+            ("ahead", "Commits locales sin subir"),
+            ("behind", "Commits de la web que te faltan"),
+        ] {
+            if let Some(arr) = v["commits"][key].as_array()
+                && !arr.is_empty()
+            {
+                egui::CollapsingHeader::new(format!("{label} ({})", arr.len()))
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        for c in arr {
+                            ui.label(format!(
+                                "{}  {}  {}",
+                                c["hash"].as_str().unwrap_or(""),
+                                c["date"].as_str().unwrap_or(""),
+                                c["subject"].as_str().unwrap_or("")
+                            ));
+                        }
+                    });
+            }
+        }
+        if let Some(arr) = v["changes"]["upstream_files"].as_array()
+            && !arr.is_empty()
+        {
+            egui::CollapsingHeader::new(format!("Archivos que cambiaron arriba ({})", arr.len())).show(
+                ui,
+                |ui| {
+                    for f in arr.iter().take(100) {
+                        ui.label(format!(
+                            "{}  {}",
+                            f["status"].as_str().unwrap_or(""),
+                            f["path"].as_str().unwrap_or("")
+                        ));
+                    }
+                },
+            );
+        }
+        if let Some(arr) = v["dirty_files"].as_array()
+            && !arr.is_empty()
+        {
+            egui::CollapsingHeader::new(format!("Cambios locales sin commitear ({})", v["dirty"]))
+                .show(ui, |ui| {
+                    for f in arr {
+                        ui.label(f.as_str().unwrap_or(""));
+                    }
+                });
+        }
+        if let Some(alts) = v["alternatives"].as_array() {
+            ui.separator();
+            ui.label(RichText::new("Alternativas").strong());
+            for a in alts {
+                ui.label(format!("· {}", a.as_str().unwrap_or("")));
+            }
+        }
+    }
+
+    /// Bytes of an extension/category per node, cached per code + revision.
+    fn ext_bytes_for(&mut self, tree: &Tree, code: u32) -> Arc<treemap::Highlight> {
+        match &self.highlight_cache {
+            Some((ce, rev, h)) if *ce == code && *rev == self.revision => h.clone(),
+            _ => {
+                let bytes = if code & CAT_FLAG != 0 {
+                    let c = (code & !CAT_FLAG) as usize;
+                    tree.ext_bytes_where(|x| category_of(&tree.exts[x as usize].name) == c)
+                } else {
+                    tree.ext_bytes(code)
+                };
+                let h = Arc::new(treemap::Highlight { bytes });
+                self.highlight_cache = Some((code, self.revision, h.clone()));
+                h
+            }
+        }
+    }
+
     fn ext_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
         let key = (self.view_root, self.revision, self.ext_sort);
         if key != self.ext_key {
@@ -2906,20 +5044,8 @@ impl App {
         if rebuild {
             self.pending_size = None;
             // Bytes of the highlighted extension per node (cached per extension + tree revision).
-            let hl = self.highlight_ext.map(|e| match &self.highlight_cache {
-                Some((ce, rev, h)) if *ce == e && *rev == self.revision => h.clone(),
-                _ => {
-                    let bytes = if e & CAT_FLAG != 0 {
-                        let c = (e & !CAT_FLAG) as usize;
-                        tree.ext_bytes_where(|x| category_of(&tree.exts[x as usize].name) == c)
-                    } else {
-                        tree.ext_bytes(e)
-                    };
-                    let h = Arc::new(treemap::Highlight { bytes });
-                    self.highlight_cache = Some((e, self.revision, h.clone()));
-                    h
-                }
-            });
+            let hl_code = self.highlight_ext;
+            let hl = hl_code.map(|e| self.ext_bytes_for(tree, e));
             let layout = if rings {
                 let bg = ui.visuals().panel_fill;
                 let p = sunburst::Params { highlight: hl.as_deref(), bg: [bg.r(), bg.g(), bg.b()] };
@@ -3009,110 +5135,28 @@ impl App {
             painter.text(c + egui::vec2(0.0, 9.0), egui::Align2::CENTER_CENTER, fmt_size(size), egui::FontId::proportional(12.0), dark);
         }
 
-        // Rings + extension highlight: rank the folders holding the most of that
-        // extension, in the free space to the right of the ring.
+        // Rings + extension highlight: a small arrow sends the filter to the left panel.
         if self.settings.rings
             && let Some(g) = layout.geom
-            && let Some((ce, _, hl)) = &self.highlight_cache
-            && self.highlight_ext == Some(*ce)
+            && let Some(code) = self.highlight_ext
         {
-            let bytes = &hl.bytes;
-            let root = layout.root;
-            let mut rows: Vec<(u32, u64)> = tree
-                .children(root)
-                .iter()
-                .filter(|&&c| tree.nodes[c as usize].is_dir())
-                .map(|&c| (c, bytes.get(c as usize).copied().unwrap_or(0)))
-                .filter(|(_, b)| *b > 0)
-                .collect();
-            rows.sort_by(|x, y| y.1.cmp(&x.1));
-            if !rows.is_empty() {
-                let total = bytes.get(root as usize).copied().unwrap_or(0).max(1);
-                let rmax = (layout.width.min(layout.height) as f32 / 2.0 - 6.0).max(10.0);
-                let cx = rect.min.x + g[0] * kx;
-                let rx = rmax * kx;
-                let right = rect.max.x - 8.0;
-                let free = right - (cx + rx + 10.0);
-                let mut left = right - free.clamp(0.0, 420.0);
-                let mut top = rect.min.y + 8.0;
-                if free < 140.0 {
-                    // Ring fills the width: fall back to the bottom-right corner.
-                    left = rect.max.x - 8.0 - 220.0;
-                    top = (rect.max.y - 8.0 - rect.height() * 0.6).max(rect.min.y + 8.0);
-                }
-                let pr = egui::Rect::from_min_max(
-                    egui::pos2(left.max(rect.min.x + 8.0), top),
-                    egui::pos2(right, rect.max.y - 8.0),
-                );
-                let row_h = 15.0;
-                let max_rows = ((pr.height() - 44.0) / row_h).floor().max(0.0) as usize;
-                if max_rows > 0 {
-                    let dark_ui = ui.visuals().dark_mode;
-                    let bg = if dark_ui {
-                        Color32::from_rgba_unmultiplied(16, 18, 22, 220)
-                    } else {
-                        Color32::from_rgba_unmultiplied(252, 252, 254, 230)
-                    };
-                    let fg = ui.visuals().text_color();
-                    let dim = ui.visuals().weak_text_color();
-                    let accent = ui.visuals().selection.bg_fill;
-                    painter.rect_filled(pr, 5.0, bg);
-                    painter.rect_stroke(pr, 5.0, Stroke::new(1.0, dim.gamma_multiply(0.35)), egui::StrokeKind::Inside);
-                    let mk = |s: String, color: Color32, max_w: f32, sz: f32| {
-                        let mut j = egui::text::LayoutJob::single_section(
-                            s,
-                            egui::TextFormat::simple(egui::FontId::proportional(sz), color),
-                        );
-                        j.wrap = egui::text::TextWrapping {
-                            max_width: max_w.max(1.0),
-                            max_rows: 1,
-                            break_anywhere: true,
-                            overflow_character: Some('…'),
-                        };
-                        j
-                    };
-                    let label = if *ce & CAT_FLAG != 0 {
-                        category_name((*ce & !CAT_FLAG) as usize).to_string()
-                    } else if tree.exts.get(*ce as usize).is_some_and(|x| x.name.is_empty()) {
-                        tree.ext_label(*ce).to_string()
-                    } else {
-                        format!(".{}", tree.ext_label(*ce))
-                    };
-                    let mut y = pr.min.y + 6.0;
-                    let title = format!("{} · {}", tr("Carpetas", "Folders"), label);
-                    let gt = painter.layout_job(mk(title, fg, pr.width() - 16.0, 12.5));
-                    painter.galley(egui::pos2(pr.min.x + 8.0, y), gt, fg);
-                    y += 17.0;
-                    let sub = format!("{} · {} {}", fmt_size(total), rows.len(), tr("carpetas", "folders"));
-                    let gs = painter.layout_job(mk(sub, dim, pr.width() - 16.0, 10.5));
-                    painter.galley(egui::pos2(pr.min.x + 8.0, y), gs, dim);
-                    y += 15.0;
-                    painter.line_segment(
-                        [egui::pos2(pr.min.x + 8.0, y), egui::pos2(pr.max.x - 8.0, y)],
-                        Stroke::new(1.0, dim.gamma_multiply(0.35)),
-                    );
-                    y += 5.0;
-                    for (id, b) in rows.iter().take(max_rows) {
-                        let frac = (*b as f64 / total as f64).clamp(0.0, 1.0) as f32;
-                        let bw = (pr.width() - 16.0) * frac;
-                        painter.rect_filled(
-                            egui::Rect::from_min_size(egui::pos2(pr.min.x + 8.0, y + 12.0), egui::vec2(bw.max(1.0), 2.0)),
-                            1.0,
-                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90),
-                        );
-                        let g1 = painter.layout_job(mk(tree.name(*id).to_string(), fg, pr.width() - 98.0, 11.5));
-                        painter.galley(egui::pos2(pr.min.x + 8.0, y), g1, fg);
-                        let pct = *b as f64 * 100.0 / total as f64;
-                        let rtxt = if pct > 0.0 && pct < 1.0 {
-                            format!("{} · <1%", fmt_size(*b))
-                        } else {
-                            format!("{} · {:.0}%", fmt_size(*b), pct)
-                        };
-                        let g2 = painter.layout_job(mk(rtxt, dim, 90.0, 11.0));
-                        painter.galley(egui::pos2(pr.max.x - 8.0 - g2.size().x, y + 1.0), g2, dim);
-                        y += row_h;
-                    }
-                }
+            let rmax = (layout.width.min(layout.height) as f32 / 2.0 - 6.0).max(10.0);
+            let cx = rect.min.x + g[0] * kx;
+            let rx = rmax * kx;
+            let pos = egui::pos2((cx + rx + 16.0).max(rect.min.x + 8.0), rect.min.y + 20.0);
+            let resp = ui.put(
+                egui::Rect::from_min_size(pos, egui::vec2(126.0, 22.0)),
+                egui::Button::new(tr("↙ Explorador", "↙ Explorer")).small(),
+            );
+            if resp
+                .on_hover_text(tr(
+                    "Llevar este filtro al panel izquierdo",
+                    "Send this filter to the left panel",
+                ))
+                .clicked()
+            {
+                self.type_filter = Some(code);
+                self.tab = Tab::Files;
             }
         }
 
@@ -3206,12 +5250,145 @@ enum MenuAction {
     Menu(u32),
     Reveal(String),
     ToggleExclude(String),
+    Advice(String, bool),
+    Provenance(String, bool),
+    Quarantine(String),
+}
+
+/// The mode a report was produced with, in UI language.
+fn mode_es(v: &serde_json::Value) -> &'static str {
+    if v.get("mode").and_then(|m| m.as_str()) == Some("deep") {
+        tr("profundo", "deep")
+    } else {
+        tr("rápido", "fast")
+    }
+}
+
+/// Human duration for estimates and measurements.
+fn fmt_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else if ms < 60_000 {
+        format!("{} s", fmt_dec(ms as f64 / 1000.0))
+    } else {
+        let m = ms / 60_000;
+        format!("{m} min {} s", fmt_dec((ms % 60_000) as f64 / 1000.0))
+    }
+}
+
+/// Deep hover: generic warning plus the estimate learned from the last fast run.
+fn deep_hover(label: &str, eta: Option<(u64, u64)>) -> String {
+    let base = format!(
+        "{label}: {}",
+        tr(
+            "sin presupuesto, analiza todo; puede tardar más.",
+            "no budget, analyses everything; may take longer.",
+        )
+    );
+    match eta {
+        Some((fast, deep)) => format!(
+            "{base}\n{} {} → {} ≈ {}.",
+            tr("Última corrida rápida:", "Last fast run:"),
+            fmt_ms(fast),
+            tr("profundo", "deep"),
+            fmt_ms(deep)
+        ),
+        None => base,
+    }
+}
+
+/// Estimate deep time from the fast result: remaining work × the known deep/fast factor.
+pub(crate) fn estimate_deep(kind: &str, fast_ms: u64, v: &serde_json::Value) -> u64 {
+    let u = |k: &str| v.get(k).and_then(|x| x.as_u64()).unwrap_or(0) as f64;
+    let partial = v.get("partial").and_then(|x| x.as_bool()).unwrap_or(false);
+    let factor = match kind {
+        // Deep only raises the budget: it re-decodes the images the fast run could not finish.
+        "images" => {
+            if partial && u("analyzed") > 0.0 {
+                (u("files") / u("analyzed")).clamp(1.0, 24.0)
+            } else {
+                1.0
+            }
+        }
+        // Deep decodes a 120 s window instead of 20 s: ~6× the decode work.
+        "audio" => {
+            let remaining = if partial && u("analyzed") > 0.0 {
+                ((u("files") - u("skipped")) / u("analyzed")).clamp(1.0, 20.0)
+            } else {
+                1.0
+            };
+            remaining * 6.0
+        }
+        // Deep resolves every change instead of the 2,000 largest.
+        "growth" => {
+            let total = ["added", "removed", "grown", "shrunk"]
+                .iter()
+                .map(|k| u(k))
+                .sum::<f64>();
+            let pct = v
+                .get("attributed_pct")
+                .and_then(|x| x.as_f64())
+                .unwrap_or(100.0);
+            let resolved = total * pct / 100.0;
+            if resolved > 0.0 && total > resolved {
+                (total / resolved).clamp(1.0, 10.0)
+            } else {
+                1.0
+            }
+        }
+        // Deep compares 250,000 files instead of 50,000.
+        "backup" => {
+            if v.get("truncated").and_then(|x| x.as_bool()).unwrap_or(false) {
+                5.0
+            } else {
+                1.0
+            }
+        }
+        // Deep adds the git check.
+        "advice" => 1.5,
+        _ => 1.0,
+    };
+    let factor = if factor.is_finite() && factor >= 1.0 { factor } else { 1.0 };
+    (fast_ms.max(1) as f64 * factor).min(1_800_000.0) as u64
+}
+
+/// Two explicit answers for heavy analyses: fast (default budget) and deep.
+fn analysis_pair(
+    ui: &mut egui::Ui,
+    label: &str,
+    hover: &str,
+    eta: Option<(u64, u64)>,
+) -> Option<bool> {
+    let mut out = None;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button(format!("{label} · {}", tr("rápido", "fast")))
+            .on_hover_text(hover)
+            .clicked()
+        {
+            out = Some(false);
+        }
+        if ui
+            .button(tr("profundo", "deep"))
+            .on_hover_text(deep_hover(label, eta))
+            .clicked()
+        {
+            out = Some(true);
+        }
+    });
+    out
 }
 
 /// Right-click menu body. Returns an action for the app, and whether to close.
 /// excluded: the folder's state in the duplicate exclusions (None = not excluded,
 /// Some(true) = excluded itself, Some(false) = inside an excluded folder).
-fn context_menu(ui: &mut egui::Ui, tree: Option<&Tree>, target: &MenuTarget, excluded: Option<bool>) -> (Option<MenuAction>, bool) {
+fn context_menu(
+    ui: &mut egui::Ui,
+    tree: Option<&Tree>,
+    target: &MenuTarget,
+    excluded: Option<bool>,
+    advice_eta: Option<(u64, u64)>,
+) -> (Option<MenuAction>, bool) {
     let (path, from_tree) = match target {
         MenuTarget::Node(id) => (tree.map(|t| t.full_path(*id)).unwrap_or_default(), true),
         MenuTarget::Path(p) => (p.clone(), false),
@@ -3235,6 +5412,61 @@ fn context_menu(ui: &mut egui::Ui, tree: Option<&Tree>, target: &MenuTarget, exc
     }
     if ui.button(tr("Copiar nombre", "Copy name")).clicked() {
         ui.ctx().copy_text(name.clone());
+        close = true;
+    }
+    if ui
+        .button(tr("¿Puedo borrar esto? (rápido)", "Can I delete this? (fast)"))
+        .on_hover_text(tr(
+            "Segunda opinión sin consultar git: artefacto regenerable, nube, carpeta del sistema, dato personal, antigüedad.",
+            "Second opinion without asking git: regenerable artifact, cloud, system folder, personal data, age.",
+        ))
+        .clicked()
+    {
+        action = Some(MenuAction::Advice(path.clone(), false));
+        close = true;
+    }
+    if ui
+        .button(tr("Procedencia (rápido)", "Provenance (fast)"))
+        .on_hover_text(tr(
+            "Zona de Internet, URL de descarga, aplicación que lo instaló y biblioteca de Steam.",
+            "Internet zone, download URL, the app that installed it and Steam library.",
+        ))
+        .clicked()
+    {
+        action = Some(MenuAction::Provenance(path.clone(), false));
+        close = true;
+    }
+    if ui
+        .button(tr("Procedencia (profundo)", "Provenance (deep)"))
+        .on_hover_text(tr(
+            "Igual que el rápido y además consulta a Everything cuántas veces se abrió.",
+            "Same as fast and also asks Everything how many times it was opened.",
+        ))
+        .clicked()
+    {
+        action = Some(MenuAction::Provenance(path.clone(), true));
+        close = true;
+    }
+    if ui
+        .button(tr("¿Puedo borrar esto? (profundo)", "Can I delete this? (deep)"))
+        .on_hover_text(deep_hover(
+            tr("¿Puedo borrar esto?", "Can I delete this?"),
+            advice_eta,
+        ))
+        .clicked()
+    {
+        action = Some(MenuAction::Advice(path.clone(), true));
+        close = true;
+    }
+    if ui
+        .button(tr("Mover a cuarentena", "Move to quarantine"))
+        .on_hover_text(tr(
+            "Lo agrega a la canasta con dry-run; nada se mueve hasta confirmar.",
+            "Adds it to the basket with dry-run; nothing moves until you confirm.",
+        ))
+        .clicked()
+    {
+        action = Some(MenuAction::Quarantine(path.clone()));
         close = true;
     }
     let is_dir = match target {
@@ -3418,6 +5650,61 @@ fn pct_bar(ui: &mut egui::Ui, pct: f32) {
         egui::FontId::proportional(11.0),
         ui.visuals().strong_text_color(),
     );
+}
+
+fn load_full(ctx: &egui::Context, path: &str) -> Option<(egui::TextureHandle, (u32, u32))> {
+    let im = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    // Cap GPU memory while keeping enough detail for 8x zoom.
+    let im = im.thumbnail(4096, 4096);
+    let rgba = im.to_rgba8();
+    let dims = (rgba.width(), rgba.height());
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [dims.0 as usize, dims.1 as usize],
+        rgba.as_raw(),
+    );
+    Some((
+        ctx.load_texture(format!("full:{path}"), color, egui::TextureOptions::LINEAR),
+        dims,
+    ))
+}
+
+/// Paint the same normalised region of one image; moving the mouse pans it.
+fn paint_crop(
+    ui: &mut egui::Ui,
+    tex: &egui::TextureHandle,
+    dim: (u32, u32),
+    center: &mut (f32, f32),
+    zoom: f32,
+    size: egui::Vec2,
+) -> egui::Response {
+    let resp = ui.allocate_response(size, egui::Sense::hover());
+    if dim.0 == 0 || dim.1 == 0 {
+        return resp;
+    }
+    let fx = 1.0 / zoom;
+    // Keep pixels square: the crop's normalised height follows the widget aspect.
+    let fy = fx * (size.y / size.x) * (dim.0 as f32 / dim.1.max(1) as f32);
+    if resp.hovered()
+        && let Some(p) = ui.ctx().pointer_hover_pos()
+    {
+        let (x0, y0, w, h) = crate::img_ab::crop_frac(dim, *center, (fx, fy));
+        let local = p - resp.rect.min;
+        center.0 = ((x0 + local.x / size.x * w) / dim.0 as f32).clamp(0.0, 1.0);
+        center.1 = ((y0 + local.y / size.y * h) / dim.1 as f32).clamp(0.0, 1.0);
+    }
+    let (x0, y0, w, h) = crate::img_ab::crop_frac(dim, *center, (fx, fy));
+    let uv = egui::Rect::from_min_max(
+        egui::pos2(x0 / dim.0 as f32, y0 / dim.1 as f32),
+        egui::pos2((x0 + w) / dim.0 as f32, (y0 + h) / dim.1 as f32),
+    );
+    ui.painter()
+        .image(tex.id(), resp.rect, uv, egui::Color32::WHITE);
+    resp
 }
 
 pub fn fmt_size(b: u64) -> String {

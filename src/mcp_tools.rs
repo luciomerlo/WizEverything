@@ -38,6 +38,16 @@ fn app_data_dir(sub: &str) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Fast by default; `mode: "deep"` (or `deep: true`) asks for the thorough path.
+pub fn is_deep(a: &Value) -> bool {
+    a.get("deep").and_then(Value::as_bool).unwrap_or(false)
+        || a.get("mode").and_then(Value::as_str) == Some("deep")
+}
+
+pub fn mode_name(deep: bool) -> &'static str {
+    if deep { "deep" } else { "fast" }
+}
+
 fn need_path(root: u32, a: &Value) -> Result<(), String> {
     if root == ROOT && !a.get("all_drives").and_then(Value::as_bool).unwrap_or(false) {
         return Err("Give a 'path' (or all_drives=true).".into());
@@ -394,6 +404,69 @@ pub fn catalog_check(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Val
     }))
 }
 
+/// "Why is it full?" — top folders/files and the biggest path chain.
+pub fn why_full(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    Ok(crate::why::why_full(t, root, limit))
+}
+
+/// "What grew?" — diff of the two newest snapshots, attributed per folder.
+pub fn growth_report(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    let (oldp, newp) = match (a.get("old").and_then(Value::as_str), a.get("new").and_then(Value::as_str)) {
+        (Some(o), Some(n)) => (PathBuf::from(o), PathBuf::from(n)),
+        _ => crate::why::latest_two()?,
+    };
+    let old = crate::why::load(&oldp)?;
+    let new = crate::why::load(&newp)?;
+    let deep = is_deep(a);
+    let mut v = crate::why::growth(t, &old, &new, limit, deep);
+    v["old"]["path"] = json!(oldp.to_string_lossy());
+    v["new"]["path"] = json!(newp.to_string_lossy());
+    v["root"] = json!(t.full_path(root));
+    v["mode"] = json!(mode_name(deep));
+    Ok(v)
+}
+
+/// "Can I delete this?" — verdict with reasons, no mutation.
+pub fn advice(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
+    let id = match a.get("path").and_then(Value::as_str) {
+        Some(p) => t.find_path(p).ok_or_else(|| format!("path not in the index: {p}"))?,
+        None => {
+            need_path(root, a)?;
+            root
+        }
+    };
+    let deep = is_deep(a);
+    let mut v = crate::advice::explain(t, id, deep);
+    v["mode"] = json!(mode_name(deep));
+    Ok(v)
+}
+
+/// "Is it backed up?" — compare a folder against another copy by relative path.
+pub fn backup_check(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    let source = match a.get("source").and_then(Value::as_str) {
+        Some(p) => t.find_path(p).ok_or_else(|| format!("source not in the index: {p}"))?,
+        None => {
+            need_path(root, a)?;
+            root
+        }
+    };
+    let target = a
+        .get("target")
+        .and_then(Value::as_str)
+        .ok_or("missing 'target' (folder with the backup copy)")?;
+    let target_id = t
+        .find_path(target)
+        .ok_or_else(|| format!("target not in the index (is the drive connected?): {target}"))?;
+    let deep = is_deep(a);
+    let max = if deep { 250_000 } else { 50_000 };
+    let mut v = crate::backup::compare_trees(t, source, target_id, max)?.to_json(limit);
+    v["source"] = json!(t.full_path(source));
+    v["target"] = json!(t.full_path(target_id));
+    v["mode"] = json!(mode_name(deep));
+    Ok(v)
+}
+
 const SIM_IMG_EXT: &str = "jpg;jpeg;png;webp;gif;bmp;tif;tiff";
 const SIM_AUD_EXT: &str = "mp3;flac;m4a;aac;ogg;opus;wav;aiff;aif;wma;ape;wv;mka";
 
@@ -418,7 +491,15 @@ pub fn similar_images(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Va
     let files = sim_files(t, root, SIM_IMG_EXT)?;
     let max_files = a.get("max_files").and_then(Value::as_u64).unwrap_or(4000).clamp(50, 50_000) as usize;
     let threshold = a.get("threshold").and_then(Value::as_u64).unwrap_or(10).clamp(2, 20) as u32;
-    Ok(crate::similar::scan_images(files, max_files, threshold).to_json(limit))
+    let deep = is_deep(a);
+    let budget_ms = a
+        .get("budget_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(if deep { 120_000 } else { 5_000 })
+        .clamp(200, 120_000);
+    let mut v = crate::similar::scan_images(files, max_files, threshold, budget_ms).to_json(limit);
+    v["mode"] = json!(mode_name(deep));
+    Ok(v)
 }
 
 /// Audio parecido (mismo tema en FLAC/MP3/…), separando versiones por duración.
@@ -426,7 +507,10 @@ pub fn similar_audio(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Val
     need_path(root, a)?;
     let files = sim_files(t, root, SIM_AUD_EXT)?;
     let max_files = a.get("max_files").and_then(Value::as_u64).unwrap_or(20_000).clamp(50, 200_000) as usize;
-    Ok(crate::similar::scan_audio(files, max_files).to_json(limit))
+    let deep = is_deep(a);
+    let mut v = crate::similar::scan_audio(files, max_files, deep).to_json(limit);
+    v["mode"] = json!(mode_name(deep));
+    Ok(v)
 }
 
 /// "GitHub mode" for any chosen folder: local vs web state, commits, files and size.
@@ -450,10 +534,231 @@ pub fn github_mode(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value
                 .collect(),
         })
     });
-    let fetch = a.get("fetch").and_then(Value::as_bool).unwrap_or(true);
-    Ok(crate::github_mode::inspect(
+    let deep = is_deep(a);
+    let fetch = a.get("fetch").and_then(Value::as_bool).unwrap_or(deep);
+    let mut v = crate::github_mode::inspect(
         start,
         sizes.as_ref(),
         &crate::github_mode::Opts { fetch, limit },
-    ))
+    );
+    v["mode"] = json!(mode_name(deep));
+    Ok(v)
+}
+
+/// Discos guardados: marca, modelo, serie, fecha de actualización y cobertura.
+pub fn volumes(_t: &Tree, _root: u32, a: &Value, _limit: usize) -> Result<Value, String> {
+    let store = crate::volumes::Store::default();
+    let only = a.get("id").and_then(Value::as_str);
+    let list: Vec<Value> = store
+        .scan()
+        .into_iter()
+        .filter(|r| only.is_none_or(|id| r.id == id))
+        .map(|r| r.to_json(false))
+        .collect();
+    let total: u64 = store.scan().iter().map(|r| r.total_logical).sum();
+    Ok(json!({
+        "kind": "volumes",
+        "count": list.len(),
+        "total_logical": total,
+        "storage_dir": store.dir().to_string_lossy(),
+        "retention_modes": [
+            { "id": "full", "label": "Completa", "description": "Todas las rutas + tamaños + fechas + huella; navegable y comparable." },
+            { "id": "digest", "label": "Resumen", "description": "Totales, carpetas principales, tipos y archivos más grandes; no navegable." }
+        ],
+        "volumes": list,
+    }))
+}
+
+/// Duplicados contra discos guardados (también entre discos guardados).
+pub fn volume_duplicates(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    let store = crate::volumes::Store::default();
+    let only = a.get("volume").and_then(Value::as_str);
+    let metas = store.scan();
+    let records: Vec<crate::volumes::VolumeRecord> = metas
+        .iter()
+        .filter(|r| only.is_none_or(|id| r.id == id))
+        .filter(|r| r.retention == crate::volumes::Retention::Full)
+        .filter_map(|r| store.load(&r.id).ok())
+        .collect();
+    if records.is_empty() {
+        return Ok(json!({
+            "kind": "volume_duplicates",
+            "mode": mode_name(is_deep(a)),
+            "volumes": 0,
+            "local_matches": 0,
+            "saved_pairs": 0,
+            "matches": [],
+            "saved": [],
+            "notes": ["No hay discos guardados con retención Completa. Conectá el disco y guardá una copia desde Opciones."],
+        }));
+    }
+    let deep = is_deep(a);
+    let opts = crate::volumes::DupOpts {
+        deep,
+        budget_ms: if deep { 60_000 } else { 3_000 },
+        min_bytes: if deep { 1 } else { 64 * 1024 },
+        max_files: if deep { 200_000 } else { 5_000 },
+    };
+    let mut v = crate::volumes::duplicates(Some(t), root, &records, &opts);
+    v["mode"] = json!(mode_name(deep));
+    if let Some(m) = v.get_mut("matches").and_then(|x| x.as_array_mut()) {
+        m.truncate(limit);
+    }
+    if let Some(s) = v.get_mut("saved").and_then(|x| x.as_array_mut()) {
+        s.truncate(limit);
+    }
+    Ok(v)
+}
+
+/// ¿Este archivo está en un disco guardado? Ruta, tamaño y huella.
+pub fn volume_lookup(t: &Tree, _root: u32, a: &Value) -> Result<Value, String> {
+    let path = a.get("path").and_then(Value::as_str).filter(|p| !p.is_empty()).ok_or("Give a 'path' to look up.")?;
+    let path = path.replace('/', "\\");
+    let _ = t;
+    let store = crate::volumes::Store::default();
+    let records: Vec<crate::volumes::VolumeRecord> = store
+        .scan()
+        .into_iter()
+        .filter(|r| r.retention == crate::volumes::Retention::Full)
+        .filter_map(|r| store.load(&r.id).ok())
+        .collect();
+    let mut v = crate::volumes::lookup(&records, Path::new(&path), is_deep(a));
+    v["volumes_checked"] = json!(records.len());
+    Ok(v)
+}
+
+/// Procedencia: zona de Internet, aplicación instalada, Steam y veces abierto.
+pub fn provenance(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
+    let id = match a.get("path").and_then(Value::as_str) {
+        Some(p) => t.find_path(&p.replace('/', "\\")).ok_or_else(|| format!("path not in the index: {p}"))?,
+        None => {
+            need_path(root, a)?;
+            root
+        }
+    };
+    let deep = is_deep(a);
+    let mut v = crate::provenance::explain(t, id, deep);
+    v["mode"] = json!(mode_name(deep));
+    Ok(v)
+}
+
+/// Línea de tiempo: snapshots guardados (fechas y cantidad de entradas).
+pub fn timeline(_t: &Tree, _root: u32, _a: &Value, limit: usize) -> Result<Value, String> {
+    Ok(crate::timeline::to_json(limit))
+}
+
+/// Cuarentena: archivos movidos por la app, con opción de restaurar desde la GUI.
+pub fn quarantine_list(_t: &Tree, _root: u32, _a: &Value, limit: usize) -> Result<Value, String> {
+    let mut entries = crate::quarantine::scan();
+    let total: u64 = entries.iter().map(|e| e.bytes).sum();
+    entries.truncate(limit);
+    Ok(json!({
+        "kind": "quarantine",
+        "count": entries.len(),
+        "total_bytes": total,
+        "root": crate::quarantine::root().to_string_lossy(),
+        "entries": entries.iter().map(|e| e.to_json()).collect::<Vec<_>>(),
+        "notes": ["Restaurar y borrar se hacen desde la app (Opciones → Abrir cuarentena). El MCP es sólo lectura."],
+    }))
+}
+
+/// Velocidad real del disco y/o de Google Drive, con ETA para una tarea.
+pub fn speed_test(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
+    use crate::throughput::{self, DiskClass, GoogleMode};
+    let path = t.full_path(root);
+    let p = Path::new(&path);
+    let deep = is_deep(a);
+    let task_bytes = a.get("bytes").and_then(Value::as_u64).unwrap_or(1_000_000_000);
+    let files = a.get("files").and_then(Value::as_u64).unwrap_or(1);
+    let want_write = deep && a.get("write").and_then(Value::as_bool).unwrap_or(false);
+    let google = throughput::google_mode(p);
+    let class = throughput::class_of(p);
+    let (read_fallback, write_fallback) = class.fallback_mbps();
+
+    let mut notes: Vec<String> = Vec::new();
+    let mut read = None;
+    let mut download = None;
+    if google == Some(GoogleMode::Stream) {
+        if deep {
+            if let Some(id) = throughput::first_cloud_file(t, root, 8 * 1024 * 1024) {
+                let f = t.full_path(id);
+                match throughput::bench_read(Path::new(&f), 32 * 1024 * 1024) {
+                    Ok(b) => {
+                        notes.push(format!("La descarga real se midió leyendo {f}; ese archivo quedó hidratado (local)."));
+                        download = Some(b);
+                    }
+                    Err(e) => notes.push(format!("No se pudo medir la descarga: {e}")),
+                }
+            } else {
+                notes.push("No se encontró un placeholder de nube ≥ 8 MB para medir la descarga.".into());
+            }
+        } else {
+            notes.push("Modo rápido: no descarga nada; usa la velocidad típica de red. Pedí profundo para medir la descarga real.".into());
+        }
+    } else if deep {
+        if let Some(id) = throughput::sample_file(t, root, 4 * 1024 * 1024) {
+            let f = t.full_path(id);
+            match throughput::bench_read(Path::new(&f), 16 * 1024 * 1024) {
+                Ok(b) => read = Some(b),
+                Err(e) => notes.push(format!("No se pudo medir la lectura: {e}")),
+            }
+        }
+    }
+
+    let write = if want_write && google != Some(GoogleMode::Stream) {
+        match throughput::bench_write(p, 16 * 1024 * 1024) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                notes.push(format!("No se pudo medir la escritura en {path}: {e}"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // La clasificación local/nube sólo tiene sentido en una unidad de Google Drive.
+    let cloud = if google.is_some() {
+        throughput::cloud_breakdown(t, root, if deep { 5_000 } else { 1_000 }, if deep { 20_000 } else { 5_000 })
+    } else {
+        Default::default()
+    };
+    let source_mbps = download.as_ref().or(read.as_ref()).map(|b| b.mbps).unwrap_or_else(|| {
+        if google == Some(GoogleMode::Stream) { 30.0 } else { read_fallback }
+    });
+    let target_mbps = write.as_ref().map(|b| b.mbps).unwrap_or(write_fallback);
+    let eta = throughput::estimate(task_bytes, files, source_mbps, target_mbps, 2);
+    let cloud_fraction = if cloud.bytes > 0 { cloud.cloud_bytes as f64 / cloud.bytes as f64 } else { 0.0 };
+    let eta_cloud = throughput::estimate((task_bytes as f64 * cloud_fraction) as u64, files, source_mbps, target_mbps, 2);
+
+    let mut v = json!({
+        "kind": "speed",
+        "mode": mode_name(deep),
+        "path": path,
+        "disk_class": class.as_str(),
+        "disk_class_label": class.label().0,
+        "read_fallback_mbps": (read_fallback * 10.0).round() / 10.0,
+        "write_fallback_mbps": (write_fallback * 10.0).round() / 10.0,
+        "read": read.as_ref().map(|b| json!({ "mbps": (b.mbps * 10.0).round() / 10.0, "bytes": b.bytes, "ms": b.ms, "file": b.path })),
+        "write": write.as_ref().map(|b| json!({ "mbps": (b.mbps * 10.0).round() / 10.0, "bytes": b.bytes, "ms": b.ms })),
+        "download": download.as_ref().map(|b| json!({ "mbps": (b.mbps * 10.0).round() / 10.0, "bytes": b.bytes, "ms": b.ms, "file": b.path })),
+        "google_drive": google.map(|g| g.as_str()),
+        "cloud": if google.is_some() { cloud.to_json() } else { serde_json::Value::Null },
+        "eta": eta.to_json(task_bytes, files),
+        "eta_cloud_only": if google.is_some() { eta_cloud.to_json((task_bytes as f64 * cloud_fraction) as u64, files) } else { serde_json::Value::Null },
+        "notes": notes,
+    });
+    if let Some(g) = google {
+        v["google_note"] = json!(match g {
+            GoogleMode::Stream => "Streaming: los archivos viven en la nube hasta que se abren; las carpetas fijadas ya están locales.",
+            GoogleMode::Clone => "Clone: los archivos ya están en el disco local; no hay descarga de Google.",
+        });
+    }
+    let _ = DiskClass::Unknown;
+    Ok(v)
+}
+
+/// Addons externos para Google Photos/OCR (sólo detección e instrucciones).
+pub fn addons(_t: &Tree, _root: u32, _a: &Value) -> Result<Value, String> {
+    Ok(crate::addons::to_json())
 }

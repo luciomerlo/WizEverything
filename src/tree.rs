@@ -304,6 +304,16 @@ impl Builder {
 }
 
 pub fn load(progress: Arc<Progress>, excluded: &[String]) -> Result<Tree, String> {
+    load_with_offline(progress, excluded, &[])
+}
+
+/// Igual que [`load`], pero suma unidades guardadas (discos desconectados)
+/// como si fueran unidades más, con su etiqueta y fecha de actualización.
+pub fn load_with_offline(
+    progress: Arc<Progress>,
+    excluded: &[String],
+    offline: &[crate::volumes::OfflineDrive],
+) -> Result<Tree, String> {
     let start = Instant::now();
     let stamp = local_stamp();
     let mut b = Builder::new();
@@ -326,7 +336,29 @@ pub fn load(progress: Arc<Progress>, excluded: &[String]) -> Result<Tree, String
             progress.total.store(total, Ordering::Relaxed);
         },
     )?;
-    Ok(b.finish(excluded, start, stamp))
+    // Unidades guardadas: cada una cuelga de la raíz con su propio nombre.
+    let mut offline_labels: Vec<(u32, String)> = Vec::new();
+    for d in offline {
+        let id = b.dir(&d.name);
+        offline_labels.push((id, d.label.clone()));
+        for e in &d.entries {
+            let (parent, name) = match e.rel.rsplit_once('\\') {
+                Some((p, n)) => (p, n),
+                None => ("", e.rel.as_str()),
+            };
+            let parent_full = if parent.is_empty() {
+                d.name.clone()
+            } else {
+                format!("{}\\{}", d.name, parent)
+            };
+            b.add(e.is_dir, &parent_full, name, if e.is_dir { None } else { Some(e.size) }, e.modified.max(0) as u64);
+        }
+    }
+    let mut tree = b.finish(excluded, start, stamp);
+    for (id, label) in offline_labels {
+        tree.labels.insert(id, label);
+    }
+    Ok(tree)
 }
 
 impl Builder {
