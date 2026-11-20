@@ -160,7 +160,9 @@ fn main() -> eframe::Result {
     }
     if std::env::args().any(|a| a == "--mcp") {
         // MCP server on stdio for AI assistants; runs alongside the desktop app.
+        let settings = i18n::Settings::load();
         i18n::set_lang(i18n::Lang::En);
+        everything::set_engine(settings.engine);
         mcp::serve();
         return Ok(());
     }
@@ -170,6 +172,7 @@ fn main() -> eframe::Result {
         let question = args.get(i + 1).cloned().unwrap_or_default();
         let settings = i18n::Settings::load();
         i18n::set_lang(settings.lang);
+        everything::set_engine(settings.engine);
         let Some(key) = ai::unprotect(&settings.groq_key_enc) else {
             println!("No Groq key saved (Options → Enter Groq key).");
             return Ok(());

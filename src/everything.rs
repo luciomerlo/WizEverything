@@ -10,9 +10,11 @@ use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use crate::i18n::tr;
+use crate::i18n::{IndexEngine, tr};
 
 const IPC_CLASS: &str = "EVERYTHING_TASKBAR_NOTIFICATION";
+/// Clase propia del demonio de Census (`census serve`).
+const CENSUS_CLASS: &str = "CENSUS_IPC";
 const COPYDATA_QUERY2W: usize = 18;
 const IPC_IS_DB_LOADED: usize = 401;
 
@@ -52,18 +54,89 @@ pub enum Status {
     Ready,
 }
 
-fn everything_hwnd() -> HWND {
-    let class = wide(IPC_CLASS);
-    unsafe { FindWindowW(class.as_ptr(), null_mut()) }
+/// Motor elegido en Opciones; se aplica sin reiniciar.
+static ENGINE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+pub fn set_engine(e: IndexEngine) {
+    let v = match e {
+        IndexEngine::Auto => 0,
+        IndexEngine::Everything => 1,
+        IndexEngine::Census => 2,
+    };
+    ENGINE.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn engine() -> IndexEngine {
+    match ENGINE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => IndexEngine::Everything,
+        2 => IndexEngine::Census,
+        _ => IndexEngine::Auto,
+    }
+}
+
+fn hwnd_for(class: &str) -> Option<HWND> {
+    let c = wide(class);
+    let h = unsafe { FindWindowW(c.as_ptr(), null_mut()) };
+    if h.is_null() { None } else { Some(h) }
+}
+
+fn loaded(h: HWND) -> bool {
+    unsafe { SendMessageW(h, WM_USER, IPC_IS_DB_LOADED, 0) != 0 }
+}
+
+/// Ventana del motor activo. En Auto: Everything listo primero; si no,
+/// Census listo; si ninguno está listo, cualquiera que exista para informar
+/// "cargando".
+fn target() -> Option<(HWND, &'static str)> {
+    match engine() {
+        IndexEngine::Everything => hwnd_for(IPC_CLASS).map(|h| (h, "Everything")),
+        IndexEngine::Census => hwnd_for(CENSUS_CLASS).map(|h| (h, "Census")),
+        IndexEngine::Auto => {
+            let ev = hwnd_for(IPC_CLASS);
+            let ce = hwnd_for(CENSUS_CLASS);
+            if ev.is_some_and(loaded) {
+                ev.map(|h| (h, "Everything"))
+            } else if ce.is_some_and(loaded) {
+                ce.map(|h| (h, "Census"))
+            } else {
+                ev.map(|h| (h, "Everything")).or(ce.map(|h| (h, "Census")))
+            }
+        }
+    }
 }
 
 pub fn status() -> Status {
-    let hwnd = everything_hwnd();
-    if hwnd.is_null() {
-        return Status::NotRunning;
+    let Some((hwnd, _)) = target() else { return Status::NotRunning };
+    if loaded(hwnd) { Status::Ready } else { Status::Loading }
+}
+
+/// Nombre del motor que está respondiendo, para la UI.
+pub fn active_engine() -> &'static str {
+    target().map(|(_, n)| n).unwrap_or("—")
+}
+
+pub fn engine_label() -> &'static str {
+    match engine() {
+        IndexEngine::Auto => "Auto",
+        IndexEngine::Everything => "Everything",
+        IndexEngine::Census => "Census",
     }
-    let loaded = unsafe { SendMessageW(hwnd, WM_USER, IPC_IS_DB_LOADED, 0) };
-    if loaded != 0 { Status::Ready } else { Status::Loading }
+}
+
+fn missing_msg() -> String {
+    match engine() {
+        IndexEngine::Everything => tr("Everything no está en ejecución", "Everything is not running").into(),
+        IndexEngine::Census => tr(
+            "Census no está en ejecución (ejecutá `census serve` como administrador)",
+            "Census is not running (run `census serve` as administrator)",
+        )
+        .into(),
+        IndexEngine::Auto => tr(
+            "No hay índice disponible: iniciá Everything o `census serve`",
+            "No index available: start Everything or `census serve`",
+        )
+        .into(),
+    }
 }
 
 thread_local! {
@@ -131,10 +204,9 @@ impl Drop for ReplyWindow {
 }
 
 fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32, request: u32) -> Result<Vec<u8>, String> {
-    let target = everything_hwnd();
-    if target.is_null() {
-        return Err(tr("Everything no está en ejecución", "Everything is not running").into());
-    }
+    let Some((target, _)) = target() else {
+        return Err(missing_msg());
+    };
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     for v in [reply.0 as usize as u32, REPLY_ID, 0, offset, max, request, SORT_NAME_ASCENDING] {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -150,7 +222,7 @@ fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32, request:
     REPLY.with(|r| *r.borrow_mut() = None);
     let ok = unsafe { SendMessageW(target, WM_COPYDATA, reply.0 as usize, &cds as *const _ as isize) };
     if ok == 0 {
-        return Err(tr("Everything rechazó la consulta IPC", "Everything rejected the IPC query").into());
+        return Err(tr("El motor de índice rechazó la consulta IPC", "The index engine rejected the IPC query").into());
     }
     let start = Instant::now();
     loop {
@@ -165,7 +237,7 @@ fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32, request:
             }
         }
         if start.elapsed() > Duration::from_secs(120) {
-            return Err(tr("Tiempo de espera agotado esperando a Everything", "Timed out waiting for Everything").into());
+            return Err(tr("Tiempo de espera agotado esperando al motor de índice", "Timed out waiting for the index engine").into());
         }
         std::thread::sleep(Duration::from_millis(2));
     }

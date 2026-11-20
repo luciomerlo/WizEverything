@@ -280,7 +280,10 @@ mod tests {
     use super::*;
 
     fn temp_db() -> PathBuf {
-        std::env::temp_dir().join(format!("wzshared-{}-{}.sqlite3", std::process::id(), now()))
+        // `now()` tiene resolución de segundos y los tests corren en paralelo:
+        // sin nanosegundos ambos podían compartir el mismo archivo.
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        std::env::temp_dir().join(format!("wzshared-{}-{nanos}.sqlite3", std::process::id()))
     }
 
     #[test]

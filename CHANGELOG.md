@@ -3,6 +3,28 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.17.0] - 2026-11-20
+
+### Added
+- **Census como motor de índice alternativo a Everything.** En Opciones → Motor de índice se elige
+  **Auto / Everything / Census**. WizEverything habla el mismo IPC `QUERY2W` (`WM_COPYDATA`) y detecta
+  la clase `CENSUS_IPC`; no hace falta DLL ni una integración distinta. Auto prefiere Everything si
+  está listo y cae a Census cuando no. También aplica al servidor MCP y a `--ask`.
+  Census se inicia con `census serve` (requiere elevación para leer la MFT); la app no lo lanza sola.
+- **Tema oscuro legible**: texto casi blanco, texto secundario más claro, paneles más separados y
+  bordes/acentos de mayor contraste. Aplica a Oscuro y a Sistema cuando detecta oscuro.
+- **FTS5 en el índice de contenido compartido** y limpieza de entradas de archivos que ya no existen.
+
+### Changed
+- `refresh` del MCP devuelve qué motor respondió (`engine`).
+- El tiempo de espera inicial del índice es de 45 s con un error claro, en vez de esperar para siempre.
+
+## [0.16.0] - 2026-11-20
+
+### Added
+- Formatos de documento, presentación y planilla además de PDF/texto, y el índice compartido con
+  SortEverything (ver 0.15.0 para el detalle de contenido).
+
 ## [0.15.0] - 2026-11-20
 
 ### Added

@@ -44,9 +44,20 @@ pub enum Theme {
     Contrast,
 }
 
+/// De dónde sale el índice de archivos.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndexEngine {
+    /// Everything si está listo; si no, Census.
+    Auto,
+    Everything,
+    Census,
+}
+
 pub struct Settings {
     pub lang: Lang,
     pub theme: Theme,
+    /// Motor del índice: Everything, Census o detección automática.
+    pub engine: IndexEngine,
     pub show_treemap: bool,
     pub show_exts: bool,
     /// Chart type: Baobab-style rings instead of the treemap.
@@ -81,6 +92,7 @@ impl Settings {
         let mut s = Settings {
             lang: default_lang,
             theme: Theme::System,
+            engine: IndexEngine::Auto,
             show_treemap: true,
             show_exts: true,
             rings: false,
@@ -100,6 +112,9 @@ impl Settings {
                 ("theme", "dark") => s.theme = Theme::Dark,
                 ("theme", "contrast") => s.theme = Theme::Contrast,
                 ("theme", "system") => s.theme = Theme::System,
+                ("engine", "auto") => s.engine = IndexEngine::Auto,
+                ("engine", "everything") => s.engine = IndexEngine::Everything,
+                ("engine", "census") => s.engine = IndexEngine::Census,
                 ("show_treemap", v) => s.show_treemap = v != "0",
                 ("show_exts", v) => s.show_exts = v != "0",
                 ("close_to_tray", v) => s.close_to_tray = v != "0",
@@ -120,13 +135,18 @@ impl Settings {
 
     pub fn to_text(&self) -> String {
         format!(
-            "lang={}\ntheme={}\nshow_treemap={}\nshow_exts={}\nchart={}\nclose_to_tray={}\nexcluded_drives={}\n",
+            "lang={}\ntheme={}\nengine={}\nshow_treemap={}\nshow_exts={}\nchart={}\nclose_to_tray={}\nexcluded_drives={}\n",
             if self.lang == Lang::Es { "es" } else { "en" },
             match self.theme {
                 Theme::System => "system",
                 Theme::Light => "light",
                 Theme::Dark => "dark",
                 Theme::Contrast => "contrast",
+            },
+            match self.engine {
+                IndexEngine::Auto => "auto",
+                IndexEngine::Everything => "everything",
+                IndexEngine::Census => "census",
             },
             self.show_treemap as u8,
             self.show_exts as u8,
@@ -165,6 +185,7 @@ mod tests {
         assert!(s.show_treemap && s.show_exts && s.close_to_tray && !s.rings);
         s.lang = Lang::En;
         s.theme = Theme::Dark;
+        s.engine = IndexEngine::Census;
         s.rings = true;
         s.show_exts = false;
         s.close_to_tray = false;
@@ -172,6 +193,7 @@ mod tests {
         let back = Settings::parse(&s.to_text(), Lang::Es);
         assert_eq!(back.lang, Lang::En);
         assert_eq!(back.theme, Theme::Dark);
+        assert_eq!(back.engine, IndexEngine::Census);
         assert!(back.rings && !back.show_exts && !back.close_to_tray && back.show_treemap);
         assert_eq!(back.excluded_drives, vec!["H:", "X:"]);
     }

@@ -41,7 +41,7 @@ impl Server {
                 "protocolVersion": msg.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "wizeverything", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Mostly read-only. Disk usage, file types, duplicates and storage-analysis reports from the Everything index on this Windows PC. Only snapshot_save and catalog_save write, and only into %LOCALAPPDATA%\\WizEverything. It never deletes or changes your files. Sizes are in bytes. Paths look like C:\\Users\\name."
+                "instructions": "Mostly read-only. Disk usage, file types, duplicates and storage-analysis reports from the Everything or Census index on this Windows PC. Only snapshot_save and catalog_save write, and only into %LOCALAPPDATA%\\WizEverything. It never deletes or changes your files. Sizes are in bytes. Paths look like C:\\Users\\name."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -66,7 +66,11 @@ impl Server {
         if name == "refresh" {
             self.tree = None;
             let t = self.tree()?;
-            return Ok(json!({ "items": t.nodes.len() - 1, "load_ms": t.load_ms }));
+            return Ok(json!({
+                "items": t.nodes.len() - 1,
+                "load_ms": t.load_ms,
+                "engine": crate::everything::active_engine(),
+            }));
         }
         // Estos dos no exigen que la ruta exista en el índice (puede ser de un
         // disco guardado que ya no está conectado).

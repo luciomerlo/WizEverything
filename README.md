@@ -2,8 +2,8 @@
 
 A **WizTree-style disk space visualizer and duplicate finder** for Windows that never scans
 your disk. It reads the file index that **[Everything](https://www.voidtools.com/)** (voidtools)
-already keeps in memory, so a full view of ~2 million files is ready in a few seconds,
-without administrator rights.
+or **Census** already keeps in memory, so a full view of ~2 million files is ready in a few seconds,
+without administrator rights (Census itself needs elevation to read the MFT).
 
 Written in Rust with [egui](https://github.com/emilk/egui).
 
@@ -13,15 +13,16 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 >
 > It is meant to **complement Everything**: Everything keeps the index and does the searching;
 > WizEverything reads that in-memory index (via IPC) and adds disk-usage visualization, duplicate
-> analysis and storage forensics on top. Everything 1.4 or later must be running with file sizes indexed.
+> analysis and storage forensics on top. It can use Everything 1.4+ (with file sizes indexed) or
+> **Census** (`census serve`) as the index engine.
 >
 > If you prefer a smaller, self-contained tool, use **Census**, a reduced version of this approach
 > (less surface area, same idea of looking at what already exists instead of walking the disk again).
 >
 > *En español: WizEverything es un homenaje independiente a Everything de voidtools, sin relación
-> oficial con sus autores. Está pensado para complementarlo, no para reemplazarlo: Everything mantiene
-> el índice y busca; WizEverything lo lee y agrega visualización y análisis. Si querés algo más
-> chico, usá **Census**, una versión reducida.*
+> oficial con sus autores. Está pensado para complementarlo, no para reemplazarlo: el motor mantiene
+> el índice y busca; WizEverything lo lee y agrega visualización y análisis. Podés usar Everything o
+> **Census** (`census serve`) como motor. Si querés algo más chico, usá **Census**, la versión reducida.*
 
 ## Features
 
@@ -38,7 +39,10 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 - **Sortable columns** everywhere: click to sort, click again to reverse, a third click clears the sort.
 - **Right-click menu**: open, open/show in Explorer, copy full path, copy name, zoom, real size.
 - **Export to CSV** (current view, folders and files).
-- **Live updates**: changed files are synced from Everything every 30 s (deletions show on refresh / every 30 min).
+- **Index engine selector**: **Auto / Everything / Census** (Opciones → Motor de índice). Auto uses
+  Everything when ready and falls back to Census. Census speaks the same `QUERY2W` IPC, so no DLL or
+  extra integration is needed; start it with `census serve` (elevated).
+- **Live updates**: changed files are synced from the active index every 30 s (deletions show on refresh / every 30 min).
 
 ### Duplicates
 - **Quick mode**: name + size straight from the index, reads no file (safe with streamed Google Drive); results marked as unverified.
@@ -60,7 +64,7 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 
 ## Advanced storage analysis (in the app and via MCP)
 
-A suite of analyzers that lean entirely on Everything's in-memory index (no directory walking)
+A suite of analyzers that lean entirely on the in-memory index (Everything or Census; no directory walking)
 and on Win32 metadata, minimizing physical disk I/O. Every engine is implemented, unit-tested and
 exposed both in the desktop app and through the MCP server.
 
@@ -172,14 +176,19 @@ Claude Desktop (`claude_desktop_config.json`):
 ## How it works
 
 Everything exposes its index through a documented IPC protocol (`WM_COPYDATA`, the SDK's `QUERY2` request).
-WizEverything implements it directly (no `Everything64.dll`), fetching pages of 250k items on one thread while
-another builds a compact tree (~56 bytes per node; names in one buffer, children in one flat array).
+Census implements the same query layout under its own `CENSUS_IPC` window class, so WizEverything uses one
+client for both engines. It implements the protocol directly (no `Everything64.dll`), fetching pages of 250k
+items on one thread while another builds a compact tree (~56 bytes per node; names in one buffer, children in one flat array).
 Charts are rasterized on the CPU in parallel bands.
 
 ## Requirements
 
 - Windows 10/11
-- [Everything](https://www.voidtools.com/) 1.4 or later, running, with file sizes indexed (the default).
+- One index engine:
+  - [Everything](https://www.voidtools.com/) 1.4 or later, running, with file sizes indexed (the default), or
+  - **Census**, running as `census serve` (elevated; it reads the NTFS MFT). Select it in
+    Opciones → Motor de índice, or leave **Auto**. Census serves one volume at a time; use
+    Everything if you need all drives in a single view.
 
 ## Building
 
@@ -199,14 +208,14 @@ cargo test --release --bin wizeverything -- --include-ignored   # + live tests a
 
 ## Settings
 
-`%APPDATA%\WizEverything\settings.ini` (language, theme, panels, chart, close to tray, excluded drives).
+`%APPDATA%\WizEverything\settings.ini` (language, theme, index engine, panels, chart, close to tray, excluded drives).
 "Start with Windows" writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\WizEverything`.
 
 ## Limitations
 
 - **Allocated** is an estimate (cluster-rounded) until the real size is computed for a folder.
 - Hard links are counted once per path in sizes.
-- Only what Everything indexes is shown.
+- Only what the active engine (Everything or Census) indexes is shown.
 
 ## License
 

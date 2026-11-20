@@ -9,7 +9,7 @@ use eframe::egui::{self, Align, Color32, Key, Layout as ELayout, RichText, Sense
 use egui_extras::{Column, TableBuilder};
 
 use crate::dup::{self, DupGroup, DupOptions, DupProgress};
-use crate::i18n::{self, Lang, Settings, Theme, tr};
+use crate::i18n::{self, IndexEngine, Lang, Settings, Theme, tr};
 use crate::tree::{self, Change, Progress, ROOT, Tree};
 use crate::treemap::{self, Layout};
 use crate::sunburst;
@@ -527,6 +527,8 @@ pub struct App {
     error_at: Instant,
     /// Drive free-space cache: (drive, when, (total, free)).
     disk_cache: Option<(u32, Instant, Option<(u64, u64)>)>,
+    /// Cambió el motor mientras cargaba: recargar al terminar.
+    reload_pending: bool,
 
     // incremental sync
     sync_rx: Option<Receiver<(u64, String, Result<Vec<Change>, String>)>>,
@@ -644,6 +646,7 @@ impl App {
             settings.save();
         }
         i18n::set_lang(settings.lang);
+        crate::everything::set_engine(settings.engine);
         apply_theme(ctx, settings.theme);
         let mut style = (*ctx.global_style()).clone();
         style.spacing.item_spacing = egui::vec2(6.0, 3.0);
@@ -662,6 +665,7 @@ impl App {
             info: None,
             error_at: Instant::now(),
             disk_cache: None,
+            reload_pending: false,
             sync_rx: None,
             pending_changes: None,
             sync_stamp: String::new(),
@@ -793,8 +797,17 @@ impl App {
         std::thread::Builder::new()
             .name("everything-load".into())
             .spawn(move || {
-                // At Windows logon Everything may not be ready yet.
+                // Al iniciar Windows el motor puede tardar; no esperar para siempre.
+                let wait_from = Instant::now();
                 while !matches!(everything::status(), everything::Status::Ready) {
+                    if wait_from.elapsed() > Duration::from_secs(45) {
+                        let _ = tx.send(Err(format!(
+                            "No se pudo cargar el índice ({}). Iniciá Everything o `census serve` y reintentá con F5.",
+                            everything::engine_label()
+                        )));
+                        ctx.request_repaint();
+                        return;
+                    }
                     p.waiting.store(true, Ordering::Relaxed);
                     ctx.request_repaint();
                     std::thread::sleep(Duration::from_secs(1));
@@ -1273,6 +1286,10 @@ impl eframe::App for App {
         self.sync_title_bar(ctx, frame);
         self.handle_tray(ctx);
         self.poll_load();
+        if self.reload_pending && self.loading.is_none() {
+            self.reload_pending = false;
+            self.start_load(ctx);
+        }
         self.poll_jobs(ctx);
         self.maybe_sync(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -1657,6 +1674,52 @@ impl App {
                 self.settings.theme = theme;
                 apply_theme(ctx, theme);
                 self.settings.save();
+            }
+            ui.add_space(4.0);
+            // Motor del índice
+            ui.label(RichText::new(tr("Motor de índice", "Index engine")).strong());
+            let mut engine = self.settings.engine;
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut engine, IndexEngine::Auto, tr("Auto", "Auto"))
+                    .on_hover_text(tr(
+                        "Usa Everything si está listo; si no, Census.",
+                        "Uses Everything when ready; otherwise Census.",
+                    ));
+                ui.selectable_value(&mut engine, IndexEngine::Everything, "Everything");
+                ui.selectable_value(&mut engine, IndexEngine::Census, "Census")
+                    .on_hover_text(tr(
+                        "Requiere `census serve` en ejecución (como administrador). Census indexa un volumen por vez.",
+                        "Requires `census serve` running (as administrator). Census indexes one volume at a time.",
+                    ));
+            });
+            ui.label(
+                RichText::new(format!(
+                    "{}: {}",
+                    tr("Activo", "Active"),
+                    crate::everything::active_engine()
+                ))
+                .weak(),
+            );
+            if engine == IndexEngine::Census
+                && matches!(crate::everything::status(), crate::everything::Status::NotRunning)
+            {
+                ui.label(
+                    RichText::new(tr(
+                        "Ejecutá `census serve` como administrador para que Census aparezca.",
+                        "Run `census serve` as administrator so Census shows up.",
+                    ))
+                    .weak(),
+                );
+            }
+            if engine != self.settings.engine {
+                self.settings.engine = engine;
+                crate::everything::set_engine(engine);
+                self.settings.save();
+                if self.loading.is_some() {
+                    self.reload_pending = true;
+                } else {
+                    self.start_load(ctx);
+                }
             }
             ui.separator();
             // Behaviour
