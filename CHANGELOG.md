@@ -3,6 +3,24 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- Advanced storage-analysis engines (branch `spec/7modules`), all backed by Everything's index and Win32 metadata,
+  with unit tests. The in-app panels that drive them are still being wired up.
+  - **Deduplication**: 3-stage exact match (size → NTFS file id → partial BLAKE3 of 3 blocks → full BLAKE3) and atomic
+    same-volume hardlink merging that keeps every path; dry-run plans by default.
+  - **Cloud/sparse audit**: logical vs physical size, sparse/offline/reparse-point classification, and
+    junction/symlink resolution via `FSCTL_GET_REPARSE_POINT`.
+  - **Dev-artifact sweeper**: detects `node_modules`, `.venv`, `target`, `__pycache__`, `.gradle`, `.next`, `.terraform`, …
+    and flags abandoned projects with an inactivity heuristic.
+  - **Snapshot delta diff**: compact binary snapshots and an O(N) diff (added/removed/grown/shrunk, net bytes per folder).
+  - **Cold data + WOF LZX**: cold score from dates and run count, plus transparent `FSCTL_SET_EXTERNAL_BACKING` compression.
+  - **Magic-byte integrity validator**: zero-filled files, HTML error pages saved as binaries, and signature mismatches.
+  - **Portable offline catalogs (`.ecat`)**: a Zstd-compressed inventory of external volumes, cross-referenced against local files.
+  - Extended Everything adapter (`DATE_ACCESSED`, `ATTRIBUTES`, `RUN_COUNT`) with a unit-tested reply parser.
+  - Transactional executor: dry-run by default, JSONL audit log before any mutation.
+
 ## [0.7.0] - 2026-11-19
 
 ### Added

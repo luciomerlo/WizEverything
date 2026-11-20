@@ -42,6 +42,28 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 - Light / dark / system theme, English / Spanish UI (defaults to the Windows language).
 - System tray, single instance, **close to tray** option, **Start with Windows** (`--background`, index preloaded).
 
+## Advanced storage analysis (engines ready, in-app panels in progress)
+
+A suite of analyzers that lean entirely on Everything's in-memory index (no directory walking)
+and on Win32 metadata, minimizing physical disk I/O. The engines are implemented and unit-tested;
+the in-app panels that drive them are being wired up.
+
+- **Deduplication & hardlinks** — 3-stage exact match (size → NTFS file id → partial BLAKE3 of 3 blocks → full
+  BLAKE3), plus atomic same-volume hardlink merging that keeps every path. Plans are dry-run by default.
+- **Cloud / sparse audit** — separates logical size from real on-disk allocation (`GetCompressedFileSizeW`),
+  flags sparse/offline/pinned placeholders, and resolves junctions and symlinks (`FSCTL_GET_REPARSE_POINT`).
+- **Dev-artifact sweeper** — spots `node_modules`, `.venv`, `target`, `__pycache__`, `.gradle`, `.next`, `.terraform`, …
+  and flags them when the surrounding project looks abandoned.
+- **Snapshot delta diff** — compact binary snapshots and an O(N) diff (added / removed / grown / shrunk, net bytes per folder).
+- **Cold data & WOF LZX** — a cold score from modified/accessed dates and run count, with transparent
+  WOF (LZX/XPRESS) compression of cold files that are not already compressed.
+- **Integrity check (magic bytes)** — reads the first 32 bytes to catch truncated or zero-filled files and
+  HTML error pages saved with binary extensions.
+- **Portable offline catalogs (`.ecat`)** — a Zstd-compressed inventory of external/offline volumes,
+  cross-referenced against local files.
+
+Every mutating operation runs as a dry-run first and writes a JSONL audit log before touching the disk.
+
 ## Use it from an AI (MCP server)
 
 `wizeverything.exe --mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio,
