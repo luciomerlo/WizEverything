@@ -13,6 +13,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     duration, splits live/remix versions, and ranks lossless over lossy.
   - Both are read-only and return per-group keep/candidates reasons plus reversible alternatives
     (quarantine, keep both edits, archive, hardlink when byte-identical).
+- GitHub mode (`github_mode` + Space analysis menu) for any chosen folder: up to date / local newer /
+  behind / diverged headline, plus commits, changed files, size and per-folder gaps. Read-only;
+  `git fetch` is optional.
 
 ## [0.10.0] - 2026-11-20
 

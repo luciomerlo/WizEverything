@@ -12,6 +12,7 @@ mod everything;
 #[cfg(windows)]
 mod everything_adapter;
 mod executor;
+mod github_mode;
 mod hashcache;
 #[cfg(windows)]
 mod hardlink;

@@ -428,3 +428,32 @@ pub fn similar_audio(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Val
     let max_files = a.get("max_files").and_then(Value::as_u64).unwrap_or(20_000).clamp(50, 200_000) as usize;
     Ok(crate::similar::scan_audio(files, max_files).to_json(limit))
 }
+
+/// "GitHub mode" for any chosen folder: local vs web state, commits, files and size.
+pub fn github_mode(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let path = t.full_path(root);
+    let start = Path::new(&path);
+    let repo = crate::github_mode::repo_root(start);
+    let sizes = repo.as_ref().and_then(|r| {
+        let p = r.to_string_lossy();
+        let node = t.find_path(p.as_ref())?;
+        let n = &t.nodes[node as usize];
+        Some(crate::github_mode::TreeSizes {
+            logical: n.size,
+            alloc: n.alloc,
+            children: t
+                .children(node)
+                .iter()
+                .filter(|&&c| t.nodes[c as usize].is_dir())
+                .map(|&c| (t.name(c).to_string(), t.nodes[c as usize].size, t.nodes[c as usize].alloc))
+                .collect(),
+        })
+    });
+    let fetch = a.get("fetch").and_then(Value::as_bool).unwrap_or(true);
+    Ok(crate::github_mode::inspect(
+        start,
+        sizes.as_ref(),
+        &crate::github_mode::Opts { fetch, limit },
+    ))
+}

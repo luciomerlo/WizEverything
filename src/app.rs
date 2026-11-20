@@ -1351,6 +1351,21 @@ impl App {
                     "max_entries": 20000
                 });
                 if ui
+                    .button(tr("Modo GitHub (carpeta actual)", "GitHub mode (current folder)"))
+                    .on_hover_text(tr(
+                        "Analiza la carpeta actual como repo: dice si está al día con la web, si el local es más nuevo (commits sin subir), o si está atrasado/divergido; y explica las diferencias por commits, archivos y tamaño.",
+                        "Treats the current folder as a repo: says whether it is up to date with the web, newer than it (unpushed commits), behind or diverged; then explains differences by commits, files and size.",
+                    ))
+                    .clicked()
+                {
+                    let res = crate::mcp_tools::github_mode(tree, root, &caps, 30);
+                    let title = match &res {
+                        Ok(v) => v.get("title_es").and_then(|x| x.as_str()).unwrap_or("Modo GitHub").to_string(),
+                        Err(_) => "Modo GitHub".to_string(),
+                    };
+                    self.analysis = Some((format!("GitHub · {title}"), fmt(res)));
+                }
+                if ui
                     .button(tr("Auditoría cloud / sparse", "Cloud / sparse audit"))
                     .on_hover_text(tr(
                         "Detecta archivos que no ocupan en disco lo que pesan (nube, sparse, comprimidos, junctions). Muestra tamaño lógico vs real y cuánto podrías liberar.",

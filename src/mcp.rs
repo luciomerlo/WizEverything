@@ -292,6 +292,7 @@ impl Server {
             "catalog_check" => crate::mcp_tools::catalog_check(&t, root, &a, limit),
             "similar_images" => crate::mcp_tools::similar_images(&t, root, &a, limit),
             "similar_audio" => crate::mcp_tools::similar_audio(&t, root, &a, limit),
+            "github_mode" => crate::mcp_tools::github_mode(&t, root, &a, limit),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -403,6 +404,9 @@ pub fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
             "max_files": { "type": "integer", "description": "Analyse at most this many audio files (default 20000)." } } } },
+        { "name": "github_mode", "description": "GitHub mode for any chosen folder: is the local copy up to date with the web, newer than it, behind or diverged? Then explains the differences by commits, changed files, size and top folders. Read-only; may run git fetch (fetch=false to stay offline).", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "fetch": { "type": "boolean", "description": "Query the remote with git fetch (default true)." } }, "required": ["path"] } },
         { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])
