@@ -21,10 +21,10 @@ use std::path::Path;
 
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_INFO,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
-    GetCompressedFileSizeW, GetFileInformationByHandle, GetFileInformationByHandleEx,
-    OPEN_EXISTING,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetCompressedFileSizeW,
+    GetFileInformationByHandle, GetFileInformationByHandleEx, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::IO::DeviceIoControl;
 use windows_sys::Win32::System::Ioctl::{
@@ -167,6 +167,51 @@ pub fn hard_link_count(path: &Path) -> io::Result<u32> {
         return Err(io::Error::last_os_error());
     }
     Ok(info.nNumberOfLinks)
+}
+
+const FSCTL_GET_REPARSE_POINT: u32 = 0x0009_00A8;
+const MAX_REPARSE_DATA: usize = 16 * 1024;
+
+/// Lee el buffer crudo `REPARSE_DATA_BUFFER` de un junction/symlink/placeholder.
+///
+/// Abre la ruta con `FILE_FLAG_OPEN_REPARSE_POINT` para leer el enlace mismo sin
+/// seguirlo. El resultado se decodifica con [`crate::reparse::parse_target`].
+pub fn read_reparse_point(path: &Path) -> io::Result<Vec<u8>> {
+    let w = wide(path);
+    let h = unsafe {
+        CreateFileW(
+            w.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if h == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let _guard = OwnedHandle(h);
+    let mut buf = vec![0u8; MAX_REPARSE_DATA];
+    let mut returned: u32 = 0;
+    let ok = unsafe {
+        DeviceIoControl(
+            h,
+            FSCTL_GET_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+            buf.as_mut_ptr() as *mut c_void,
+            buf.len() as u32,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    buf.truncate(returned as usize);
+    Ok(buf)
 }
 
 /// Atributos NTFS crudos de `path`.
@@ -349,5 +394,42 @@ mod tests {
         assert!(m.is_offline());
         assert!(m.is_thinner_than_logical());
         assert!(!m.is_reparse_point());
+    }
+
+    #[test]
+    fn reads_junction_reparse_point() {
+        let base = std::env::temp_dir();
+        let tag = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let target = base.join(format!("wize_jtarget_{tag}"));
+        let link = base.join(format!("wize_jlink_{tag}"));
+        if std::fs::create_dir(&target).is_err() {
+            return;
+        }
+        // Crear un junction (no requiere admin, a diferencia de un symlink).
+        let created = std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if created {
+            let buf = read_reparse_point(&link).unwrap();
+            let t = crate::reparse::parse_target(&buf).expect("el junction debe parsear");
+            assert_eq!(t.kind, crate::reparse::ReparseKind::MountPoint);
+            assert!(t.target.to_lowercase().contains("wize_jtarget_"));
+            assert!(t.kind.is_link());
+        }
+        let _ = std::fs::remove_dir(&link);
+        let _ = std::fs::remove_dir(&target);
     }
 }

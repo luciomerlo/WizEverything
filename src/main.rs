@@ -27,6 +27,8 @@ mod treemap;
 
 #[cfg(windows)]
 mod winphys;
+#[cfg(windows)]
+mod wof;
 #[cfg(test)]
 mod tests;
 
