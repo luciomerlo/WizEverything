@@ -7,6 +7,7 @@ mod dup;
 mod everything;
 mod hashcache;
 mod i18n;
+mod magic;
 mod mcp;
 mod tree;
 mod sunburst;
