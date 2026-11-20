@@ -667,6 +667,18 @@ impl App {
                     self.view_root = default_drive(&new);
                     self.expanded.insert(self.view_root);
                 }
+                // Debug hook for screenshots/tests: WIZE_HL=cat:<name>|<ext> opens highlighted.
+                if let Ok(v) = std::env::var("WIZE_HL") {
+                    let v = v.trim();
+                    self.highlight_ext = if let Some(c) = v.strip_prefix("cat:") {
+                        CATEGORIES
+                            .iter()
+                            .position(|(es, en, _)| es.eq_ignore_ascii_case(c) || en.eq_ignore_ascii_case(c))
+                            .map(|i| CAT_FLAG | i as u32)
+                    } else {
+                        new.find_ext(v.trim_start_matches('.'))
+                    };
+                }
                 self.tree = Some(new);
                 self.epoch += 1;
                 self.hovered = None;
@@ -2960,6 +2972,113 @@ impl App {
             let dark = Color32::from_gray(30);
             painter.text(c - egui::vec2(0.0, 8.0), egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(13.0), dark);
             painter.text(c + egui::vec2(0.0, 9.0), egui::Align2::CENTER_CENTER, fmt_size(size), egui::FontId::proportional(12.0), dark);
+        }
+
+        // Rings + extension highlight: rank the folders holding the most of that
+        // extension, in the free space to the right of the ring.
+        if self.settings.rings
+            && let Some(g) = layout.geom
+            && let Some((ce, _, hl)) = &self.highlight_cache
+            && self.highlight_ext == Some(*ce)
+        {
+            let bytes = &hl.bytes;
+            let root = layout.root;
+            let mut rows: Vec<(u32, u64)> = tree
+                .children(root)
+                .iter()
+                .filter(|&&c| tree.nodes[c as usize].is_dir())
+                .map(|&c| (c, bytes.get(c as usize).copied().unwrap_or(0)))
+                .filter(|(_, b)| *b > 0)
+                .collect();
+            rows.sort_by(|x, y| y.1.cmp(&x.1));
+            if !rows.is_empty() {
+                let total = bytes.get(root as usize).copied().unwrap_or(0).max(1);
+                let rmax = (layout.width.min(layout.height) as f32 / 2.0 - 6.0).max(10.0);
+                let cx = rect.min.x + g[0] * kx;
+                let rx = rmax * kx;
+                let right = rect.max.x - 8.0;
+                let free = right - (cx + rx + 10.0);
+                let mut left = right - free.clamp(0.0, 420.0);
+                let mut top = rect.min.y + 8.0;
+                if free < 140.0 {
+                    // Ring fills the width: fall back to the bottom-right corner.
+                    left = rect.max.x - 8.0 - 220.0;
+                    top = (rect.max.y - 8.0 - rect.height() * 0.6).max(rect.min.y + 8.0);
+                }
+                let pr = egui::Rect::from_min_max(
+                    egui::pos2(left.max(rect.min.x + 8.0), top),
+                    egui::pos2(right, rect.max.y - 8.0),
+                );
+                let row_h = 15.0;
+                let max_rows = ((pr.height() - 44.0) / row_h).floor().max(0.0) as usize;
+                if max_rows > 0 {
+                    let dark_ui = ui.visuals().dark_mode;
+                    let bg = if dark_ui {
+                        Color32::from_rgba_unmultiplied(16, 18, 22, 220)
+                    } else {
+                        Color32::from_rgba_unmultiplied(252, 252, 254, 230)
+                    };
+                    let fg = ui.visuals().text_color();
+                    let dim = ui.visuals().weak_text_color();
+                    let accent = ui.visuals().selection.bg_fill;
+                    painter.rect_filled(pr, 5.0, bg);
+                    painter.rect_stroke(pr, 5.0, Stroke::new(1.0, dim.gamma_multiply(0.35)), egui::StrokeKind::Inside);
+                    let mk = |s: String, color: Color32, max_w: f32, sz: f32| {
+                        let mut j = egui::text::LayoutJob::single_section(
+                            s,
+                            egui::TextFormat::simple(egui::FontId::proportional(sz), color),
+                        );
+                        j.wrap = egui::text::TextWrapping {
+                            max_width: max_w.max(1.0),
+                            max_rows: 1,
+                            break_anywhere: true,
+                            overflow_character: Some('…'),
+                        };
+                        j
+                    };
+                    let label = if *ce & CAT_FLAG != 0 {
+                        category_name((*ce & !CAT_FLAG) as usize).to_string()
+                    } else if tree.exts.get(*ce as usize).is_some_and(|x| x.name.is_empty()) {
+                        tree.ext_label(*ce).to_string()
+                    } else {
+                        format!(".{}", tree.ext_label(*ce))
+                    };
+                    let mut y = pr.min.y + 6.0;
+                    let title = format!("{} · {}", tr("Carpetas", "Folders"), label);
+                    let gt = painter.layout_job(mk(title, fg, pr.width() - 16.0, 12.5));
+                    painter.galley(egui::pos2(pr.min.x + 8.0, y), gt, fg);
+                    y += 17.0;
+                    let sub = format!("{} · {} {}", fmt_size(total), rows.len(), tr("carpetas", "folders"));
+                    let gs = painter.layout_job(mk(sub, dim, pr.width() - 16.0, 10.5));
+                    painter.galley(egui::pos2(pr.min.x + 8.0, y), gs, dim);
+                    y += 15.0;
+                    painter.line_segment(
+                        [egui::pos2(pr.min.x + 8.0, y), egui::pos2(pr.max.x - 8.0, y)],
+                        Stroke::new(1.0, dim.gamma_multiply(0.35)),
+                    );
+                    y += 5.0;
+                    for (id, b) in rows.iter().take(max_rows) {
+                        let frac = (*b as f64 / total as f64).clamp(0.0, 1.0) as f32;
+                        let bw = (pr.width() - 16.0) * frac;
+                        painter.rect_filled(
+                            egui::Rect::from_min_size(egui::pos2(pr.min.x + 8.0, y + 12.0), egui::vec2(bw.max(1.0), 2.0)),
+                            1.0,
+                            Color32::from_rgba_unmultiplied(accent.r(), accent.g(), accent.b(), 90),
+                        );
+                        let g1 = painter.layout_job(mk(tree.name(*id).to_string(), fg, pr.width() - 98.0, 11.5));
+                        painter.galley(egui::pos2(pr.min.x + 8.0, y), g1, fg);
+                        let pct = *b as f64 * 100.0 / total as f64;
+                        let rtxt = if pct > 0.0 && pct < 1.0 {
+                            format!("{} · <1%", fmt_size(*b))
+                        } else {
+                            format!("{} · {:.0}%", fmt_size(*b), pct)
+                        };
+                        let g2 = painter.layout_job(mk(rtxt, dim, 90.0, 11.0));
+                        painter.galley(egui::pos2(pr.max.x - 8.0 - g2.size().x, y + 1.0), g2, dim);
+                        y += row_h;
+                    }
+                }
+            }
         }
 
         self.hovered = None;
