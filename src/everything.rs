@@ -20,6 +20,9 @@ const REQ_NAME: u32 = 0x0000_0001;
 const REQ_PATH: u32 = 0x0000_0002;
 const REQ_SIZE: u32 = 0x0000_0010;
 const REQ_DATE_MODIFIED: u32 = 0x0000_0040;
+const REQ_DATE_ACCESSED: u32 = 0x0000_0080;
+const REQ_ATTRIBUTES: u32 = 0x0000_0100;
+const REQ_RUN_COUNT: u32 = 0x0000_0400;
 
 const ITEM_FOLDER: u32 = 0x1;
 const ITEM_DRIVE: u32 = 0x2;
@@ -127,12 +130,11 @@ impl Drop for ReplyWindow {
     }
 }
 
-fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32) -> Result<Vec<u8>, String> {
+fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32, request: u32) -> Result<Vec<u8>, String> {
     let target = everything_hwnd();
     if target.is_null() {
         return Err(tr("Everything no está en ejecución", "Everything is not running").into());
     }
-    let request = REQ_NAME | REQ_PATH | REQ_SIZE | REQ_DATE_MODIFIED;
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     for v in [reply.0 as usize as u32, REPLY_ID, 0, offset, max, request, SORT_NAME_ASCENDING] {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -214,7 +216,7 @@ pub fn for_each_item(
         };
         let mut offset = 0u32;
         loop {
-            let page = query_page(&reply, &search_owned, offset, PAGE);
+            let page = query_page(&reply, &search_owned, offset, PAGE, REQ_NAME | REQ_PATH | REQ_SIZE | REQ_DATE_MODIFIED);
             let (num, total) = match &page {
                 Ok(d) if d.len() >= 20 => (rd_u32(d, 4), rd_u32(d, 0)),
                 _ => (0, 0),
@@ -276,5 +278,252 @@ fn parse_pages(
         if num == 0 || offset >= total {
             return Ok(());
         }
+    }
+}
+
+// ===========================================================================
+// Consulta extendida: metadatos completos exigidos por la spec de analizadores.
+// ===========================================================================
+
+/// Todos los campos que necesitan los 7 módulos, en un solo request.
+pub const REQ_FULL: u32 = REQ_NAME
+    | REQ_PATH
+    | REQ_SIZE
+    | REQ_DATE_MODIFIED
+    | REQ_DATE_ACCESSED
+    | REQ_ATTRIBUTES
+    | REQ_RUN_COUNT;
+
+/// Elemento con metadatos completos (cadenas propias, sin atarse al buffer IPC).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtItem {
+    pub is_dir: bool,
+    pub name: String,
+    /// Carpeta contenedora (sin el nombre).
+    pub path: String,
+    pub size: Option<u64>,
+    pub modified: u64,
+    pub accessed: u64,
+    pub attributes: u32,
+    pub run_count: u32,
+}
+
+impl ExtItem {
+    /// Ruta completa combinando carpeta + nombre.
+    pub fn full_path(&self) -> String {
+        if self.path.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{}\\{}", self.path.trim_end_matches('\\'), self.name)
+        }
+    }
+}
+
+struct Cur<'a> {
+    d: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cur<'a> {
+    fn u32(&mut self) -> Result<u32, String> {
+        if self.at + 4 > self.d.len() {
+            return Err("respuesta IPC truncada".into());
+        }
+        let v = u32::from_le_bytes(self.d[self.at..self.at + 4].try_into().unwrap());
+        self.at += 4;
+        Ok(v)
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        if self.at + 8 > self.d.len() {
+            return Err("respuesta IPC truncada".into());
+        }
+        let v = u64::from_le_bytes(self.d[self.at..self.at + 8].try_into().unwrap());
+        self.at += 8;
+        Ok(v)
+    }
+    /// Lee DWORD longitud + UTF-16 + terminador nulo.
+    fn wstr(&mut self) -> Result<String, String> {
+        let len = self.u32()? as usize;
+        let bytes = len * 2;
+        if self.at + bytes + 2 > self.d.len() {
+            return Err("cadena IPC truncada".into());
+        }
+        let units: Vec<u16> = self.d[self.at..self.at + bytes]
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        self.at += bytes + 2;
+        Ok(String::from_utf16_lossy(&units))
+    }
+}
+
+/// Parsea una página de respuesta QUERY2 con el mask extendido [`REQ_FULL`].
+///
+/// Es puro (no toca IPC ni estado global), por lo que se puede testear con
+/// buffers sintéticos.
+pub fn parse_reply_ext(data: &[u8]) -> Result<Vec<ExtItem>, String> {
+    if data.len() < 20 {
+        return Err(tr("Respuesta IPC inválida", "Invalid IPC reply").into());
+    }
+    let num = rd_u32(data, 4) as usize;
+    let request = rd_u32(data, 12);
+    let mut out = Vec::with_capacity(num);
+    for i in 0..num {
+        let hdr = 20 + i * 8;
+        if hdr + 8 > data.len() {
+            return Err("cabecera de item truncada".into());
+        }
+        let flags = rd_u32(data, hdr);
+        let mut c = Cur {
+            d: data,
+            at: rd_u32(data, hdr + 4) as usize,
+        };
+        let name = if request & REQ_NAME != 0 { c.wstr()? } else { String::new() };
+        let path = if request & REQ_PATH != 0 { c.wstr()? } else { String::new() };
+        let size = if request & REQ_SIZE != 0 {
+            let s = c.u64()?;
+            if s == u64::MAX { None } else { Some(s) }
+        } else {
+            None
+        };
+        let modified = if request & REQ_DATE_MODIFIED != 0 { c.u64()? } else { 0 };
+        let accessed = if request & REQ_DATE_ACCESSED != 0 { c.u64()? } else { 0 };
+        let attributes = if request & REQ_ATTRIBUTES != 0 { c.u32()? } else { 0 };
+        let run_count = if request & REQ_RUN_COUNT != 0 { c.u32()? } else { 0 };
+        out.push(ExtItem {
+            is_dir: flags & (ITEM_FOLDER | ITEM_DRIVE) != 0,
+            name,
+            path,
+            size,
+            modified,
+            accessed,
+            attributes,
+            run_count,
+        });
+    }
+    Ok(out)
+}
+
+/// Recorre todo el índice pidiendo metadatos completos, llamando a `f` por item.
+pub fn for_each_item_ext(
+    search: &str,
+    mut f: impl FnMut(ExtItem),
+    mut progress: impl FnMut(u32, u32),
+) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(2);
+    let search_owned = search.to_string();
+    let fetcher = std::thread::spawn(move || {
+        let reply = match ReplyWindow::new() {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.send(Err(e));
+                return;
+            }
+        };
+        let mut offset = 0u32;
+        loop {
+            let page = query_page(&reply, &search_owned, offset, PAGE, REQ_FULL);
+            let (num, total) = match &page {
+                Ok(d) if d.len() >= 20 => (rd_u32(d, 4), rd_u32(d, 0)),
+                _ => (0, 0),
+            };
+            let failed = page.is_err();
+            if tx.send(page).is_err() || failed || num == 0 {
+                return;
+            }
+            offset += num;
+            if offset >= total {
+                return;
+            }
+        }
+    });
+
+    let mut offset = 0u32;
+    let result: Result<(), String> = loop {
+        let Ok(data) = rx.recv() else { break Ok(()) };
+        let data = data?;
+        let total = rd_u32(&data, 0);
+        let num = rd_u32(&data, 4);
+        progress(offset, total);
+        for it in parse_reply_ext(&data)? {
+            f(it);
+        }
+        offset += num;
+        progress(offset, total);
+        if num == 0 || offset >= total {
+            break Ok(());
+        }
+    };
+    let _ = fetcher.join();
+    result
+}
+
+#[cfg(test)]
+mod ext_tests {
+    use super::*;
+
+    fn push_wstr(buf: &mut Vec<u8>, s: &str) {
+        let units: Vec<u16> = s.encode_utf16().collect();
+        buf.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        for u in &units {
+            buf.extend_from_slice(&u.to_le_bytes());
+        }
+        buf.extend_from_slice(&0u16.to_le_bytes());
+    }
+
+    /// Construye una página QUERY2 sintética de un item con todos los campos.
+    fn build_page(name: &str, path: &str, size: u64, flags: u32) -> Vec<u8> {
+        let request = REQ_FULL;
+        let mut page = Vec::new();
+        page.extend_from_slice(&1u32.to_le_bytes()); // total
+        page.extend_from_slice(&1u32.to_le_bytes()); // num
+        page.extend_from_slice(&0u32.to_le_bytes());
+        page.extend_from_slice(&request.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes());
+        page.extend_from_slice(&flags.to_le_bytes());
+        page.extend_from_slice(&28u32.to_le_bytes());
+        push_wstr(&mut page, name);
+        push_wstr(&mut page, path);
+        page.extend_from_slice(&size.to_le_bytes());
+        page.extend_from_slice(&111u64.to_le_bytes()); // modified
+        page.extend_from_slice(&222u64.to_le_bytes()); // accessed
+        page.extend_from_slice(&0x200u32.to_le_bytes()); // attributes (sparse)
+        page.extend_from_slice(&7u32.to_le_bytes()); // run_count
+        page
+    }
+
+    #[test]
+    fn parses_all_extended_fields() {
+        let page = build_page("archivo.bin", "C:\\datos", 4096, 0);
+        let items = parse_reply_ext(&page).unwrap();
+        assert_eq!(items.len(), 1);
+        let it = &items[0];
+        assert_eq!(it.name, "archivo.bin");
+        assert_eq!(it.path, "C:\\datos");
+        assert_eq!(it.full_path(), "C:\\datos\\archivo.bin");
+        assert_eq!(it.size, Some(4096));
+        assert_eq!(it.modified, 111);
+        assert_eq!(it.accessed, 222);
+        assert_eq!(it.attributes, 0x200);
+        assert_eq!(it.run_count, 7);
+        assert!(!it.is_dir);
+    }
+
+    #[test]
+    fn empty_size_is_none_for_folders() {
+        let page = build_page("carpeta", "C:\\", u64::MAX, ITEM_FOLDER);
+        let items = parse_reply_ext(&page).unwrap();
+        assert_eq!(items[0].size, None);
+        assert!(items[0].is_dir);
+    }
+
+    #[test]
+    fn rejects_truncated_page() {
+        assert!(parse_reply_ext(&[]).is_err());
+        let mut page = build_page("x", "y", 1, 0);
+        page.truncate(page.len() / 2);
+        assert!(parse_reply_ext(&page).is_err());
     }
 }

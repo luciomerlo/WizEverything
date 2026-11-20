@@ -9,6 +9,8 @@ mod cold;
 mod dedup;
 mod dup;
 mod everything;
+#[cfg(windows)]
+mod everything_adapter;
 mod hashcache;
 #[cfg(windows)]
 mod hardlink;
