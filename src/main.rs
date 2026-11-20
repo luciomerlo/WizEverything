@@ -3,14 +3,32 @@
 mod ai;
 mod app;
 mod autostart;
+mod catalog;
+mod cold;
+#[cfg(windows)]
+mod dedup;
 mod dup;
 mod everything;
+#[cfg(windows)]
+mod everything_adapter;
+mod executor;
 mod hashcache;
+#[cfg(windows)]
+mod hardlink;
 mod i18n;
+mod magic;
 mod mcp;
+mod reparse;
+mod snapshot;
 mod tree;
 mod sunburst;
+mod sweeper;
 mod treemap;
+
+#[cfg(windows)]
+mod winphys;
+#[cfg(windows)]
+mod wof;
 #[cfg(test)]
 mod tests;
 
