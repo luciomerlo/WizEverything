@@ -4,6 +4,7 @@ mod ai;
 mod app;
 mod autostart;
 mod catalog;
+mod cold;
 #[cfg(windows)]
 mod dedup;
 mod dup;
@@ -14,6 +15,7 @@ mod hardlink;
 mod i18n;
 mod magic;
 mod mcp;
+mod reparse;
 mod snapshot;
 mod tree;
 mod sunburst;
