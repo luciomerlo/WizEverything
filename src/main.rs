@@ -6,12 +6,17 @@ mod autostart;
 mod dup;
 mod everything;
 mod hashcache;
+#[cfg(windows)]
+mod hardlink;
 mod i18n;
 mod magic;
 mod mcp;
 mod tree;
 mod sunburst;
 mod treemap;
+
+#[cfg(windows)]
+mod winphys;
 #[cfg(test)]
 mod tests;
 
