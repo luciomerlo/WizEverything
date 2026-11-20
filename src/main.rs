@@ -18,6 +18,7 @@ mod hardlink;
 mod i18n;
 mod magic;
 mod mcp;
+mod mcp_tools;
 mod reparse;
 mod snapshot;
 mod tree;

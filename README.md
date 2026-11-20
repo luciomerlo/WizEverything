@@ -69,9 +69,10 @@ Every mutating operation runs as a dry-run first and writes a JSONL audit log be
 `wizeverything.exe --mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio,
 using the same Everything index. It can run alongside the desktop app.
 
-Tools: `drives`, `folder_sizes`, `largest_files`, `file_types`, `find_duplicates` (read-only;
-`verify: false` = name + size only, reads no file), `dev_artifacts` (abandoned `node_modules`/`target`/…
-with reclaimable size), `scan_integrity` (corrupt / zero-filled / HTML-error files), `refresh`.
+Tools (all read-only except `snapshot_save`/`catalog_save`, which write only into `%LOCALAPPDATA%\WizEverything`):
+`drives`, `folder_sizes`, `largest_files`, `file_types`, `find_duplicates`, `dev_artifacts`,
+`scan_integrity`, `cloud_audit`, `hardlink_plan`, `cold_files`, `compression_candidates`,
+`snapshot_save`, `snapshot_diff`, `catalog_save`, `catalog_check`, `refresh`.
 
 Claude Code:
 

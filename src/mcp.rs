@@ -41,7 +41,7 @@ impl Server {
                 "protocolVersion": msg.pointer("/params/protocolVersion").and_then(Value::as_str).unwrap_or(PROTOCOL),
                 "capabilities": { "tools": {} },
                 "serverInfo": { "name": "wizeverything", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": "Read-only. Disk usage, file types and duplicate files from the Everything index on this Windows PC. It never deletes or changes files. Sizes are in bytes. Paths look like C:\\Users\\name."
+                "instructions": "Mostly read-only. Disk usage, file types, duplicates and storage-analysis reports from the Everything index on this Windows PC. Only snapshot_save and catalog_save write, and only into %LOCALAPPDATA%\\WizEverything. It never deletes or changes your files. Sizes are in bytes. Paths look like C:\\Users\\name."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tools() })),
@@ -281,6 +281,14 @@ impl Server {
                     "items": items,
                 }))
             }
+            "cloud_audit" => crate::mcp_tools::cloud_audit(&t, root, &a, limit),
+            "hardlink_plan" => crate::mcp_tools::hardlink_plan(&t, root, &a, limit),
+            "cold_files" => crate::mcp_tools::cold_files(&t, root, &a, limit),
+            "compression_candidates" => crate::mcp_tools::compression_candidates(&t, root, &a, limit),
+            "snapshot_save" => crate::mcp_tools::snapshot_save(&t, root, &a),
+            "snapshot_diff" => crate::mcp_tools::snapshot_diff(&a, limit),
+            "catalog_save" => crate::mcp_tools::catalog_save(&t, root, &a),
+            "catalog_check" => crate::mcp_tools::catalog_check(&t, root, &a, limit),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -316,6 +324,7 @@ fn walk_dirs(t: &Tree, root: u32, f: &mut impl FnMut(u32)) {
 /// Every tool is read-only: nothing here deletes, moves or writes files.
 pub fn tools() -> Value {
     let ro = json!({ "readOnlyHint": true, "destructiveHint": false, "openWorldHint": false });
+    let wr = json!({ "readOnlyHint": false, "destructiveHint": false, "openWorldHint": false });
     let path = json!({ "type": "string", "description": "Folder or drive, e.g. C:\\ or C:\\Users. Omit for all drives." });
     let limit = json!({ "type": "integer", "description": "Max items to return (default 25)." });
     json!([
@@ -344,6 +353,39 @@ pub fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
             "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
             "max_scan": { "type": "integer", "description": "Max files to read (default 3000, max 50000)." } } } },
+        { "name": "cloud_audit", "description": "Audit sparse/offline/cloud files and reparse points: shows logical vs real on-disk size and the space that could be recovered. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
+            "max_scan": { "type": "integer", "description": "Max files to inspect (default 2000)." } } } },
+        { "name": "hardlink_plan", "description": "Dry-run: finds exact duplicates that could be merged into NTFS hardlinks on the same volume, with the space it would reclaim. Does not modify anything. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
+            "min_size_mb": { "type": "number", "description": "Ignore files smaller than this (default 1)." },
+            "max_files": { "type": "integer", "description": "Safety cap on files considered (default 200000)." } } } },
+        { "name": "cold_files", "description": "Coldest files by a score from modified date, last access and run count — candidates to archive. Reads Everything's access/run metadata. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
+            "min_score": { "type": "integer", "description": "Minimum cold score 0–100 (default 60)." } } } },
+        { "name": "compression_candidates", "description": "Cold files worth compressing with WOF LZX (excludes formats already compressed). Read-only plan.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
+            "min_score": { "type": "integer", "description": "Minimum cold score (default 70)." } } } },
+        { "name": "snapshot_save", "description": "Saves a compact snapshot of the current index for later diffing. Writes only into the app's data folder (%LOCALAPPDATA%\\WizEverything\\snapshots).", "annotations": wr,
+          "inputSchema": { "type": "object", "properties": { "path": path,
+            "all_drives": { "type": "boolean", "description": "Snapshot every included drive when no path is given." },
+            "max_entries": { "type": "integer", "description": "Safety cap (default 500000)." } } } },
+        { "name": "snapshot_diff", "description": "Compares two saved snapshots (.wzsnap): added/removed/grown/shrunk files and net bytes. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "a": { "type": "string", "description": "First .wzsnap path." }, "b": { "type": "string", "description": "Second .wzsnap path." }, "limit": limit }, "required": ["a", "b"] } },
+        { "name": "catalog_save", "description": "Saves a portable, Zstd-compressed .ecat catalog of a drive/folder for offline cross-checking. Writes only into the app's data folder.", "annotations": wr,
+          "inputSchema": { "type": "object", "properties": { "path": path,
+            "all_drives": { "type": "boolean", "description": "Catalog every included drive when no path is given." },
+            "volume_name": { "type": "string", "description": "Label for the volume (default 'catalog')." },
+            "max_entries": { "type": "integer", "description": "Safety cap (default 500000)." } } } },
+        { "name": "catalog_check", "description": "Cross-checks local files against a saved .ecat catalog to show what is already backed up on a disconnected volume. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Check every included drive when no path is given." },
+            "catalog": { "type": "string", "description": "Path to the .ecat file." },
+            "max_entries": { "type": "integer", "description": "Safety cap (default 500000)." } }, "required": ["catalog"] } },
         { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])

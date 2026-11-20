@@ -3,6 +3,18 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.0] - 2026-11-20
+
+### Added
+- The remaining storage-analysis engines are now usable from the MCP server — nothing is internal-only anymore:
+  - `cloud_audit` — sparse/offline/cloud files and reparse points, logical vs real on-disk size.
+  - `hardlink_plan` — dry-run plan of exact duplicates mergeable into NTFS hardlinks on the same volume (read-only; merging stays in the app).
+  - `cold_files` — coldest files by modified date, last access and run count (uses Everything's full metadata).
+  - `compression_candidates` — cold files worth WOF LZX compression (excludes already-compressed formats).
+  - `snapshot_save` / `snapshot_diff` — compact index snapshots and an O(N) delta.
+  - `catalog_save` / `catalog_check` — portable `.ecat` catalogs and cross-checking local files against a disconnected volume.
+- `snapshot_save`/`catalog_save` write only into `%LOCALAPPDATA%\WizEverything`; every other tool is read-only.
+
 ## [0.9.1] - 2026-11-20
 
 ### Added

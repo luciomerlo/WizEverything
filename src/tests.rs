@@ -549,8 +549,15 @@ fn mcp_handshake_and_tools() {
     assert!(s.handle(&serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"})).is_none());
     let list = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"})).unwrap();
     let names: Vec<&str> = list["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, ["drives", "folder_sizes", "largest_files", "file_types", "find_duplicates", "dev_artifacts", "scan_integrity", "refresh"]);
-    assert!(list["result"]["tools"].as_array().unwrap().iter().all(|t| t["annotations"]["readOnlyHint"] == true), "every tool is read-only");
+    assert_eq!(names, ["drives", "folder_sizes", "largest_files", "file_types", "find_duplicates", "dev_artifacts", "scan_integrity", "cloud_audit", "hardlink_plan", "cold_files", "compression_candidates", "snapshot_save", "snapshot_diff", "catalog_save", "catalog_check", "refresh"]);
+    let writers = ["snapshot_save", "catalog_save"];
+    assert!(
+        list["result"]["tools"].as_array().unwrap().iter().all(|t| {
+            let is_writer = writers.contains(&t["name"].as_str().unwrap());
+            t["annotations"]["readOnlyHint"] == serde_json::Value::Bool(!is_writer)
+        }),
+        "only snapshot_save/catalog_save may write"
+    );
     let bad = s.handle(&serde_json::json!({"jsonrpc":"2.0","id":3,"method":"nope"})).unwrap();
     assert_eq!(bad["error"]["code"], -32601);
 }
