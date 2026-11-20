@@ -416,6 +416,45 @@ impl TrayItems {
     }
 }
 
+/// Oscuro legible: texto casi blanco, paneles bien separados y acentos vivos.
+/// El oscuro por defecto de egui deja el texto gris sobre gris; esto lo evita.
+fn dark_visuals() -> egui::Visuals {
+    use egui::{Color32, Stroke};
+    let mut v = egui::Visuals::dark();
+    v.dark_mode = true;
+    v.override_text_color = None;
+    v.weak_text_color = Some(Color32::from_rgb(205, 205, 212));
+    v.panel_fill = Color32::from_rgb(20, 20, 23);
+    v.window_fill = Color32::from_rgb(30, 30, 34);
+    v.faint_bg_color = Color32::from_rgb(42, 42, 48);
+    v.extreme_bg_color = Color32::from_rgb(12, 12, 14);
+    v.text_edit_bg_color = Some(Color32::from_rgb(12, 12, 14));
+    v.code_bg_color = Color32::from_rgb(38, 38, 44);
+    v.hyperlink_color = Color32::from_rgb(130, 185, 255);
+    v.warn_fg_color = Color32::from_rgb(255, 195, 95);
+    v.error_fg_color = Color32::from_rgb(255, 125, 125);
+    v.window_stroke = Stroke::new(1.0, Color32::from_gray(95));
+    v.selection = egui::style::Selection {
+        bg_fill: Color32::from_rgb(40, 95, 175),
+        stroke: Stroke::new(1.0, Color32::WHITE),
+    };
+    v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, Color32::from_gray(85));
+    v.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::from_gray(220));
+    v.widgets.inactive.bg_fill = Color32::from_rgb(52, 52, 60);
+    v.widgets.inactive.weak_bg_fill = Color32::from_rgb(44, 44, 51);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_gray(115));
+    v.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::from_gray(238));
+    v.widgets.hovered.bg_fill = Color32::from_rgb(66, 78, 100);
+    v.widgets.hovered.weak_bg_fill = Color32::from_rgb(58, 70, 92);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.5, Color32::from_rgb(125, 175, 255));
+    v.widgets.hovered.fg_stroke = Stroke::new(1.5, Color32::WHITE);
+    v.widgets.active.bg_fill = Color32::from_rgb(78, 98, 132);
+    v.widgets.active.weak_bg_fill = Color32::from_rgb(70, 90, 124);
+    v.widgets.active.bg_stroke = Stroke::new(2.0, Color32::from_rgb(160, 200, 255));
+    v.widgets.active.fg_stroke = Stroke::new(2.0, Color32::WHITE);
+    v
+}
+
 /// Claro de alto contraste: fondo papel, tinta negra y bordes gruesos.
 /// Pensado para pantallas con brillo bajo, monitores viejos o vista cansada.
 fn contrast_visuals() -> egui::Visuals {
@@ -458,7 +497,7 @@ fn apply_theme(ctx: &egui::Context, t: Theme) {
     match t {
         Theme::System => {
             ctx.set_visuals_of(egui::Theme::Light, egui::Visuals::light());
-            ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals::dark());
+            ctx.set_visuals_of(egui::Theme::Dark, dark_visuals());
             ctx.set_theme(egui::ThemePreference::System);
         }
         Theme::Light => {
@@ -466,7 +505,7 @@ fn apply_theme(ctx: &egui::Context, t: Theme) {
             ctx.set_theme(egui::ThemePreference::Light);
         }
         Theme::Dark => {
-            ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals::dark());
+            ctx.set_visuals_of(egui::Theme::Dark, dark_visuals());
             ctx.set_theme(egui::ThemePreference::Dark);
         }
         Theme::Contrast => {

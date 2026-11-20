@@ -56,6 +56,21 @@ CREATE TABLE IF NOT EXISTS docs (
     updated INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS docs_updated ON docs(updated);
+CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(
+    path UNINDEXED,
+    text,
+    tokenize = 'unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS docs_fts_ai AFTER INSERT ON docs BEGIN
+    INSERT INTO docs_fts(path, text) VALUES (new.path, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS docs_fts_au AFTER UPDATE ON docs BEGIN
+    DELETE FROM docs_fts WHERE path = old.path;
+    INSERT INTO docs_fts(path, text) VALUES (new.path, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS docs_fts_ad AFTER DELETE ON docs BEGIN
+    DELETE FROM docs_fts WHERE path = old.path;
+END;
 CREATE TABLE IF NOT EXISTS lease (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     app TEXT NOT NULL,
@@ -74,6 +89,22 @@ pub fn open() -> Result<Connection, String> {
     let conn = Connection::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    // Bases creadas antes de FTS5: poblar una sola vez.
+    let ready: Option<String> = conn
+        .query_row("SELECT value FROM meta WHERE key = 'fts_ready'", [], |r| r.get(0))
+        .optional()
+        .map_err(|e| e.to_string())?;
+    if ready.as_deref() != Some("1") {
+        conn.execute(
+            "INSERT INTO docs_fts(path, text)
+             SELECT path, text FROM docs
+             WHERE NOT EXISTS (SELECT 1 FROM docs_fts f WHERE f.path = docs.path)",
+            [],
+        )
+        .map_err(|e| e.to_string())?;
+        conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('fts_ready', '1')", [])
+            .map_err(|e| e.to_string())?;
+    }
     Ok(conn)
 }
 
@@ -176,6 +207,54 @@ pub fn prune(conn: &Connection, missing: &[String]) -> Result<usize, String> {
     Ok(n)
 }
 
+/// Búsqueda directa en el índice (FTS5), sin recorrer el árbol.
+/// Devuelve `(path, kind, snippet)`; el llamador decide si el archivo sigue vivo.
+pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<(String, String, String)>, String> {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .filter(|t| !t.is_empty())
+        .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+        .collect();
+    if tokens.is_empty() {
+        return Ok(Vec::new());
+    }
+    let expr = tokens.join(" AND ");
+    let mut st = conn
+        .prepare(
+            "SELECT d.path, d.kind, snippet(docs_fts, 1, '', '', '…', 18)
+             FROM docs_fts JOIN docs d ON d.path = docs_fts.path
+             WHERE docs_fts MATCH ?1
+             ORDER BY rank LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = st
+        .query_map(params![expr, limit as i64], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .map_err(|e| e.to_string())?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| e.to_string())?);
+    }
+    Ok(out)
+}
+
+/// Borra del índice los archivos que ya no existen. `max` acota el trabajo por llamada.
+pub fn prune_missing(conn: &Connection, max: usize) -> Result<usize, String> {
+    let mut st = conn.prepare("SELECT path FROM docs LIMIT ?1").map_err(|e| e.to_string())?;
+    let paths: Vec<String> = st
+        .query_map(params![max as i64], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(st);
+    let mut n = 0;
+    for p in paths {
+        if !Path::new(&p).exists() {
+            n += conn.execute("DELETE FROM docs WHERE path = ?1", params![p]).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(n)
+}
+
 pub fn stats(conn: &Connection) -> serde_json::Value {
     let docs: i64 = conn.query_row("SELECT COUNT(*) FROM docs", [], |r| r.get(0)).unwrap_or(0);
     let bytes: i64 = conn.query_row("SELECT COALESCE(SUM(LENGTH(text)), 0) FROM docs", [], |r| r.get(0)).unwrap_or(0);
@@ -212,11 +291,17 @@ mod tests {
         let c = Connection::open(&p).unwrap();
         c.execute_batch(SCHEMA).unwrap();
         c.execute_batch(SCHEMA).unwrap();
-        put(&c, "C:\\a.pdf", 10, 20, "pdf", "hola mundo").unwrap();
+        put(&c, r"C:\a.pdf", 10, 20, "pdf", "hola mundo").unwrap();
         let (kind, text) = get(&c, "C:\\a.pdf", 10, 20).unwrap();
         assert_eq!(kind, "pdf");
         assert_eq!(text, "hola mundo");
         assert!(get(&c, "C:\\a.pdf", 11, 20).is_none());
+        let found = search(&c, "mundo", 10).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, r"C:\a.pdf");
+        put(&c, r"C:\a.pdf", 10, 20, "pdf", "otro texto").unwrap();
+        assert!(search(&c, "mundo", 10).unwrap().is_empty());
+        assert_eq!(search(&c, "otro", 10).unwrap().len(), 1);
         let _ = claim(&c, APP_WIZ).unwrap();
         assert_eq!(lease_status(&c)["owner"], APP_WIZ);
         release(&c, APP_WIZ).unwrap();
