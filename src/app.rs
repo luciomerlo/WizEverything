@@ -469,6 +469,8 @@ pub struct App {
     ext_cats: Vec<(usize, u64, u64)>,
     ext_open: HashSet<usize>,
     highlight_ext: Option<u32>,
+    /// Report shown in the Analysis window (title, text).
+    analysis: Option<(String, String)>,
 
     tab: Tab,
     file_filter: String,
@@ -546,6 +548,7 @@ impl App {
             ext_cats: Vec::new(),
             ext_open: HashSet::new(),
             highlight_ext: None,
+            analysis: None,
             tab: Tab::Tree,
             file_filter: String::new(),
             files: Vec::new(),
@@ -1137,6 +1140,23 @@ impl eframe::App for App {
             }
         });
         self.menu_ui(&ctx);
+        // Storage-analysis report window (read-only engines).
+        if let Some((title, text)) = self.analysis.clone() {
+            let mut open = true;
+            egui::Window::new(title)
+                .open(&mut open)
+                .resizable(true)
+                .default_width(760.0)
+                .default_height(420.0)
+                .show(&ctx, |ui| {
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        ui.add(egui::Label::new(RichText::new(text).monospace()).wrap());
+                    });
+                });
+            if !open {
+                self.analysis = None;
+            }
+        }
         // Sorting / expanding marks the rows dirty during this frame: draw the
         // result right away instead of waiting for the next mouse move.
         if self.rows_dirty {
@@ -1300,6 +1320,38 @@ impl App {
                         self.exclusion_dirty = true;
                         self.settings.save();
                     }
+                }
+            }
+            // Storage analysis (read-only engines).
+            ui.separator();
+            if let Some(tree) = tree {
+                ui.label(RichText::new(tr("Análisis del espacio", "Space analysis")).strong());
+                let fmt = |r: Result<serde_json::Value, String>| match r {
+                    Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_default(),
+                    Err(e) => format!("Error: {e}"),
+                };
+                let root = self.view_root;
+                let caps = serde_json::json!({
+                    "all_drives": true,
+                    "max_scan": 2000,
+                    "max_files": 5000,
+                    "min_score": 40,
+                    "max_entries": 20000
+                });
+                if ui.button(tr("Auditoría cloud / sparse", "Cloud / sparse audit")).clicked() {
+                    self.analysis = Some(("Cloud / sparse audit".into(), fmt(crate::mcp_tools::cloud_audit(tree, root, &caps, 30))));
+                }
+                if ui.button(tr("Archivos fríos", "Cold files")).clicked() {
+                    self.analysis = Some(("Cold files".into(), fmt(crate::mcp_tools::cold_files(tree, root, &caps, 30))));
+                }
+                if ui.button(tr("Candidatos a compresión", "Compression candidates")).clicked() {
+                    self.analysis = Some(("Compression candidates".into(), fmt(crate::mcp_tools::compression_candidates(tree, root, &caps, 30))));
+                }
+                if ui.button(tr("Plan de hardlinks", "Hardlink plan")).clicked() {
+                    self.analysis = Some(("Hardlink plan".into(), fmt(crate::mcp_tools::hardlink_plan(tree, root, &caps, 30))));
+                }
+                if ui.button(tr("Guardar snapshot", "Save snapshot")).clicked() {
+                    self.analysis = Some(("Snapshot".into(), fmt(crate::mcp_tools::snapshot_save(tree, root, &caps))));
                 }
             }
         });
