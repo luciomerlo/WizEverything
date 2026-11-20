@@ -203,10 +203,7 @@ impl Drop for ReplyWindow {
     }
 }
 
-fn query_page(reply: &ReplyWindow, search: &str, offset: u32, max: u32, request: u32) -> Result<Vec<u8>, String> {
-    let Some((target, _)) = target() else {
-        return Err(missing_msg());
-    };
+fn query_page(reply: &ReplyWindow, target: HWND, search: &str, offset: u32, max: u32, request: u32) -> Result<Vec<u8>, String> {
     let mut buf: Vec<u8> = Vec::with_capacity(64);
     for v in [reply.0 as usize as u32, REPLY_ID, 0, offset, max, request, SORT_NAME_ASCENDING] {
         buf.extend_from_slice(&v.to_le_bytes());
@@ -279,6 +276,13 @@ pub fn for_each_item(
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(2);
     let search_owned = search.to_string();
     let fetcher = std::thread::spawn(move || {
+        // Fijar el motor al empezar: si Auto cambia a mitad de carga (por ejemplo
+        // Everything termina de cargar), mezclar páginas de dos índices rompería
+        // el árbol. El motor elegido se usa hasta terminar esta carga.
+        let Some((target, _)) = target() else {
+            let _ = tx.send(Err(missing_msg()));
+            return;
+        };
         let reply = match ReplyWindow::new() {
             Ok(r) => r,
             Err(e) => {
@@ -288,7 +292,7 @@ pub fn for_each_item(
         };
         let mut offset = 0u32;
         loop {
-            let page = query_page(&reply, &search_owned, offset, PAGE, REQ_NAME | REQ_PATH | REQ_SIZE | REQ_DATE_MODIFIED);
+            let page = query_page(&reply, target, &search_owned, offset, PAGE, REQ_NAME | REQ_PATH | REQ_SIZE | REQ_DATE_MODIFIED);
             let (num, total) = match &page {
                 Ok(d) if d.len() >= 20 => (rd_u32(d, 4), rd_u32(d, 0)),
                 _ => (0, 0),
@@ -487,6 +491,10 @@ pub fn for_each_item_ext(
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(2);
     let search_owned = search.to_string();
     let fetcher = std::thread::spawn(move || {
+        let Some((target, _)) = target() else {
+            let _ = tx.send(Err(missing_msg()));
+            return;
+        };
         let reply = match ReplyWindow::new() {
             Ok(r) => r,
             Err(e) => {
@@ -496,7 +504,7 @@ pub fn for_each_item_ext(
         };
         let mut offset = 0u32;
         loop {
-            let page = query_page(&reply, &search_owned, offset, PAGE, REQ_FULL);
+            let page = query_page(&reply, target, &search_owned, offset, PAGE, REQ_FULL);
             let (num, total) = match &page {
                 Ok(d) if d.len() >= 20 => (rd_u32(d, 4), rd_u32(d, 0)),
                 _ => (0, 0),
