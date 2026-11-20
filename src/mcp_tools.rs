@@ -4,6 +4,7 @@
 //! `compression_candidates` (M5), `snapshot_diff` (M4), `catalog_check` (M7).
 //! Writing tools (only into the app's own data dir): `snapshot_save`, `catalog_save`.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
@@ -198,6 +199,56 @@ pub fn cold_files(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value,
         })
         .collect();
     Ok(json!({ "cold_files": items.len(), "min_score": min_score, "total_bytes": total, "top": top }))
+}
+
+/// M5 — cold data aggregated by folder (which folders hold the most unused bytes).
+pub fn cold_folders(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let min_score = a.get("min_score").and_then(Value::as_u64).unwrap_or(60).clamp(0, 100) as u8;
+    let min_bytes = (a.get("min_folder_mb").and_then(Value::as_f64).unwrap_or(0.0) * 1024.0 * 1024.0) as u64;
+    let items = cold_scan(t, root, a)?;
+    // folder -> (bytes, files, max_score, oldest_unix)
+    let mut agg: HashMap<String, (u64, u64, u8, u64)> = HashMap::new();
+    for (c, s) in items {
+        if s < min_score {
+            continue;
+        }
+        let Some(parent) = c.path.parent() else { continue };
+        let folder = parent.to_string_lossy().to_string();
+        if folder.is_empty() {
+            continue;
+        }
+        let e = agg.entry(folder).or_insert((0, 0, 0, u64::MAX));
+        e.0 += c.size;
+        e.1 += 1;
+        e.2 = e.2.max(s);
+        if let Some(m) = filetime_to_unix(c.modified) {
+            e.3 = e.3.min(m);
+        }
+    }
+    let mut rows: Vec<(String, (u64, u64, u8, u64))> =
+        agg.into_iter().filter(|(_, x)| x.0 >= min_bytes && x.0 > 0).collect();
+    rows.sort_by(|x, y| y.1.0.cmp(&x.1.0));
+    let total: u64 = rows.iter().map(|(_, x)| x.0).sum();
+    let top: Vec<Value> = rows
+        .iter()
+        .take(limit)
+        .map(|(folder, x)| {
+            json!({
+                "folder": folder,
+                "cold_bytes": x.0,
+                "cold_files": x.1,
+                "max_cold_score": x.2,
+                "oldest_unix": if x.3 == u64::MAX { Value::Null } else { json!(x.3) },
+            })
+        })
+        .collect();
+    Ok(json!({
+        "folders": rows.len(),
+        "cold_bytes": total,
+        "min_score": min_score,
+        "top": top,
+    }))
 }
 
 /// M5 — files worth compressing with WOF LZX (cold + not already compressed).

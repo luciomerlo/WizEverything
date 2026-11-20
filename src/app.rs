@@ -1338,19 +1338,64 @@ impl App {
                     "min_score": 40,
                     "max_entries": 20000
                 });
-                if ui.button(tr("Auditoría cloud / sparse", "Cloud / sparse audit")).clicked() {
+                if ui
+                    .button(tr("Auditoría cloud / sparse", "Cloud / sparse audit"))
+                    .on_hover_text(tr(
+                        "Detecta archivos que no ocupan en disco lo que pesan (nube, sparse, comprimidos, junctions). Muestra tamaño lógico vs real y cuánto podrías liberar.",
+                        "Finds files that use less disk than their size (cloud, sparse, compressed, junctions). Shows logical vs real size and how much you could free.",
+                    ))
+                    .clicked()
+                {
                     self.analysis = Some(("Cloud / sparse audit".into(), fmt(crate::mcp_tools::cloud_audit(tree, root, &caps, 30))));
                 }
-                if ui.button(tr("Archivos fríos", "Cold files")).clicked() {
+                if ui
+                    .button(tr("Archivos fríos", "Cold files"))
+                    .on_hover_text(tr(
+                        "Puntúa cada archivo por cuán poco lo usás (modificación, último acceso, veces abierto). Para elegir qué archivar o borrar.",
+                        "Scores each file by how rarely you use it (modified, last access, run count). Helps choose what to archive or delete.",
+                    ))
+                    .clicked()
+                {
                     self.analysis = Some(("Cold files".into(), fmt(crate::mcp_tools::cold_files(tree, root, &caps, 30))));
                 }
-                if ui.button(tr("Candidatos a compresión", "Compression candidates")).clicked() {
+                if ui
+                    .button(tr("Carpetas frías", "Cold folders"))
+                    .on_hover_text(tr(
+                        "Igual que Archivos fríos, pero agrupado por carpeta: qué carpetas concentran más datos sin usar.",
+                        "Same as Cold files but grouped by folder: which folders hold the most unused data.",
+                    ))
+                    .clicked()
+                {
+                    self.analysis = Some(("Cold folders".into(), fmt(crate::mcp_tools::cold_folders(tree, root, &caps, 30))));
+                }
+                if ui
+                    .button(tr("Candidatos a compresión", "Compression candidates"))
+                    .on_hover_text(tr(
+                        "Archivos fríos que no están ya comprimidos y ganarían espacio con compresión LZX de Windows. Solo plan; no comprime todavía.",
+                        "Cold files not already compressed that would gain space from Windows LZX compression. Plan only; does not compress yet.",
+                    ))
+                    .clicked()
+                {
                     self.analysis = Some(("Compression candidates".into(), fmt(crate::mcp_tools::compression_candidates(tree, root, &caps, 30))));
                 }
-                if ui.button(tr("Plan de hardlinks", "Hardlink plan")).clicked() {
+                if ui
+                    .button(tr("Plan de hardlinks", "Hardlink plan"))
+                    .on_hover_text(tr(
+                        "Duplicados exactos que podrían ser hardlinks (mismo archivo físico, varias rutas) dentro del mismo disco. Dry-run: no modifica nada.",
+                        "Exact duplicates that could be hardlinks (one physical file, several paths) on the same volume. Dry-run: changes nothing.",
+                    ))
+                    .clicked()
+                {
                     self.analysis = Some(("Hardlink plan".into(), fmt(crate::mcp_tools::hardlink_plan(tree, root, &caps, 30))));
                 }
-                if ui.button(tr("Guardar snapshot", "Save snapshot")).clicked() {
+                if ui
+                    .button(tr("Guardar snapshot", "Save snapshot"))
+                    .on_hover_text(tr(
+                        "Guarda una foto compacta del índice para comparar después y ver qué creció o desapareció. Se guarda en la carpeta de datos de la app.",
+                        "Saves a compact snapshot of the index to compare later and see what grew or disappeared. Stored in the app's data folder.",
+                    ))
+                    .clicked()
+                {
                     self.analysis = Some(("Snapshot".into(), fmt(crate::mcp_tools::snapshot_save(tree, root, &caps))));
                 }
             }
