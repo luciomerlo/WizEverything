@@ -3,6 +3,17 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] - 2026-11-20
+
+### Added
+- "Similar files" analysis (MCP `similar_images`, `similar_audio` + Space analysis menu):
+  - Images: perceptual hashes (dHash + aHash) with LSH banding to find the same photo resized,
+    recompressed or exported twice, and a quality score that suggests which copy to keep.
+  - Audio: groups the same track across formats/bitrates by artist + title (or filename) and
+    duration, splits live/remix versions, and ranks lossless over lossy.
+  - Both are read-only and return per-group keep/candidates reasons plus reversible alternatives
+    (quarantine, keep both edits, archive, hardlink when byte-identical).
+
 ## [0.10.0] - 2026-11-20
 
 ### Added

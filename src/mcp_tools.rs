@@ -393,3 +393,38 @@ pub fn catalog_check(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Val
         "top_missing": missing,
     }))
 }
+
+const SIM_IMG_EXT: &str = "jpg;jpeg;png;webp;gif;bmp;tif;tiff";
+const SIM_AUD_EXT: &str = "mp3;flac;m4a;aac;ogg;opus;wav;aiff;aif;wma;ape;wv;mka";
+
+/// Archivos del índice bajo `root`, restringidos por extensión (consulta a Everything).
+fn sim_files(t: &Tree, root: u32, exts: &str) -> Result<Vec<crate::similar::FileInfo>, String> {
+    let query = if root == ROOT {
+        format!("ext:{exts}")
+    } else {
+        format!("path:\"{}\" ext:{exts}", t.full_path(root))
+    };
+    let files = everything_adapter::query_files(&query)?;
+    Ok(files
+        .into_iter()
+        .filter(|c| !c.is_dir && c.size > 0)
+        .map(|c| crate::similar::FileInfo { path: c.path, bytes: c.size })
+        .collect())
+}
+
+/// Imágenes parecidas (misma foto reescalada/recomprimida) con "conservar la mejor".
+pub fn similar_images(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let files = sim_files(t, root, SIM_IMG_EXT)?;
+    let max_files = a.get("max_files").and_then(Value::as_u64).unwrap_or(4000).clamp(50, 50_000) as usize;
+    let threshold = a.get("threshold").and_then(Value::as_u64).unwrap_or(10).clamp(2, 20) as u32;
+    Ok(crate::similar::scan_images(files, max_files, threshold).to_json(limit))
+}
+
+/// Audio parecido (mismo tema en FLAC/MP3/…), separando versiones por duración.
+pub fn similar_audio(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let files = sim_files(t, root, SIM_AUD_EXT)?;
+    let max_files = a.get("max_files").and_then(Value::as_u64).unwrap_or(20_000).clamp(50, 200_000) as usize;
+    Ok(crate::similar::scan_audio(files, max_files).to_json(limit))
+}

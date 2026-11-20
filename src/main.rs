@@ -20,6 +20,7 @@ mod magic;
 mod mcp;
 mod mcp_tools;
 mod reparse;
+mod similar;
 mod snapshot;
 mod tree;
 mod sunburst;

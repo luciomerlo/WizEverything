@@ -290,6 +290,8 @@ impl Server {
             "snapshot_diff" => crate::mcp_tools::snapshot_diff(&a, limit),
             "catalog_save" => crate::mcp_tools::catalog_save(&t, root, &a),
             "catalog_check" => crate::mcp_tools::catalog_check(&t, root, &a, limit),
+            "similar_images" => crate::mcp_tools::similar_images(&t, root, &a, limit),
+            "similar_audio" => crate::mcp_tools::similar_audio(&t, root, &a, limit),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -392,6 +394,15 @@ pub fn tools() -> Value {
             "all_drives": { "type": "boolean", "description": "Check every included drive when no path is given." },
             "catalog": { "type": "string", "description": "Path to the .ecat file." },
             "max_entries": { "type": "integer", "description": "Safety cap (default 500000)." } }, "required": ["catalog"] } },
+        { "name": "similar_images", "description": "Finds near-duplicate images (same photo resized, recompressed or exported twice) using perceptual hashes, and suggests which copy to keep by quality. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
+            "max_files": { "type": "integer", "description": "Analyse at most this many images, largest first (default 4000)." },
+            "threshold": { "type": "integer", "description": "Hamming threshold 2–20 (default 10)." } } } },
+        { "name": "similar_audio", "description": "Groups the same track across formats/bitrates (FLAC vs MP3, etc.) by tags + duration and suggests which copy to keep by quality. Read-only.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit,
+            "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." },
+            "max_files": { "type": "integer", "description": "Analyse at most this many audio files (default 20000)." } } } },
         { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])

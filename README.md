@@ -61,6 +61,10 @@ the in-app panels that drive them are being wired up.
   HTML error pages saved with binary extensions.
 - **Portable offline catalogs (`.ecat`)** — a Zstd-compressed inventory of external/offline volumes,
   cross-referenced against local files.
+- **Similar files (images & audio)** — finds near-duplicates that are not byte-identical: perceptual
+  hashes (dHash + aHash, LSH-banded) for photos resized/recompressed/re-exported, and tag + duration
+  matching for the same track across FLAC/MP3/M4A. Each group suggests which copy to keep by quality
+  and offers reversible alternatives (quarantine, keep both edits, archive).
 
 Every mutating operation runs as a dry-run first and writes a JSONL audit log before touching the disk.
 
@@ -72,7 +76,7 @@ using the same Everything index. It can run alongside the desktop app.
 Tools (all read-only except `snapshot_save`/`catalog_save`, which write only into `%LOCALAPPDATA%\WizEverything`):
 `drives`, `folder_sizes`, `largest_files`, `file_types`, `find_duplicates`, `dev_artifacts`,
 `scan_integrity`, `cloud_audit`, `hardlink_plan`, `cold_files`, `compression_candidates`,
-`snapshot_save`, `snapshot_diff`, `catalog_save`, `catalog_check`, `refresh`.
+`similar_images`, `similar_audio`, `snapshot_save`, `snapshot_diff`, `catalog_save`, `catalog_check`, `refresh`.
 
 Claude Code:
 

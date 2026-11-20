@@ -1381,6 +1381,26 @@ impl App {
                     self.analysis = Some(("Cold folders".into(), fmt(crate::mcp_tools::cold_folders(tree, root, &caps, 30))));
                 }
                 if ui
+                    .button(tr("Imágenes parecidas", "Similar images"))
+                    .on_hover_text(tr(
+                        "Agrupa la misma foto en distintas resoluciones o recompresiones (hash perceptual) y sugiere cuál conservar por calidad. Solo lectura.",
+                        "Groups the same photo at different resolutions or recompressions (perceptual hash) and suggests which copy to keep by quality. Read-only.",
+                    ))
+                    .clicked()
+                {
+                    self.analysis = Some(("Similar images".into(), fmt(crate::mcp_tools::similar_images(tree, root, &caps, 30))));
+                }
+                if ui
+                    .button(tr("Audio parecido", "Similar audio"))
+                    .on_hover_text(tr(
+                        "Agrupa el mismo tema en FLAC/MP3/etc. por etiquetas y duración, separa versiones y sugiere cuál conservar por calidad. Solo lectura.",
+                        "Groups the same track across FLAC/MP3/etc. by tags and duration, splits versions and suggests which copy to keep by quality. Read-only.",
+                    ))
+                    .clicked()
+                {
+                    self.analysis = Some(("Similar audio".into(), fmt(crate::mcp_tools::similar_audio(tree, root, &caps, 30))));
+                }
+                if ui
                     .button(tr("Candidatos a compresión", "Compression candidates"))
                     .on_hover_text(tr(
                         "Archivos fríos que no están ya comprimidos y ganarían espacio con compresión LZX de Windows. Solo plan; no comprime todavía.",
