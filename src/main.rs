@@ -11,6 +11,7 @@ mod dup;
 mod everything;
 #[cfg(windows)]
 mod everything_adapter;
+mod executor;
 mod hashcache;
 #[cfg(windows)]
 mod hardlink;
