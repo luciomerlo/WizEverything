@@ -114,14 +114,17 @@ pub fn clones(t: &Tree, root: u32, limit: usize, deep: bool) -> Value {
         })
         .collect();
     out.sort_by(|a, b| b["redundant_bytes"].as_u64().cmp(&a["redundant_bytes"].as_u64()));
-    let shown = out.len().min(limit);
-    out.truncate(limit);
+    let total_groups = out.len();
     let redundant: u64 = out.iter().map(|g| g["redundant_bytes"].as_u64().unwrap_or(0)).sum();
+    let shown = total_groups.min(limit);
+    out.truncate(limit);
 
     json!({
         "kind": "github_clones",
         "repos": seen,
-        "groups": shown,
+        "groups": total_groups,
+        "shown": shown,
+        "truncated": total_groups > shown,
         "items": out,
         "redundant_bytes": redundant,
         "unreadable": unreadable,

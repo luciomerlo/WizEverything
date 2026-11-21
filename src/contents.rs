@@ -147,11 +147,24 @@ fn msg_text(bytes: &[u8]) -> String {
         }
         cur.clear();
     }
-    for w in bytes.chunks_exact(2) {
-        let u = u16::from_le_bytes([w[0], w[1]]);
-        let ch = char::from_u32(u as u32).filter(|c| !c.is_control() || c.is_whitespace());
+    let units: Vec<u16> = bytes.chunks_exact(2).map(|w| u16::from_le_bytes([w[0], w[1]])).collect();
+    let mut i = 0usize;
+    while i < units.len() {
+        let u = units[i];
+        let (ch, used) = if (0xD800..=0xDBFF).contains(&u) && i + 1 < units.len() {
+            let v = units[i + 1];
+            if (0xDC00..=0xDFFF).contains(&v) {
+                let cp = 0x1_0000 + ((u as u32 - 0xD800) << 10) + (v as u32 - 0xDC00);
+                (char::from_u32(cp), 2)
+            } else {
+                (None, 1)
+            }
+        } else {
+            (char::from_u32(u as u32), 1)
+        };
+        i += used;
         match ch {
-            Some(c) if c.is_ascii_graphic() || c == ' ' || c == '\n' || c == '\r' || c == '\t' || u >= 0xA0 => {
+            Some(c) if c.is_ascii_graphic() || c == ' ' || c == '\n' || c == '\r' || c == '\t' || (c as u32) >= 0xA0 => {
                 if c == '\r' || c == '\n' {
                     flush(&mut cur, &mut out);
                 } else {
