@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::tree::Tree;
 
@@ -27,6 +27,7 @@ const DOC_EXT: &[&str] = &["docx", "odt", "rtf", "epub"];
 const PPT_EXT: &[&str] = &["pptx", "odp"];
 const SHEET_EXT: &[&str] = &["xlsx", "ods"];
 const LEGACY_EXT: &[&str] = &["doc", "ppt", "xls"];
+const MAIL_EXT: &[&str] = &["eml", "msg"];
 
 fn ext_of(p: &Path) -> String {
     p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase()
@@ -63,12 +64,235 @@ pub struct Extracted {
     pub note: String,
 }
 
-fn run_stdout(mut cmd: Command) -> Option<String> {
-    let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
+fn temp_file(tag: &str) -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("wz-{tag}-{}-{stamp}", std::process::id()))
+}
+
+/// Ejecuta con un tope de tiempo. Sin esto, un PDF dañado o una imagen enorme
+/// puede colgar el OCR para siempre.
+fn run_stdout_timeout(mut cmd: Command, secs: u64) -> Option<String> {
+    let out_path = temp_file("out");
+    let file = std::fs::File::create(&out_path).ok()?;
+    cmd.stdout(Stdio::from(file)).stderr(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break Some(st),
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let text = std::fs::read(&out_path).ok().map(|b| String::from_utf8_lossy(&b).into_owned());
+    let _ = std::fs::remove_file(&out_path);
+    match status {
+        Some(st) if st.success() => text,
+        _ => None,
     }
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn status_timeout(mut cmd: Command, secs: u64) -> bool {
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
+    let Ok(mut child) = cmd.spawn() else { return false };
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => return st.success(),
+            Ok(None) => {}
+            Err(_) => return false,
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Texto aproximado de un `.msg` de Outlook (contenedor OLE binario).
+/// No intenta interpretar el formato: extrae las cadenas UTF-16LE/ASCII, que
+/// incluyen asunto y cuerpo en la mayoría de los mensajes.
+fn msg_text(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut cur = String::new();
+    fn flush(cur: &mut String, out: &mut String) {
+        if cur.chars().filter(|c| c.is_alphanumeric()).count() >= 4 {
+            out.push_str(cur);
+            out.push('\n');
+        }
+        cur.clear();
+    }
+    for w in bytes.chunks_exact(2) {
+        let u = u16::from_le_bytes([w[0], w[1]]);
+        let ch = char::from_u32(u as u32).filter(|c| !c.is_control() || c.is_whitespace());
+        match ch {
+            Some(c) if c.is_ascii_graphic() || c == ' ' || c == '\n' || c == '\r' || c == '\t' || u >= 0xA0 => {
+                if c == '\r' || c == '\n' {
+                    flush(&mut cur, &mut out);
+                } else {
+                    cur.push(c);
+                }
+            }
+            _ => flush(&mut cur, &mut out),
+        }
+    }
+    flush(&mut cur, &mut out);
+    let ascii = String::from_utf8_lossy(bytes);
+    for part in ascii.split(|c: char| c.is_control() && c != '\n' && c != '\r') {
+        let t = part.trim();
+        if t.len() >= 8 && t.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').count() == t.chars().count() {
+            out.push_str(t);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn decode_qp(s: &str) -> Vec<u8> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'=' {
+            if i + 1 < b.len() && (b[i + 1] == b'\n' || b[i + 1] == b'\r') {
+                i += if b.get(i + 1) == Some(&b'\r') && b.get(i + 2) == Some(&b'\n') { 3 } else { 2 };
+                continue;
+            }
+            if let (Some(h), Some(l)) = (b.get(i + 1).and_then(|&x| hex_val(x)), b.get(i + 2).and_then(|&x| hex_val(x))) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn b64_val(c: u8) -> Option<u8> {
+    match c {
+        b'A'..=b'Z' => Some(c - b'A'),
+        b'a'..=b'z' => Some(c - b'a' + 26),
+        b'0'..=b'9' => Some(c - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn decode_base64(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut acc = 0u32;
+    let mut bits = 0u8;
+    for &c in s.as_bytes() {
+        let Some(v) = b64_val(c) else { continue };
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
+fn strip_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    unescape(&out.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+fn header(body: &str, name: &str) -> Option<String> {
+    let head = body.split("\n\n").next().unwrap_or(body);
+    for line in head.lines() {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+fn eml_part(raw: &str) -> String {
+    let (head, body) = raw.split_once("\n\n").unwrap_or((raw, ""));
+    let enc = header(head, "content-transfer-encoding").unwrap_or_default().to_ascii_lowercase();
+    let ctype = header(head, "content-type").unwrap_or_default().to_ascii_lowercase();
+    let bytes = if enc.contains("quoted-printable") {
+        decode_qp(body)
+    } else if enc.contains("base64") {
+        decode_base64(body)
+    } else {
+        body.as_bytes().to_vec()
+    };
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    if ctype.contains("text/html") { strip_html(&text) } else { text }
+}
+
+fn eml_text(raw: &str) -> String {
+    let norm = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = String::new();
+    for h in ["Subject", "From", "To", "Date"] {
+        if let Some(v) = header(&norm, h) {
+            out.push_str(h);
+            out.push_str(": ");
+            out.push_str(&v);
+            out.push('\n');
+        }
+    }
+    out.push('\n');
+    let ctype = header(&norm, "content-type").unwrap_or_default();
+    if ctype.to_ascii_lowercase().contains("multipart/") {
+        let boundary = ctype
+            .split(';')
+            .find_map(|p| p.trim().strip_prefix("boundary="))
+            .map(|b| b.trim_matches('"').to_string());
+        if let Some(b) = boundary {
+            for part in norm.split(&format!("--{b}")) {
+                let p = part.trim_start_matches('\n');
+                if p.starts_with("--") || p.trim().is_empty() {
+                    continue;
+                }
+                let t = eml_part(p);
+                if !t.trim().is_empty() {
+                    out.push_str(&t);
+                    out.push('\n');
+                }
+            }
+            return out;
+        }
+    }
+    out.push_str(&eml_part(&norm));
+    out
 }
 
 /// Extrae texto de `path`. En fast no hace OCR ni abre imágenes.
@@ -84,6 +308,22 @@ pub fn extract(path: &Path, deep: bool, tools: &Tools) -> Option<Extracted> {
             kind: "text",
             note: String::new(),
         });
+    }
+    if MAIL_EXT.contains(&ext.as_str()) {
+        let cap = if deep { 16 * 1024 * 1024 } else { 8 * 1024 * 1024 };
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        std::fs::File::open(path).ok()?.take(cap as u64).read_to_end(&mut bytes).ok()?;
+        if ext == "msg" {
+            let text = msg_text(&bytes);
+            return Some(Extracted {
+                text,
+                kind: "email",
+                note: "Outlook .msg: extracción aproximada de cadenas; puede incluir ruido binario.".into(),
+            });
+        }
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
+        return Some(Extracted { text: eml_text(&raw), kind: "email", note: String::new() });
     }
     if DOC_EXT.contains(&ext.as_str()) {
         if ext == "rtf" {
@@ -144,7 +384,7 @@ pub fn extract(path: &Path, deep: bool, tools: &Tools) -> Option<Extracted> {
             cmd.args(["-l", "3"]);
         }
         cmd.arg(path).arg("-");
-        let text = run_stdout(cmd).unwrap_or_default();
+        let text = run_stdout_timeout(cmd, if deep { 60 } else { 20 }).unwrap_or_default();
         if text.trim().is_empty() {
             if deep && tools.tesseract {
                 // PDF escaneado: se rasteriza con pdftoppm y se pasa a tesseract.
@@ -157,7 +397,7 @@ pub fn extract(path: &Path, deep: bool, tools: &Tools) -> Option<Extracted> {
     if deep && IMAGE_EXT.contains(&ext.as_str()) && tools.tesseract {
         let mut cmd = Command::new("tesseract");
         cmd.arg(path).arg("stdout").args(["-l", "spa+eng", "--psm", "3"]);
-        if let Some(text) = run_stdout(cmd) {
+        if let Some(text) = run_stdout_timeout(cmd, 25) {
             return Some(Extracted { text, kind: "ocr", note: String::new() });
         }
     }
@@ -173,13 +413,9 @@ fn ocr_pdf(path: &Path, tools: &Tools, deep: bool) -> Option<Extracted> {
     std::fs::create_dir_all(&dir).ok()?;
     let out = dir.join("page");
     let max_pages = if deep { 20 } else { 1 };
-    let ok = Command::new("pdftoppm")
-        .args(["-f", "1", "-l", &max_pages.to_string(), "-r", "200", "-png"])
-        .arg(path)
-        .arg(&out)
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
+    let mut raster = Command::new("pdftoppm");
+    raster.args(["-f", "1", "-l", &max_pages.to_string(), "-r", "200", "-png"]).arg(path).arg(&out);
+    let ok = status_timeout(raster, 180);
     if !ok {
         let _ = std::fs::remove_dir_all(&dir);
         return None;
@@ -195,7 +431,7 @@ fn ocr_pdf(path: &Path, tools: &Tools, deep: bool) -> Option<Extracted> {
     for img in imgs.iter().take(max_pages) {
         let mut cmd = Command::new("tesseract");
         cmd.arg(img).arg("stdout").args(["-l", "spa+eng"]);
-        text.push_str(&run_stdout(cmd).unwrap_or_default());
+        text.push_str(&run_stdout_timeout(cmd, 25).unwrap_or_default());
         text.push('\n');
     }
     let _ = std::fs::remove_dir_all(&dir);
@@ -442,6 +678,7 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
             || PPT_EXT.contains(&ext.as_str())
             || SHEET_EXT.contains(&ext.as_str())
             || LEGACY_EXT.contains(&ext.as_str())
+            || MAIL_EXT.contains(&ext.as_str())
             || ext == "pdf"
             || (deep && IMAGE_EXT.contains(&ext.as_str()));
         if !supported {
@@ -457,7 +694,19 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
         let ex = match cached {
             Some((kind, text)) => {
                 index_hits += 1;
-                Extracted { text, kind: if kind == "text" { "text" } else { "document" }, note: String::new() }
+                Extracted {
+                    text,
+                    kind: match kind.as_str() {
+                        "text" => "text",
+                        "email" => "email",
+                        "ocr" => "ocr",
+                        "pdf" => "pdf",
+                        "presentation" => "presentation",
+                        "sheet" => "sheet",
+                        _ => "document",
+                    },
+                    note: String::new(),
+                }
             }
             None => {
                 let Some(ex) = extract(path, deep, &tools) else { continue };
@@ -525,11 +774,15 @@ pub fn estimate(t: &Tree, root: u32) -> serde_json::Value {
     let mut text = (0u64, 0u64);
     let mut pdf = (0u64, 0u64);
     let mut images = (0u64, 0u64);
+    let mut email = (0u64, 0u64);
     for id in t.files_under(root) {
         let p = PathBuf::from(t.full_path(id));
         let ext = ext_of(&p);
         let size = t.nodes[id as usize].size;
-        if TEXT_EXT.contains(&ext.as_str()) {
+        if MAIL_EXT.contains(&ext.as_str()) {
+            email.0 += 1;
+            email.1 += size;
+        } else if TEXT_EXT.contains(&ext.as_str()) {
             text.0 += 1;
             text.1 += size;
         } else if ext == "pdf" {
@@ -542,14 +795,15 @@ pub fn estimate(t: &Tree, root: u32) -> serde_json::Value {
     }
     // Órdenes de magnitud medidos en esta app: texto ~20 MB/s, PDF ~1 pág/0,2 s,
     // OCR ~1 pág/1,2 s. Se declaran como estimación, no como promesa.
-    let fast = text.1 as f64 / 20e6 + pdf.0 as f64 * 0.2;
-    let deep = text.1 as f64 / 20e6 + pdf.0 as f64 * 1.2 + images.0 as f64 * 1.2;
+    let fast = (text.1 + email.1) as f64 / 20e6 + pdf.0 as f64 * 0.2;
+    let deep = (text.1 + email.1) as f64 / 20e6 + pdf.0 as f64 * 1.2 + images.0 as f64 * 1.2;
     let tools = Tools::detect();
     serde_json::json!({
         "kind": "content_estimate",
         "text": { "files": text.0, "bytes": text.1 },
         "pdf": { "files": pdf.0, "bytes": pdf.1 },
         "images": { "files": images.0, "bytes": images.1 },
+        "email": { "files": email.0, "bytes": email.1 },
         "estimated_seconds_fast": (fast * 10.0).round() / 10.0,
         "estimated_seconds_deep": (deep * 10.0).round() / 10.0,
         "pdftotext": tools.pdftotext,
@@ -600,6 +854,22 @@ mod tests {
         assert!(x.text.contains("Factura enero"));
         let _ = std::fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn eml_headers_and_quoted_printable_are_read() {
+        let raw = "Subject: Factura =?UTF-8?B?YWJyaWw=?=
+From: a@b.c
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Hola=20mundo=
+continuaci=C3=B3n
+";
+        let text = eml_text(raw);
+        assert!(text.contains("Subject:"));
+        assert!(text.contains("Hola mundo"));
+        assert!(text.contains("continuación"));
+    }
+
     #[test]
     fn text_extensions_are_recognized() {
         assert_eq!(ext_of(Path::new("a.MD")), "md");

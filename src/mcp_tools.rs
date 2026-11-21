@@ -57,6 +57,17 @@ fn need_path(root: u32, a: &Value) -> Result<(), String> {
 
 
 
+
+/// Carpetas duplicadas por estructura y tamaños.
+pub fn duplicate_folders(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let deep = is_deep(a);
+    let mut v = crate::dupdirs::duplicate_folders(t, root, limit, deep);
+    v["mode"] = json!(mode_name(deep));
+    v["root"] = json!(t.full_path(root));
+    Ok(v)
+}
+
 /// Multicopia: clones del mismo remoto Git bajo la ruta actual.
 pub fn github_clones(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
     need_path(root, a)?;
@@ -332,11 +343,33 @@ pub fn compression_candidates(t: &Tree, root: u32, a: &Value, limit: usize) -> R
     Ok(json!({ "candidates": items.len(), "min_score": min_score, "total_bytes": total, "top": top }))
 }
 
+/// Agrega directorios al snapshot para que `machine_compare` pueda reconstruir
+/// rutas completas. Los consumidores de diff ignoran estas entradas.
+fn push_dirs(t: &Tree, root: u32, entries: &mut Vec<crate::snapshot::Entry>, max: usize) {
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        if entries.len() >= max {
+            return;
+        }
+        if !t.nodes[id as usize].is_dir() {
+            continue;
+        }
+        let path = PathBuf::from(t.full_path(id));
+        entries.push(crate::snapshot::Entry::from_path(&path, 0, 0, 0, crate::snapshot::ATTR_DIRECTORY));
+        for &c in t.children(id) {
+            if t.nodes[c as usize].is_dir() {
+                stack.push(c);
+            }
+        }
+    }
+}
+
 /// M4 — guarda un snapshot del índice actual en el directorio de datos de la app.
 pub fn snapshot_save(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
     need_path(root, a)?;
     let max_entries = a.get("max_entries").and_then(Value::as_u64).unwrap_or(500_000).clamp(1, 5_000_000) as usize;
     let mut entries = Vec::new();
+    push_dirs(t, root, &mut entries, max_entries);
     for id in t.files_under(root) {
         if entries.len() >= max_entries {
             break;
@@ -359,6 +392,14 @@ pub fn snapshot_save(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
         "entries": snap.entries.len(),
         "bytes": bytes.len(),
     }))
+}
+
+
+/// Compara dos snapshots/catálogos de máquinas o volúmenes distintos.
+pub fn machine_compare(a: &Value, limit: usize) -> Result<Value, String> {
+    let pa = a.get("a").and_then(Value::as_str).ok_or("missing 'a' (snapshot or catalog path)")?;
+    let pb = a.get("b").and_then(Value::as_str).ok_or("missing 'b' (snapshot or catalog path)")?;
+    crate::compare::compare(pa, pb, limit)
 }
 
 /// M4 — compara dos snapshots `.wzsnap`.
@@ -386,6 +427,7 @@ pub fn catalog_save(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
     let name = a.get("volume_name").and_then(Value::as_str).unwrap_or("catalog");
     let max_entries = a.get("max_entries").and_then(Value::as_u64).unwrap_or(500_000).clamp(1, 5_000_000) as usize;
     let mut entries = Vec::new();
+    push_dirs(t, root, &mut entries, max_entries);
     for id in t.files_under(root) {
         if entries.len() >= max_entries {
             break;

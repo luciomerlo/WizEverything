@@ -325,6 +325,8 @@ impl Server {
             "wsl_docker" => crate::mcp_tools::wsl_docker(&t, root, &a, limit),
             "forecast" => crate::mcp_tools::forecast(&t, root, &a),
             "github_clones" => crate::mcp_tools::github_clones(&t, root, &a, limit),
+            "duplicate_folders" => crate::mcp_tools::duplicate_folders(&t, root, &a, limit),
+            "machine_compare" => crate::mcp_tools::machine_compare(&a, limit),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -497,8 +499,12 @@ pub fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit }, "required": ["path"] } },
         { "name": "forecast", "description": "Projects days until the system drive is full from the first and last saved snapshots and current free space. Needs at least two snapshots. Read-only. Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "duplicate_folders", "description": "Groups folders under 'path' with the same structure and file sizes, estimating redundant bytes. Structural comparison; never deletes. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast caps at 20,000 folders; deep 200,000." }, "limit": limit }, "required": ["path"] } },
         { "name": "github_clones", "description": "Groups local Git clones by origin URL under 'path' and estimates redundant bytes. Read-only; no fetch, no delete. Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast caps at 500 repos." }, "limit": limit }, "required": ["path"] } },
+        { "name": "machine_compare", "description": "Compares two .wzsnap/.ecat files (two machines or volumes) by path hash: only in A, only in B, grown, shrunk. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "a": { "type": "string", "description": "First snapshot/catalog path." }, "b": { "type": "string", "description": "Second snapshot/catalog path." }, "limit": limit }, "required": ["a", "b"] } },
         { "name": "refresh", "description": "Reload the index from the active engine (Everything or Census).", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])

@@ -25,6 +25,10 @@ use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"WZSNAP1\0";
 
+/// Marca una entrada de directorio (tamaño 0). Los snapshots nuevos la incluyen
+/// para reconstruir rutas completas al comparar dos máquinas.
+pub const ATTR_DIRECTORY: u32 = 0x10;
+
 /// Una fila del snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -35,6 +39,10 @@ pub struct Entry {
     pub physical_size: u64,
     pub modified: i64,
     pub attributes: u32,
+}
+
+pub fn is_directory(e: &Entry) -> bool {
+    e.attributes & ATTR_DIRECTORY != 0
 }
 
 fn hash_path(p: &Path) -> u64 {
@@ -227,7 +235,7 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Diff {
     let mut d = Diff::default();
     let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::with_capacity(new.entries.len());
 
-    for ne in &new.entries {
+    for ne in new.entries.iter().filter(|e| !is_directory(e)) {
         seen.insert(ne.path_hash);
         match index.get(&ne.path_hash) {
             None => {
@@ -256,7 +264,7 @@ pub fn diff(old: &Snapshot, new: &Snapshot) -> Diff {
         }
     }
 
-    for oe in &old.entries {
+    for oe in old.entries.iter().filter(|e| !is_directory(e)) {
         if !seen.contains(&oe.path_hash) {
             d.net_bytes -= oe.logical_size as i64;
             *d.bytes_by_parent.entry(oe.parent_hash).or_default() -= oe.logical_size as i64;
@@ -300,6 +308,18 @@ mod tests {
         let mut bytes = encode(&snap);
         bytes.truncate(bytes.len() - 3);
         assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn directory_markers_do_not_count_as_changes() {
+        let mut d = e(r"C:\p", 0);
+        d.attributes = ATTR_DIRECTORY;
+        let old = Snapshot::new(1, vec![d.clone()]);
+        let new = Snapshot::new(2, vec![d, e(r"C:\p\a.bin", 10)]);
+        let delta = diff(&old, &new);
+        assert_eq!(delta.added.len(), 1);
+        assert_eq!(delta.net_bytes, 10);
+        assert!(delta.removed.is_empty());
     }
 
     #[test]

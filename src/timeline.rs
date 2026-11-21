@@ -7,8 +7,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::snapshot;
-
 /// Cabecera de un snapshot, sin decodificar todas las entradas.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Meta {
@@ -91,6 +89,7 @@ pub fn to_json(limit: usize) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot;
 
     #[test]
     fn reads_headers_without_decoding_entries() {

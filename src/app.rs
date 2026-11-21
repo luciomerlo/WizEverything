@@ -1439,11 +1439,27 @@ impl eframe::App for App {
         }
         if let Some((title, v)) = self.report.clone() {
             let mut open = true;
-            egui::Window::new(title)
+            egui::Window::new(title.clone())
                 .open(&mut open)
                 .resizable(true)
                 .default_size([820.0, 560.0])
                 .show(&ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(tr("Guardar HTML", "Save HTML"))
+                            .on_hover_text(tr(
+                                "Guarda este análisis como un HTML autocontenido en la carpeta de datos de la app.",
+                                "Saves this analysis as a self-contained HTML file in the app data folder.",
+                            ))
+                            .clicked()
+                        {
+                            match crate::report::save(&title, &v) {
+                                Ok(p) => self.info = Some((format!("HTML: {}", p.display()), Instant::now())),
+                                Err(e) => self.error = Some(e),
+                            }
+                        }
+                    });
+                    ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         self.report_body(ui, &v);
                     });
@@ -2105,6 +2121,19 @@ impl App {
                             );
                         }
                         if ui
+                            .button(tr("Carpetas duplicadas", "Duplicate folders"))
+                            .on_hover_text(tr(
+                                "Agrupa carpetas con la misma estructura y tamaños de archivo. Comparación estructural: revisá antes de borrar. (Experimental)",
+                                "Groups folders with the same structure and file sizes. Structural comparison: review before deleting. (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            self.set_report(
+                                tr("Carpetas duplicadas (exp)", "Duplicate folders (exp)"),
+                                crate::mcp_tools::duplicate_folders(tree, root, &caps, 20),
+                            );
+                        }
+                        if ui
                             .button(tr("GitHub multicopia", "GitHub clones"))
                             .on_hover_text(tr(
                                 "Agrupa clones del mismo repositorio por remoto y estima bytes redundantes. No hace fetch ni borra. (Experimental)",
@@ -2391,7 +2420,7 @@ impl App {
             ui.label(RichText::new(tr("Archivos", "Files")).strong());
             ui.label(RichText::new(tr("Tamaño", "Size")).strong());
             ui.end_row();
-            for k in ["text", "pdf", "images"] {
+            for k in ["text", "pdf", "images", "email"] {
                 if let Some(x) = v.get(k) {
                     ui.label(k);
                     ui.label(fmt_int(x["files"].as_u64().unwrap_or(0)));
@@ -4500,6 +4529,34 @@ impl App {
         }
     }
 
+    fn duplicate_folders_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Carpetas duplicadas", "Duplicate folders"));
+        ui.label(format!(
+            "{} carpetas · {} grupos · {} redundantes · modo {}",
+            v["folders"],
+            v["groups"],
+            fmt_size(v["redundant_bytes"].as_u64().unwrap_or(0)),
+            mode_es(v)
+        ));
+        ui.label(RichText::new(v["note"].as_str().unwrap_or("")).weak());
+        let empty: Vec<serde_json::Value> = Vec::new();
+        for g in v["items"].as_array().unwrap_or(&empty) {
+            ui.separator();
+            ui.label(RichText::new(format!(
+                "{} copias · {} redundantes · conservar: {}",
+                g["copies"],
+                fmt_size(g["redundant_bytes"].as_u64().unwrap_or(0)),
+                g["keep_suggestion"].as_str().unwrap_or("")
+            )).strong());
+            for c in g["items"].as_array().unwrap_or(&empty) {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{:>9}", fmt_size(c["bytes"].as_u64().unwrap_or(0))));
+                    ui.label(RichText::new(c["path"].as_str().unwrap_or("")).size(10.0));
+                });
+            }
+        }
+    }
+
     fn github_clones_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
         ui.heading(tr("GitHub multicopia", "GitHub clones"));
         ui.label(format!(
@@ -4725,7 +4782,6 @@ impl App {
                 ),
             );
         }
-        let empty: Vec<serde_json::Value> = Vec::new();
         if let Some(arr) = v["top_missing"].as_array()
             && !arr.is_empty()
         {
@@ -5075,6 +5131,7 @@ impl App {
             Some("wsl_docker") => self.wsl_report_ui(ui, v),
             Some("forecast") => self.forecast_report_ui(ui, v),
             Some("github_clones") => self.github_clones_report_ui(ui, v),
+            Some("duplicate_folders") => self.duplicate_folders_report_ui(ui, v),
             _ => {
                 ui.add(
                     egui::Label::new(

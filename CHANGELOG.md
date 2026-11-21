@@ -3,6 +3,24 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.18.0] - 2026-11-21
+
+### Added
+- **Exportar análisis a HTML**: botón **Guardar HTML** en la ventana de resultados; genera un
+  documento autocontenido y escapado en `%LOCALAPPDATA%\WizEverything\reports`.
+- **Buscar en correo**: `.eml` con decodificación MIME, quoted-printable y base64; `.msg` de Outlook
+  con extracción aproximada de cadenas UTF-16. Se suman al índice de contenido y a `content_search`.
+- **Comparar dos máquinas**: `machine_compare` cruza dos `.wzsnap`/`.ecat` por hash de ruta y muestra
+  sólo en A, sólo en B, archivos que crecieron y que se achicaron.
+- **Carpetas duplicadas (rápido, exp)**: análisis estructural por nombres y tamaños, con grupos
+  anidados marcados para no inflar los bytes redundantes; no borra nada.
+- **Límites de OCR por página/proceso**: `pdftotext`, `pdftoppm` y `tesseract` se cortan por tiempo
+  para que un PDF o una imagen dañada no cuelguen la búsqueda.
+
+### Changed
+- Los snapshots nuevos incluyen marcadores de directorio (`ATTR_DIRECTORY`) para reconstruir rutas
+  completas; el diff los ignora, así que los totales de archivos no cambian.
+
 ## [0.17.0] - 2026-11-20
 
 ### Added
