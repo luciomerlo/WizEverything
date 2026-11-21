@@ -23,6 +23,8 @@ pub const APP_WIZ: &str = "WizEverything";
 pub const APP_SORT: &str = "SortEverything";
 /// Un lease sin latido durante este tiempo se considera abandonado.
 pub const LEASE_TTL_SECS: i64 = 300;
+/// Tope compartido con SortEverything: 48.000 caracteres por documento.
+pub const MAX_TEXT_CHARS: usize = 48_000;
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
@@ -188,6 +190,11 @@ pub fn get(conn: &Connection, path: &str, size: u64, mtime: i64) -> Option<(Stri
 
 /// Guarda/actualiza el texto extraído. Sólo el dueño del lease debería llamar.
 pub fn put(conn: &Connection, path: &str, size: u64, mtime: i64, kind: &str, text: &str) -> Result<(), String> {
+    let text: String = if text.chars().count() > MAX_TEXT_CHARS {
+        text.chars().take(MAX_TEXT_CHARS).collect()
+    } else {
+        text.to_string()
+    };
     conn.execute(
         "INSERT INTO docs(path, size, mtime, kind, text, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, kind=excluded.kind,
@@ -323,6 +330,10 @@ mod tests {
         assert!(!claim(&c, APP_WIZ).unwrap());
         c.execute("UPDATE lease SET heartbeat = 0 WHERE id = 1", []).unwrap();
         assert!(claim(&c, APP_WIZ).unwrap());
+        let long = "x".repeat(MAX_TEXT_CHARS + 100);
+        put(&c, r"C:\long.txt", 1, 1, "text", &long).unwrap();
+        let (_, stored) = get(&c, r"C:\long.txt", 1, 1).unwrap();
+        assert_eq!(stored.chars().count(), MAX_TEXT_CHARS);
         let _ = std::fs::remove_file(&p);
     }
 }

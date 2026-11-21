@@ -33,7 +33,8 @@ CREATE TABLE lease(
 );
 ```
 `docs` guarda el texto extraído por archivo y su versión exacta (`size`+`mtime`). `kind` es
-`text|document|presentation|sheet|pdf|ocr`.
+`text|document|presentation|sheet|pdf|ocr`. El texto se trunca a **48.000 caracteres** por documento.
+Correo (`.eml`/`.msg`) no se indexa y no existe `kind=mail`.
 
 ## API idéntica en ambos repos (`content_index`)
 - `db_path() -> PathBuf`
@@ -42,7 +43,7 @@ CREATE TABLE lease(
 - `heartbeat(&Connection, app) -> Result<(), String>`
 - `release(&Connection, app) -> Result<(), String>`
 - `get(&Connection, path, size, mtime) -> Option<(kind, text)>`
-- `put(&Connection, path, size, mtime, kind, text) -> Result<(), String>`
+- `put(&Connection, path, size, mtime, kind, text) -> Result<(), String>` (trunca a 48.000 chars)
 - `prune(&Connection, missing) -> Result<usize, String>`
 - `stats(&Connection) -> Value`
 - `lease_status(&Connection) -> Value`

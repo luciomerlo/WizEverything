@@ -8,8 +8,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 - **Exportar análisis a HTML**: botón **Guardar HTML** en la ventana de resultados; genera un
   documento autocontenido y escapado en `%LOCALAPPDATA%\WizEverything\reports`.
-- **Buscar en correo**: `.eml` con decodificación MIME, quoted-printable y base64; `.msg` de Outlook
-  con extracción aproximada de cadenas UTF-16. Se suman al índice de contenido y a `content_search`.
 - **Comparar dos máquinas**: `machine_compare` cruza dos `.wzsnap`/`.ecat` por hash de ruta y muestra
   sólo en A, sólo en B, archivos que crecieron y que se achicaron.
 - **Carpetas duplicadas (rápido, exp)**: análisis estructural por nombres y tamaños, con grupos
@@ -20,8 +18,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Fixed
 - Carpetas duplicadas: el marcado de grupos anidados ya no es O(N²); los totales se calculan antes
   del límite y las carpetas con un solo archivo grande también entran.
-- Correo: se descartan adjuntos (`Content-Disposition: attachment`) y partes que no son texto; se
-  decodifican charset y encabezados RFC 2047.
 - OCR: directorio temporal único por búsqueda y limpieza de procesos colgados; se evita dejar
   archivos temporales si falla el lanzamiento.
 - `machine_compare`: avisa cuando menos del 5% de las rutas coinciden, acepta `strip_a`/`strip_b`
@@ -29,8 +25,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   También se puede lanzar desde **Planificación → A:/B:** en la app.
 - El presupuesto de `content_search` ahora se reparte entre `pdftotext`, rasterización y cada página
   de OCR, en vez de comprobarse sólo entre archivos.
+- **WOF LZX/XPRESS**: los `FSCTL_SET_EXTERNAL_BACKING`/`FSCTL_DELETE_EXTERNAL_BACKING` usaban los
+  números de función 243/245 en vez de 195/197; Windows devolvía `ERROR_INVALID_FUNCTION` y la app
+  concluía que el volumen no soportaba WOF. Ahora comprime y se verifica con un archivo de prueba.
 
 ### Changed
+- **Correo fuera de la búsqueda de contenido**: `.eml` y `.msg` no se indexan ni se buscan por dentro;
+  `.msg` es OLE binario y `.eml` quedó excluido por decisión de producto.
 - Los snapshots nuevos incluyen marcadores de directorio (`ATTR_DIRECTORY`) para reconstruir rutas
   completas; el diff los ignora, así que los totales de archivos no cambian.
 

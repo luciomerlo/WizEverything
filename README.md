@@ -115,8 +115,7 @@ exposed both in the desktop app and through the MCP server.
   it, with age and risk (safe / review / keep). Dry-run: nothing is deleted.
 - **HTML export** — the open analysis window has **Save HTML**: a self-contained, escaped report
   written to `%LOCALAPPDATA%\WizEverything\reports` (nothing leaves the machine).
-- **Email search (exp)** — `.eml` (MIME, quoted-printable/base64) and `.msg` (approximate UTF-16
-  extraction) inside `content_search`.
+- **Correo no indexado**: `.eml` y `.msg` no se buscan por dentro; siguen contando como tipo de archivo.
 - **Compare machines (exp)** — `machine_compare` crosses two `.wzsnap`/`.ecat` files by path hash:
   only in A, only in B, grown and shrunk. New snapshots include directory markers so paths are readable;
   `strip_a`/`strip_b` remove different drive/user roots before matching. The planning panel has

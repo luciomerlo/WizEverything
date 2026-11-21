@@ -2469,7 +2469,7 @@ impl App {
             ui.label(RichText::new(tr("Archivos", "Files")).strong());
             ui.label(RichText::new(tr("Tamaño", "Size")).strong());
             ui.end_row();
-            for k in ["text", "pdf", "images", "email"] {
+            for k in ["text", "pdf", "images"] {
                 if let Some(x) = v.get(k) {
                     ui.label(k);
                     ui.label(fmt_int(x["files"].as_u64().unwrap_or(0)));
