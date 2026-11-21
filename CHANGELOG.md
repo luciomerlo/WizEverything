@@ -24,8 +24,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   decodifican charset y encabezados RFC 2047.
 - OCR: directorio temporal único por búsqueda y limpieza de procesos colgados; se evita dejar
   archivos temporales si falla el lanzamiento.
-- `machine_compare`: avisa cuando menos del 5% de las rutas coinciden (otra unidad/usuario/raíz) y
-  limita el tamaño de snapshots y la descompresión de `.ecat`.
+- `machine_compare`: avisa cuando menos del 5% de las rutas coinciden, acepta `strip_a`/`strip_b`
+  para quitar raíces distintas y limita el tamaño de snapshots y la descompresión de `.ecat`.
+- El presupuesto de `content_search` ahora se reparte entre `pdftotext`, rasterización y cada página
+  de OCR, en vez de comprobarse sólo entre archivos.
 
 ### Changed
 - Los snapshots nuevos incluyen marcadores de directorio (`ATTR_DIRECTORY`) para reconstruir rutas

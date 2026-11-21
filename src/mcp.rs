@@ -505,7 +505,10 @@ pub fn tools() -> Value {
         { "name": "github_clones", "description": "Groups local Git clones by origin URL under 'path' and estimates redundant bytes. Read-only; no fetch, no delete. Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path, "all_drives": { "type": "boolean", "description": "Scan every included drive when no path is given." }, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast caps at 500 repos." }, "limit": limit }, "required": ["path"] } },
         { "name": "machine_compare", "description": "Compares two .wzsnap/.ecat files (two machines or volumes) by path hash: only in A, only in B, grown, shrunk. Read-only. Experimental.", "annotations": ro,
-          "inputSchema": { "type": "object", "properties": { "a": { "type": "string", "description": "First snapshot/catalog path." }, "b": { "type": "string", "description": "Second snapshot/catalog path." }, "limit": limit }, "required": ["a", "b"] } },
+          "inputSchema": { "type": "object", "properties": { "a": { "type": "string", "description": "First snapshot/catalog path." }, "b": { "type": "string", "description": "Second snapshot/catalog path." },
+            "strip_a": { "type": "string", "description": "Optional root to strip from A before matching (different drive/user)." },
+            "strip_b": { "type": "string", "description": "Optional root to strip from B before matching." },
+            "limit": limit }, "required": ["a", "b"] } },
         { "name": "refresh", "description": "Reload the index from the active engine (Everything or Census).", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])

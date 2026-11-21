@@ -38,18 +38,59 @@ fn path_of(e: &Entry, map: &HashMap<u64, &Entry>) -> String {
             break;
         }
         parts.push(p.name.clone());
-        parent = p.parent_hash;
+        let next = p.parent_hash;
+        if next == parent {
+            break;
+        }
+        parent = next;
     }
     parts.reverse();
     parts.join("\\")
 }
 
+fn strip_prefix(path: &str, prefix: Option<&str>) -> String {
+    let Some(pre) = prefix.map(|p| p.trim_end_matches('\\')) else {
+        return path.to_string();
+    };
+    if pre.is_empty() {
+        return path.to_string();
+    }
+    if path.to_lowercase().starts_with(&pre.to_lowercase()) {
+        return path.get(pre.len()..).unwrap_or(path).trim_start_matches('\\').to_string();
+    }
+    path.to_string()
+}
+
+fn key_of(e: &Entry, map: &HashMap<u64, &Entry>, strip: Option<&str>) -> String {
+    // Sin prefijo, el hash de ruta es exacto y evita colisiones de nombres.
+    if strip.is_none() {
+        return format!("#{:016x}", e.path_hash);
+    }
+    strip_prefix(&path_of(e, map), strip).to_lowercase()
+}
+
 /// Compara A (máquina/volumen 1) contra B (máquina/volumen 2).
 pub fn compare(a_path: &str, b_path: &str, limit: usize) -> Result<Value, String> {
+    compare_stripped(a_path, b_path, limit, None, None)
+}
+
+/// Igual que [`compare`], pero quita una raíz distinta en cada lado antes de
+/// cruzar (`C:\Users\Lucio` vs `C:\Users\Otro`).
+pub fn compare_stripped(
+    a_path: &str,
+    b_path: &str,
+    limit: usize,
+    strip_a: Option<&str>,
+    strip_b: Option<&str>,
+) -> Result<Value, String> {
     let (name_a, a) = load(a_path)?;
     let (name_b, b) = load(b_path)?;
     let map_a: HashMap<u64, &Entry> = a.entries.iter().map(|e| (e.path_hash, e)).collect();
     let map_b: HashMap<u64, &Entry> = b.entries.iter().map(|e| (e.path_hash, e)).collect();
+    let key_a = |e: &Entry| key_of(e, &map_a, strip_a);
+    let key_b = |e: &Entry| key_of(e, &map_b, strip_b);
+    let map_a_keys: HashMap<String, &Entry> = a.entries.iter().map(|e| (key_a(e), e)).collect();
+    let map_b_keys: HashMap<String, &Entry> = b.entries.iter().map(|e| (key_b(e), e)).collect();
 
     let files_a = a.entries.iter().filter(|e| !crate::snapshot::is_directory(e)).count();
     let files_b = b.entries.iter().filter(|e| !crate::snapshot::is_directory(e)).count();
@@ -62,7 +103,7 @@ pub fn compare(a_path: &str, b_path: &str, limit: usize) -> Result<Value, String
     let (mut only_a_n, mut only_b_n, mut grown_n, mut shrunk_n) = (0u64, 0u64, 0u64, 0u64);
 
     for e in a.entries.iter().filter(|e| !crate::snapshot::is_directory(e)) {
-        match map_b.get(&e.path_hash) {
+        match map_b_keys.get(&key_a(e)) {
             None => {
                 only_a_n += 1;
                 only_a_bytes += e.logical_size;
@@ -91,7 +132,7 @@ pub fn compare(a_path: &str, b_path: &str, limit: usize) -> Result<Value, String
         }
     }
     for e in b.entries.iter().filter(|e| !crate::snapshot::is_directory(e)) {
-        if !map_a.contains_key(&e.path_hash) {
+        if !map_a_keys.contains_key(&key_b(e)) {
             only_b_n += 1;
             only_b_bytes += e.logical_size;
             if only_b.len() < limit {
@@ -118,6 +159,8 @@ pub fn compare(a_path: &str, b_path: &str, limit: usize) -> Result<Value, String
         "a": { "label": name_a, "file": a_path, "entries": a.entries.len(), "bytes": total_a },
         "b": { "label": name_b, "file": b_path, "entries": b.entries.len(), "bytes": total_b },
         "net_bytes": total_b as i64 - total_a as i64,
+        "strip_a": strip_a,
+        "strip_b": strip_b,
         "overlap_pct": (overlap * 10.0).round() / 10.0,
         "warnings": warnings,
         "only_a": { "files": only_a_n, "bytes": only_a_bytes, "top": only_a },
@@ -131,6 +174,12 @@ pub fn compare(a_path: &str, b_path: &str, limit: usize) -> Result<Value, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_prefix_removes_only_a_root() {
+        assert_eq!(strip_prefix(r"C:\Users\me\a.bin", Some(r"C:\Users\me")), r"a.bin");
+        assert_eq!(strip_prefix(r"D:\x\a.bin", Some(r"C:\Users\me")), r"D:\x\a.bin");
+    }
 
     #[test]
     fn paths_are_reconstructed() {

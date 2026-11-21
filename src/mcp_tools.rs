@@ -355,7 +355,13 @@ fn push_dirs(t: &Tree, root: u32, entries: &mut Vec<crate::snapshot::Entry>, max
             continue;
         }
         let path = PathBuf::from(t.full_path(id));
-        entries.push(crate::snapshot::Entry::from_path(&path, 0, 0, 0, crate::snapshot::ATTR_DIRECTORY));
+        let mut e = crate::snapshot::Entry::from_path(&path, 0, 0, 0, crate::snapshot::ATTR_DIRECTORY);
+        // El nombre de una raíz `C:\` suele venir vacío; sin él no se puede
+        // mostrar ni quitar el prefijo de unidad al comparar máquinas.
+        if t.nodes[id as usize].parent == ROOT && e.name.is_empty() {
+            e.name = t.name(id).trim_end_matches('\\').to_string();
+        }
+        entries.push(e);
         for &c in t.children(id) {
             if t.nodes[c as usize].is_dir() {
                 stack.push(c);
@@ -399,7 +405,9 @@ pub fn snapshot_save(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
 pub fn machine_compare(a: &Value, limit: usize) -> Result<Value, String> {
     let pa = a.get("a").and_then(Value::as_str).ok_or("missing 'a' (snapshot or catalog path)")?;
     let pb = a.get("b").and_then(Value::as_str).ok_or("missing 'b' (snapshot or catalog path)")?;
-    crate::compare::compare(pa, pb, limit)
+    let sa = a.get("strip_a").and_then(Value::as_str);
+    let sb = a.get("strip_b").and_then(Value::as_str);
+    crate::compare::compare_stripped(pa, pb, limit, sa, sb)
 }
 
 /// M4 — compara dos snapshots `.wzsnap`.

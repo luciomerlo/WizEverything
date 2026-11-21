@@ -341,19 +341,30 @@ fn eml_multipart(raw: &str, ctype: &str, depth: usize) -> String {
         return String::new();
     }
     let Some(b) = boundary_of(ctype) else { return String::new() };
+    let alternative = ctype.contains("multipart/alternative");
     let mut out = String::new();
+    let mut html = String::new();
     for part in raw.split(&format!("--{b}")) {
         let p = part.trim_start_matches('\n');
         if p.starts_with("--") || p.trim().is_empty() {
             continue;
         }
+        let pctype = header(p, "content-type").unwrap_or_default().to_ascii_lowercase();
         let t = eml_part(p, depth + 1);
-        if !t.trim().is_empty() {
+        if t.trim().is_empty() {
+            continue;
+        }
+        // En alternative, texto plano y HTML son el mismo mensaje: quedarse con uno.
+        if alternative && pctype.contains("text/html") {
+            if html.is_empty() {
+                html = t;
+            }
+        } else {
             out.push_str(&t);
             out.push('\n');
         }
     }
-    out
+    if out.trim().is_empty() { html } else { out }
 }
 
 fn eml_part(raw: &str, depth: usize) -> String {
@@ -399,6 +410,16 @@ fn eml_text(raw: &str) -> String {
 
 /// Extrae texto de `path`. En fast no hace OCR ni abre imágenes.
 pub fn extract(path: &Path, deep: bool, tools: &Tools) -> Option<Extracted> {
+    extract_with_budget(path, deep, tools, 120_000)
+}
+
+fn budget_secs(started: Instant, budget_ms: u128) -> u64 {
+    let left = budget_ms.saturating_sub(started.elapsed().as_millis());
+    if left == 0 { 0 } else { ((left + 999) / 1000).max(1) as u64 }
+}
+
+fn extract_with_budget(path: &Path, deep: bool, tools: &Tools, budget_ms: u128) -> Option<Extracted> {
+    let started = Instant::now();
     let ext = ext_of(path);
     if TEXT_EXT.contains(&ext.as_str()) {
         use std::io::Read;
@@ -486,27 +507,35 @@ pub fn extract(path: &Path, deep: bool, tools: &Tools) -> Option<Extracted> {
             cmd.args(["-l", "3"]);
         }
         cmd.arg(path).arg("-");
-        let text = run_stdout_timeout(cmd, if deep { 60 } else { 20 }).unwrap_or_default();
+        let left = budget_secs(started, budget_ms);
+        if left == 0 {
+            return None;
+        }
+        let text = run_stdout_timeout(cmd, left.min(if deep { 60 } else { 20 })).unwrap_or_default();
         if text.trim().is_empty() {
             if deep && tools.tesseract {
                 // PDF escaneado: se rasteriza con pdftoppm y se pasa a tesseract.
-                return ocr_pdf(path, tools, deep);
+                return ocr_pdf(path, tools, deep, budget_ms, started);
             }
             return Some(Extracted { text, kind: "pdf", note: "Sin capa de texto; probá profundo con OCR.".into() });
         }
         return Some(Extracted { text, kind: "pdf", note: String::new() });
     }
     if deep && IMAGE_EXT.contains(&ext.as_str()) && tools.tesseract {
+        let left = budget_secs(started, budget_ms);
+        if left == 0 {
+            return None;
+        }
         let mut cmd = Command::new("tesseract");
         cmd.arg(path).arg("stdout").args(["-l", "spa+eng", "--psm", "3"]);
-        if let Some(text) = run_stdout_timeout(cmd, 25) {
+        if let Some(text) = run_stdout_timeout(cmd, left.min(25)) {
             return Some(Extracted { text, kind: "ocr", note: String::new() });
         }
     }
     None
 }
 
-fn ocr_pdf(path: &Path, tools: &Tools, deep: bool) -> Option<Extracted> {
+fn ocr_pdf(path: &Path, tools: &Tools, deep: bool, budget_ms: u128, started: Instant) -> Option<Extracted> {
     if !tools.pdftotext || !tools.tesseract {
         return None;
     }
@@ -518,7 +547,12 @@ fn ocr_pdf(path: &Path, tools: &Tools, deep: bool) -> Option<Extracted> {
     let max_pages = if deep { 20 } else { 1 };
     let mut raster = Command::new("pdftoppm");
     raster.args(["-f", "1", "-l", &max_pages.to_string(), "-r", "200", "-png"]).arg(path).arg(&out);
-    let ok = status_timeout(raster, 180);
+    let left = budget_secs(started, budget_ms);
+    if left == 0 {
+        let _ = std::fs::remove_dir_all(&dir);
+        return None;
+    }
+    let ok = status_timeout(raster, left.min(180));
     if !ok {
         let _ = std::fs::remove_dir_all(&dir);
         return None;
@@ -813,7 +847,12 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
                 }
             }
             None => {
-                let Some(ex) = extract(path, deep, &tools) else { continue };
+                let left = budget_ms.saturating_sub(started.elapsed().as_millis());
+                if left == 0 {
+                    partial = true;
+                    break;
+                }
+                let Some(ex) = extract_with_budget(path, deep, &tools, left) else { continue };
                 if !ex.note.is_empty() && notes.len() < 30 {
                     notes.push(format!("{}: {}", p, ex.note));
                 }

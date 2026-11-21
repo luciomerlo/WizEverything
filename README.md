@@ -118,7 +118,8 @@ exposed both in the desktop app and through the MCP server.
 - **Email search (exp)** — `.eml` (MIME, quoted-printable/base64) and `.msg` (approximate UTF-16
   extraction) inside `content_search`.
 - **Compare machines (exp)** — `machine_compare` crosses two `.wzsnap`/`.ecat` files by path hash:
-  only in A, only in B, grown and shrunk. New snapshots include directory markers so paths are readable.
+  only in A, only in B, grown and shrunk. New snapshots include directory markers so paths are readable;
+  `strip_a`/`strip_b` remove different drive/user roots before matching.
 - **Age heatmap, WSL/Docker, disk forecast and GitHub multicopy** (exp) — bytes per age bucket,
   VHDX space recoverable by compaction, days until the drive is full from saved snapshots, and
   local Git clones grouped by remote with redundant bytes.

@@ -159,6 +159,19 @@ fn reports_dir() -> PathBuf {
     base.join("WizEverything").join("reports")
 }
 
+fn prune_old(keep: usize) {
+    let Ok(rd) = std::fs::read_dir(reports_dir()) else { return };
+    let mut files: Vec<PathBuf> = rd
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()).is_some_and(|x| x.eq_ignore_ascii_case("html")))
+        .collect();
+    files.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    for p in files.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// Guarda el reporte y devuelve la ruta del HTML.
 pub fn save(title: &str, v: &Value) -> Result<PathBuf, String> {
     if v.get("error").is_some() {
@@ -172,6 +185,7 @@ pub fn save(title: &str, v: &Value) -> Result<PathBuf, String> {
         .unwrap_or(0);
     let file = dir.join(format!("wize-{stamp}.html"));
     std::fs::write(&file, html(title, v)).map_err(|e| format!("No pude escribir {}: {e}", file.display()))?;
+    prune_old(50);
     Ok(file)
 }
 
