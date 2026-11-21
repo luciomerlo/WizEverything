@@ -2132,6 +2132,7 @@ impl App {
                     );
                     if r.lost_focus() {
                         self.settings.save();
+                        self.setup_det = None; // redetectar con la ruta nueva
                     }
                     if let Some(p) = &det.census_installed {
                         if det.census_running {
