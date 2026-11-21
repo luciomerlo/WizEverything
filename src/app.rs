@@ -539,6 +539,8 @@ pub struct App {
     /// Snapshots/catálogos para comparar dos máquinas.
     machine_a: String,
     machine_b: String,
+    machine_strip_a: String,
+    machine_strip_b: String,
 
     // incremental sync
     sync_rx: Option<Receiver<(u64, String, Result<Vec<Change>, String>)>>,
@@ -683,6 +685,8 @@ impl App {
             plan_target_gb: 100,
             machine_a: String::new(),
             machine_b: String::new(),
+            machine_strip_a: String::new(),
+            machine_strip_b: String::new(),
             sync_rx: None,
             pending_changes: None,
             sync_stamp: String::new(),
@@ -2175,20 +2179,32 @@ impl App {
                         if ui
                             .button(tr("Comparar", "Compare"))
                             .on_hover_text(tr(
-                                "Cruza dos snapshots por ruta. Si las máquinas usan distinta unidad o usuario, usá el MCP con strip_a/strip_b. (Experimental)",
-                                "Crosses two snapshots by path. If the machines use a different drive/user, use MCP with strip_a/strip_b. (Experimental)",
+                                "Cruza dos snapshots por ruta. Si las máquinas usan distinta unidad o usuario, completá «Quitar raíz» en cada lado. (Experimental)",
+                                "Crosses two snapshots by path. If the machines use a different drive/user, fill «Strip root» on each side. (Experimental)",
                             ))
                             .clicked()
                         {
-                            let args = serde_json::json!({
+                            let mut args = serde_json::json!({
                                 "a": self.machine_a.trim(),
                                 "b": self.machine_b.trim(),
                             });
+                            if !self.machine_strip_a.trim().is_empty() {
+                                args["strip_a"] = serde_json::json!(self.machine_strip_a.trim());
+                            }
+                            if !self.machine_strip_b.trim().is_empty() {
+                                args["strip_b"] = serde_json::json!(self.machine_strip_b.trim());
+                            }
                             self.set_report(
                                 tr("Comparar máquinas (exp)", "Compare machines (exp)"),
                                 crate::mcp_tools::machine_compare(&args, 20),
                             );
                         }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(tr("Quitar raíz A:", "Strip root A:"));
+                        ui.add(egui::TextEdit::singleline(&mut self.machine_strip_a).desired_width(240.0).hint_text(tr(r"ej. C:\Users\Lucio", r"e.g. C:\Users\Lucio")));
+                        ui.label(tr("B:", "B:"));
+                        ui.add(egui::TextEdit::singleline(&mut self.machine_strip_b).desired_width(240.0));
                     });
                 });
             }
