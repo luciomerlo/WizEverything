@@ -15,7 +15,9 @@ tengan límites claros y para detectar solapamientos antes de que se conviertan 
 |---|---|---|
 | **WizEverything** | Analizador de uso de disco y contenido | “¿Qué ocupa espacio, qué es, y qué puedo hacer con esto?” |
 | **SortEverything** | Organizador con plan y deshacer | “¿Dónde debería estar este archivo y cómo lo muevo sin romper nada?” |
-| **Census** | Motor de índice NTFS/MFT | “¿Qué archivos existen en este volumen, ahora, sin recorrerlos?” |
+| **Census** | Motor de índice NTFS/MFT, **sólo lectura** | “¿Qué archivos existen en este volumen, ahora, sin recorrerlos?” |
+
+**Regla de oro:** Census **lee, no borra**. No mueve, renombra, modifica ni elimina archivos del usuario; sólo escribe su propio estado (`C.wcat`, `pause.json`, `activity-Census.json`) en su carpeta de datos.
 
 ---
 
@@ -99,6 +101,8 @@ tengan límites claros y para detectar solapamientos antes de que se conviertan 
 
 **No hace**
 
+- **No borra, mueve, renombra ni modifica archivos del usuario.** Es read-only sobre el volumen;
+  sólo escribe `C.wcat`, `pause.json` y `activity-Census.json` en su propia carpeta de datos.
 - No extrae texto, no hace OCR, no abre comprimidos, no lee EXIF.
 - No analiza duplicados por contenido ni organiza archivos.
 - No escribe `content-index.sqlite3`; sólo aporta identidad y cambios.
@@ -433,6 +437,9 @@ desbloquean el trabajo de las tres apps.
   Wiz y Census están pendientes. No hay `activity.json` único: cada app escribe el suyo.
 - **Sort standalone** extrae PDF/Office por su cuenta; el modo compartido es una optimización,
   no una dependencia de Wiz.
+
+- **Census es read-only**: no borra, mueve, renombra ni modifica archivos del usuario; sólo
+  escribe su propio estado en `%LOCALAPPDATA%\Census`.
 
 ### Abiertas
 
