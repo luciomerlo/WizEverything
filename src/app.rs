@@ -529,6 +529,11 @@ pub struct App {
     disk_cache: Option<(u32, Instant, Option<(u64, u64)>)>,
     /// Cambió el motor mientras cargaba: recargar al terminar.
     reload_pending: bool,
+    /// Diálogo de instalación cuando no hay ningún motor.
+    setup_open: bool,
+    setup_msg: Option<String>,
+    setup_det: Option<crate::setup::Detection>,
+    setup_det_at: Instant,
 
     // incremental sync
     sync_rx: Option<Receiver<(u64, String, Result<Vec<Change>, String>)>>,
@@ -666,6 +671,10 @@ impl App {
             error_at: Instant::now(),
             disk_cache: None,
             reload_pending: false,
+            setup_open: matches!(crate::everything::status(), crate::everything::Status::NotRunning),
+            setup_msg: None,
+            setup_det: None,
+            setup_det_at: Instant::now() - Duration::from_secs(10),
             sync_rx: None,
             pending_changes: None,
             sync_stamp: String::new(),
@@ -1290,6 +1299,7 @@ impl eframe::App for App {
             self.reload_pending = false;
             self.start_load(ctx);
         }
+        self.setup_ui(ctx);
         self.poll_jobs(ctx);
         self.maybe_sync(ctx);
         if ctx.input(|i| i.viewport().close_requested()) {
@@ -1715,11 +1725,24 @@ impl App {
                 self.settings.engine = engine;
                 crate::everything::set_engine(engine);
                 self.settings.save();
+                if matches!(crate::everything::status(), crate::everything::Status::NotRunning) {
+                    self.setup_open = true;
+                }
                 if self.loading.is_some() {
                     self.reload_pending = true;
                 } else {
                     self.start_load(ctx);
                 }
+            }
+            if ui
+                .button(tr("Instalar o elegir motor…", "Install or choose an engine…"))
+                .on_hover_text(tr(
+                    "Detecta Everything/Census y ofrece instalarlos o indicar dónde está census.exe.",
+                    "Detects Everything/Census and offers installation or a path to census.exe.",
+                ))
+                .clicked()
+            {
+                self.setup_open = true;
             }
             ui.separator();
             // Behaviour
@@ -2024,6 +2047,145 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Diálogo de arranque: no hay ningún motor de índice disponible.
+    fn setup_ui(&mut self, ctx: &egui::Context) {
+        if !self.setup_open {
+            return;
+        }
+        if matches!(crate::everything::status(), crate::everything::Status::Ready) {
+            self.setup_open = false;
+            return;
+        }
+        // `detect` ejecuta `where.exe`: no lo hacer 60 veces por segundo.
+        if self.setup_det.is_none() || self.setup_det_at.elapsed() > Duration::from_secs(2) {
+            self.setup_det = Some(crate::setup::detect(&self.settings.census_path));
+            self.setup_det_at = Instant::now();
+        }
+        let det = self.setup_det.clone().unwrap_or_default();
+        let mut open = self.setup_open;
+        egui::Window::new(tr("Falta un motor de índice", "No index engine found"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(640.0)
+            .show(ctx, |ui| {
+                ui.label(tr(
+                    "WizEverything no recorre el disco: necesita Everything o Census para leer un índice. Elegí uno.",
+                    "WizEverything does not scan the disk: it needs Everything or Census to read an index. Choose one.",
+                ));
+                ui.add_space(8.0);
+                ui.heading("Everything");
+                ui.label(tr(
+                    "La opción completa: todas las unidades, actualización en vivo y menos configuración.",
+                    "The complete option: all drives, live updates and less setup.",
+                ));
+                ui.label(crate::setup::status_text(det.everything_running, det.everything_installed.as_deref()));
+                ui.horizontal(|ui| {
+                    if det.everything_running {
+                        ui.colored_label(Color32::from_rgb(90, 180, 100), tr("Todo listo", "Ready"));
+                    } else if let Some(p) = &det.everything_installed {
+                        if ui.button(tr("Iniciar Everything", "Start Everything")).clicked() {
+                            match crate::setup::start_everything(p) {
+                                Ok(()) => self.setup_msg = Some(tr(
+                                    "Everything se está iniciando. Esperá unos segundos y reintentá.",
+                                    "Everything is starting. Wait a few seconds and retry.",
+                                ).into()),
+                                Err(e) => self.setup_msg = Some(e),
+                            }
+                        }
+                    } else {
+                        if det.winget
+                            && ui
+                                .button(tr("Instalar con winget", "Install with winget"))
+                                .on_hover_text("winget install --id voidtools.Everything -e")
+                                .clicked()
+                        {
+                            match crate::setup::install_everything() {
+                                Ok(()) => self.setup_msg = Some(tr(
+                                    "Instalación iniciada. Completala en la ventana de winget y después tocá Reintentar.",
+                                    "Installation started. Finish it in the winget window, then press Retry.",
+                                ).into()),
+                                Err(e) => self.setup_msg = Some(e),
+                            }
+                        }
+                        if ui.button(tr("Abrir descarga oficial", "Open official download")).clicked() {
+                            crate::setup::open_everything_download();
+                        }
+                    }
+                });
+                ui.add_space(10.0);
+                ui.separator();
+                ui.heading("Census");
+                ui.label(tr(
+                    "Alternativa reducida: un volumen por vez. Requiere `census serve` (elevado para leer la MFT).",
+                    "Reduced alternative: one volume at a time. Requires `census serve` (elevated to read the MFT).",
+                ));
+                ui.label(crate::setup::status_text(det.census_running, det.census_installed.as_deref()));
+                ui.horizontal(|ui| {
+                    ui.label(tr("census.exe:", "census.exe:"));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.settings.census_path)
+                            .hint_text(r"C:\ruta\a\census.exe")
+                            .desired_width(360.0),
+                    );
+                    if r.lost_focus() {
+                        self.settings.save();
+                    }
+                    if let Some(p) = &det.census_installed {
+                        if det.census_running {
+                            ui.colored_label(Color32::from_rgb(90, 180, 100), tr("En ejecución", "Running"));
+                        } else if ui.button(tr("Iniciar Census", "Start Census")).clicked() {
+                            match crate::setup::start_census(p) {
+                                Ok(()) => self.setup_msg = Some(tr(
+                                    "Census se está iniciando. Si Windows pide administrador, aceptalo; después tocá Reintentar.",
+                                    "Census is starting. If Windows asks for administrator, accept it; then press Retry.",
+                                ).into()),
+                                Err(e) => self.setup_msg = Some(e),
+                            }
+                        }
+                        if ui.button(tr("Abrir carpeta", "Open folder")).clicked() {
+                            if let Some(dir) = p.parent() {
+                                crate::setup::open_folder(dir);
+                            }
+                        }
+                    }
+                });
+                if det.census_installed.is_none() {
+                    ui.label(RichText::new(tr(
+                        "No encontrado. Compilá Census (`cargo build --release`) y pegá la ruta de census.exe, o agregalo al PATH.",
+                        "Not found. Build Census (`cargo build --release`) and paste the census.exe path, or add it to PATH.",
+                    )).weak());
+                }
+                if let Some(m) = &self.setup_msg {
+                    ui.add_space(6.0);
+                    ui.label(RichText::new(m).color(Color32::from_rgb(220, 170, 70)));
+                }
+                ui.add_space(10.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button(tr("Reintentar", "Retry")).clicked() {
+                        match crate::everything::status() {
+                            crate::everything::Status::Ready => self.setup_open = false,
+                            crate::everything::Status::Loading => {
+                                self.setup_msg = Some(tr("El motor está cargando; esperá un momento.", "The engine is loading; wait a moment.").into());
+                            }
+                            crate::everything::Status::NotRunning => {
+                                self.setup_msg = Some(tr("Todavía no hay motor. Iniciá o instalá uno.", "Still no engine. Start or install one.").into());
+                                if self.loading.is_none() {
+                                    self.start_load(ctx);
+                                }
+                            }
+                        }
+                    }
+                    if ui.button(tr("Seguir sin índice", "Continue without an index")).clicked() {
+                        self.setup_open = false;
+                    }
+                });
+            });
+        // Si un botón lo cerró, no reabrirlo al final del frame.
+        self.setup_open = self.setup_open && open;
     }
 
     /// Ventana para buscar dentro de archivos, con estimación previa.

@@ -42,6 +42,9 @@ Written in Rust with [egui](https://github.com/emilk/egui).
 - **Index engine selector**: **Auto / Everything / Census** (Opciones → Motor de índice). Auto uses
   Everything when ready and falls back to Census. Census speaks the same `QUERY2W` IPC, so no DLL or
   extra integration is needed; start it with `census serve` (elevated).
+- **Startup setup dialog**: if no engine is detected, WizEverything offers to install Everything with
+  winget (or open the official download) and to point at `census.exe` / start `census serve`. It never
+  downloads or elevates anything without the user pressing the button.
 - **Live updates**: changed files are synced from the active index every 30 s (deletions show on refresh / every 30 min).
 
 ### Duplicates
@@ -114,7 +117,7 @@ exposed both in the desktop app and through the MCP server.
   missing bytes, same-name-different-size and extras only in the backup. Both folders must be indexed.
 - **Action basket** (experimental) — stages hardlink merges, LZX compression and reversible quarantine,
   shows a dry-run estimate, and only executes after an explicit "I understand this modifies files"
-  checkbox. Writes one JSONL line per operation to `%LOCALAPPDATA%\WizEverythingudit.jsonl` and keeps
+  checkbox. Writes one JSONL line per operation to `%LOCALAPPDATA%\WizEverything\audit.jsonl` and keeps
   a manifest so quarantined files can be restored.
 
 Audio A/B and the image zoom comparison are local only: audio is decoded and played through the
@@ -208,7 +211,7 @@ cargo test --release --bin wizeverything -- --include-ignored   # + live tests a
 
 ## Settings
 
-`%APPDATA%\WizEverything\settings.ini` (language, theme, index engine, panels, chart, close to tray, excluded drives).
+`%APPDATA%\WizEverything\settings.ini` (language, theme, index engine and optional census.exe path, panels, chart, close to tray, excluded drives).
 "Start with Windows" writes `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\WizEverything`.
 
 ## Limitations

@@ -32,6 +32,7 @@ mod mcp;
 mod mcp_tools;
 mod reparse;
 mod similar;
+mod setup;
 mod snapshot;
 mod throughput;
 mod timeline;

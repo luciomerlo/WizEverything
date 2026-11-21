@@ -6,6 +6,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [0.17.0] - 2026-11-20
 
 ### Added
+- **Diálogo de arranque sin motor**: si no detecta Everything ni Census, ofrece instalar Everything
+  con winget o abrir la descarga oficial, y permite indicar la ruta de `census.exe` e iniciar
+  `census serve` con elevación. Nada se instala ni se eleva sin que el usuario lo pida.
 - **Census como motor de índice alternativo a Everything.** En Opciones → Motor de índice se elige
   **Auto / Everything / Census**. WizEverything habla el mismo IPC `QUERY2W` (`WM_COPYDATA`) y detecta
   la clase `CENSUS_IPC`; no hace falta DLL ni una integración distinta. Auto prefiere Everything si

@@ -47,7 +47,7 @@ pub struct Item<'a> {
     pub modified: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
     NotRunning,
     Loading,
@@ -106,7 +106,17 @@ fn target() -> Option<(HWND, &'static str)> {
 }
 
 pub fn status() -> Status {
-    let Some((hwnd, _)) = target() else { return Status::NotRunning };
+    status_of(engine())
+}
+
+/// Estado de un motor concreto, sin depender de la preferencia global.
+pub fn status_of(e: IndexEngine) -> Status {
+    let hwnd = match e {
+        IndexEngine::Everything => hwnd_for(IPC_CLASS),
+        IndexEngine::Census => hwnd_for(CENSUS_CLASS),
+        IndexEngine::Auto => return status(),
+    };
+    let Some(hwnd) = hwnd else { return Status::NotRunning };
     if loaded(hwnd) { Status::Ready } else { Status::Loading }
 }
 

@@ -74,6 +74,8 @@ pub struct Settings {
     pub dup_prefer: String,
     /// Groq API key encrypted with DPAPI (hex); never stored in plain text.
     pub groq_key_enc: String,
+    /// Ruta opcional a census.exe si no está en PATH.
+    pub census_path: String,
 }
 
 fn settings_path() -> Option<std::path::PathBuf> {
@@ -101,6 +103,7 @@ impl Settings {
             dup_exclude: Vec::new(),
             dup_exclude_init: false,
             groq_key_enc: String::new(),
+            census_path: String::new(),
             dup_prefer: String::new(),
         };
         for line in text.lines() {
@@ -123,6 +126,7 @@ impl Settings {
                 ("dup_exclude", v) if !v.is_empty() => s.dup_exclude.push(v.to_string()),
                 ("dup_exclude_init", v) => s.dup_exclude_init = v != "0",
                 ("groq_key", v) => s.groq_key_enc = v.to_string(),
+                ("census_path", v) => s.census_path = v.to_string(),
                 ("dup_prefer", v) => s.dup_prefer = v.to_string(),
                 ("excluded_drives", v) => {
                     s.excluded_drives = v.split(',').map(str::trim).filter(|d| !d.is_empty()).map(String::from).collect()
@@ -153,7 +157,7 @@ impl Settings {
             if self.rings { "rings" } else { "treemap" },
             self.close_to_tray as u8,
             self.excluded_drives.join(","),
-        ) + &format!("dup_exclude_init={}\ngroq_key={}\ndup_prefer={}\n", self.dup_exclude_init as u8, self.groq_key_enc, self.dup_prefer)
+        ) + &format!("census_path={}\ndup_exclude_init={}\ngroq_key={}\ndup_prefer={}\n", self.census_path, self.dup_exclude_init as u8, self.groq_key_enc, self.dup_prefer)
             + &self.dup_exclude.iter().map(|d| format!("dup_exclude={d}\n")).collect::<String>()
     }
 
@@ -186,6 +190,7 @@ mod tests {
         s.lang = Lang::En;
         s.theme = Theme::Dark;
         s.engine = IndexEngine::Census;
+        s.census_path = r"C:\Tools\census.exe".into();
         s.rings = true;
         s.show_exts = false;
         s.close_to_tray = false;
@@ -194,6 +199,7 @@ mod tests {
         assert_eq!(back.lang, Lang::En);
         assert_eq!(back.theme, Theme::Dark);
         assert_eq!(back.engine, IndexEngine::Census);
+        assert_eq!(back.census_path, r"C:\Tools\census.exe");
         assert!(back.rings && !back.show_exts && !back.close_to_tray && back.show_treemap);
         assert_eq!(back.excluded_drives, vec!["H:", "X:"]);
     }
