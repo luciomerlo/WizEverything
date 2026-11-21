@@ -1,6 +1,6 @@
 # Reparto de funciones — WizEverything / SortEverything / Census
 
-**Estado:** borrador vivo. Última actualización: 2026-11-21.
+**Estado:** borrador vivo. Última actualización: 2026-11-21 (revisión de Census).
 **Fuente única de este documento:** `C:\Users\Lucio\Downloads\WizEverything\docs\APP-ROLES.md`.
 Si otra app necesita corregir algo, que lo pida; no se duplica el documento en tres repos.
 
@@ -71,19 +71,42 @@ tengan límites claros y para detectar solapamientos antes de que se conviertan 
 
 - Lee la MFT de NTFS y mantiene el índice en RAM (arrays planos + arena UTF-16).
 - Snapshot propio por volumen: `%LOCALAPPDATA%\Census\C.wcat` (`CENSUSWCAT`, checksum FNV-1a).
-- Servidor IPC `QUERY2W` (clase `CENSUS_IPC`) compatible con el protocolo de Everything.
-- Consultas por nombre, ruta, tipo, tamaño, fecha, extensión y términos.
+- Servidor IPC `QUERY2W`, registrado en **dos clases**: `CENSUS_IPC` y
+  `EVERYTHING_TASKBAR_NOTIFICATION`.
+- **Búsqueda por fragmentos**: cada término se busca como subcadena (sin distinguir mayúsculas
+  ni acentos) en el nombre del archivo y en las carpetas que lo contienen. Sin regex ni comodines.
+  La única alternativa es lenguaje natural con Groq (`census ask`), que traduce a las herramientas MCP.
+- El **parser de IPC sigue aceptando** `path:`, `ext:`, `size:`, `dm:`, `rc:` y `file:`/`folder:`
+  porque Wiz/Sort mandan esas consultas. Lo que desapareció es la superficie de operadores en la
+  ventana de Census, no el protocolo.
 - MCP por stdio, CLI (`index`, `query`, `serve`, `mcp`, `gui`, `drives`, `bench`, `ask`).
 - Búsqueda en lenguaje natural con Groq (opcional).
-- En progreso: delta por USN Journal, identidad `vol_serial` + `frn` por IPC, shim
-  `Everything64.dll` con exports reales, robustez de `serve`.
+- Ventana vacía estilo Everything: la tabla aparece sólo cuando hay resultados. **No muestra
+  árbol de carpetas ni treemap**; eso es de Wiz.
+- Residente **sólo por el USN**, para no perder el delta. Escaneo completo de MFT, `--rebuild` y
+  releer una unidad son **forzados**; el replay de USN al arrancar sólo se permite si es corto
+  (≤ 1 s de journal) y se anuncia en `activity.json`.
+- Pausa implementada: `%LOCALAPPDATA%\Census\pause.json`, `census pause --until 22:00 | --for 8h`,
+  `census resume`; en pausa reusa el snapshot aunque esté viejo y las consultas siguen respondiendo.
+- En progreso: C1 identidad `vol_serial`+`frn`, C2 delta USN, C4 `nightly-state`, C5 nube explícita,
+  C6 locks/`activity.json`, robustez de `serve`.
+- El shim `Everything64.dll` está **diferido/opcional**: Sort no lo necesita; usa `WM_COPYDATA`
+  para Census y la DLL real sólo para Everything 1.4.
+- Capacidades: `reply.flags` anuncia sólo los campos que viajan, con
+  `PARTIAL_METADATA = 0x8000` cuando falta `run_count`. `serve` aplica
+  `ChangeWindowMessageFilterEx` a `WM_COPYDATA`, `WM_USER+401` y `WM_USER+402`: un cliente no
+  elevado puede consultar un Census elevado; lo inverso no.
 
 **No hace**
 
 - No extrae texto, no hace OCR, no abre comprimidos, no lee EXIF.
 - No analiza duplicados por contenido ni organiza archivos.
 - No escribe `content-index.sqlite3`; sólo aporta identidad y cambios.
-- No debe indexar Google Drive/volúmenes virtuales como si fueran NTFS.
+- No indexa Google Drive/volúmenes virtuales por defecto. Hoy `index_all()` todavía recorre
+  G:/H:; C5 lo corrige: nube excluida por defecto, `census drives` la marca
+  `virtual · no indexable`, y `--include-cloud` sólo enumera metadata, sin abrir archivos.
+- No hace árbol de carpetas ni treemap en su UI.
+- No autoindexa MFT ni hace replay largo de USN sin forzarlo.
 
 ---
 
@@ -103,7 +126,7 @@ tengan límites claros y para detectar solapamientos antes de que se conviertan 
 | Snapshots de inventario `.ecat` / `.wzsnap` | **Wiz** | Sort/otras herramientas |
 | Snapshot de índice `.wcat` | **Census** | Wiz vía IPC |
 | Informe HTML, comparación de máquinas | **Wiz** | — |
-| Pausa/checkpoint de trabajo pesado | Cada app | — |
+| Pausa/checkpoint de trabajo pesado | Cada app | Census ya; Wiz P0; Sort pendiente |
 | Locks de disco/GPU/nube y avisos de conflicto | Contrato compartido | Las tres |
 | Prioridad en contención | **Wiz** | Census/Sort ceden |
 
@@ -115,23 +138,34 @@ Reglas vigentes acordadas con las tres apps:
 
 1. **Wiz y Sort sólo trabajan cuando el usuario los fuerza.** No autoarrancan tandas, no
    escanean al iniciar, no se disparan por horario ni por watcher. Las noches se arman a mano.
-2. **Census sigue residente** para USN/identidad, pero sus tareas pesadas también avisan
-   conflicto y ceden ante Wiz. Si el usuario pide que también sea manual, se cambia.
+2. **Census queda residente sólo por el USN.** Su escaneo completo de MFT, `--rebuild` y la
+   relectura de una unidad son **forzados**, nunca automáticos. El replay de USN al arrancar sólo
+   se permite si el journal es corto (≤ 1 s), se anuncia en `activity.json` y espera si hay otra
+   tarea pesada; si el journal es largo, avisa y pide forzarlo. Si el usuario fuerza Wiz y Census
+   a la vez, Census pausa en el próximo punto seguro.
 3. La exclusión es por **recurso**, no por letra de unidad: `disk:<n>` físico, `cloud:<provider>`,
    `gpu:<n>`, SQLite, snapshots/catálogos y raíces solapadas.
-4. Antes de arrancar y durante la tarea se consulta `%LOCALAPPDATA%\WizeShared\activity.json`.
-   Si hay conflicto: aviso visible (banner + notificación de Windows), con **Cancelar / Esperar /
-   Forzar**. Forzar exige confirmación y queda en el log.
+4. Cuando C6 esté implementado, antes de arrancar y durante la tarea se consultará
+   `%LOCALAPPDATA%\WizeShared\activity.json`. Si hay conflicto: aviso visible (banner +
+   notificación de Windows), con **Cancelar / Esperar / Forzar**. Forzar exige confirmación y queda
+   en el log. Mientras C6 no exista, no hay enforcement automático.
 5. A mitad de conflicto, la app que cede termina la transacción/archivo/miembro actual, guarda
    checkpoint y libera el lock. Nunca deja SQLite a medias.
 6. **Wiz tiene prioridad** si el usuario fuerza varias apps a la vez. Sort/Census pausan en el
    próximo punto seguro y avisan “pausado por WizEverything”.
 7. **Pausa persistente** por app: `pause.json` con `paused`, `resume_at`, `reason`.
    El trabajo pesado se corta en límites seguros; las consultas siguen respondiendo con lo indexado.
+   Census ya la implementó; Wiz la hace en P0; Sort la implementa en su próxima tanda.
 8. **Google Drive/streaming**: metadata-only. No se hidrata, no se hashea, no se hace OCR,
    no se abren comprimidos, no se copia entre volúmenes. Hidratar es una acción explícita aparte.
+   Census además excluye las unidades de nube de `index_all` por defecto (C5); `--include-cloud`
+   sólo enumera directorios y metadata, nunca abre archivos.
 
-### Contrato de locks (propuesto)
+### Contrato de locks (C6, pendiente)
+
+El contrato está acordado, pero **Census todavía no implementa** `activity.json` ni los locks;
+Wiz y Sort tampoco los tienen aún. Hasta que C6 y sus equivalentes estén hechos, la regla es
+contractual, no enforcement automático.
 
 - `%LOCALAPPDATA%\WizeShared\locks\disk-<n>.lock`
 - `%LOCALAPPDATA%\WizeShared\locks\cloud-<provider>.lock`
@@ -139,6 +173,18 @@ Reglas vigentes acordadas con las tres apps:
 
 Lock con `LockFileEx`; el sistema lo libera si el proceso muere. El archivo guarda
 `pid/app/task/expires` para diagnóstico. Una tarea pesada por disco físico.
+
+### Identidad IPC (C1, acordada; aún no implementada)
+
+- Capacidad nueva: `IDENTITY = 0x0001_0000` en `WM_USER+402`.
+- En la respuesta binaria, al final: **16 bytes por ítem**, dos `u64` little-endian
+  (`vol_serial`, `frn`). Siempre presente si el cliente anunció la capacidad; no altera el
+  `offset` de 8 B por ítem de la respuesta base.
+- En JSON/MCP: los mismos valores como **string hexadecimal** (`"vol_serial":"1a2b3c4d"`),
+  para no perder bits.
+- `frn = 0` = sin identidad → fallback `path + size + mtime`.
+- `reply.flags` sólo anuncia los campos que realmente viajan; `PARTIAL_METADATA = 0x8000`
+  cuando falta `run_count`. Sin ese bit, Wiz leería `run_count = 0` como “nunca ejecutado”.
 
 ---
 
@@ -215,8 +261,9 @@ Lock con `LockFileEx`; el sistema lo libera si el proceso muere. El archivo guar
 - MCP: `status`, `preview_plan`, `apply_plan`, `undo`, `journals`, `explain`.
 - Estado en `%APPDATA%\SortEverything`.
 
-**A confirmar con Sort:** lista final de tareas profundas, residencia (no residente por ahora),
-postura sobre el shim `Everything64.dll` y límites de su UI.
+**A confirmar con Sort:** lista final de tareas profundas y límites de su UI. El shim
+`Everything64.dll` está descartado para Sort: usa `WM_COPYDATA` con Census y la DLL real sólo
+para Everything 1.4. `crates/census-shim` queda como placeholder diferido.
 
 ---
 
@@ -224,14 +271,23 @@ postura sobre el shim `Everything64.dll` y límites de su UI.
 
 - Índice MFT+USN multiunidad; arrays planos; arena UTF-16.
 - Snapshot `C.wcat` por volumen, cabecera versionada, checksum, escritura atómica.
-- IPC `QUERY2W`/`CENSUS_IPC`; compatibilidad con `EVERYTHING_TASKBAR_NOTIFICATION`.
-- Consultas por nombre/ruta/tipo/tamaño/fecha/extensión; paginación.
+- IPC `QUERY2W` registrado en `CENSUS_IPC` y `EVERYTHING_TASKBAR_NOTIFICATION`; capacidad
+  `IDENTITY` (C1) pendiente.
+- **Búsqueda por fragmentos** en nombre, extensión y carpetas; sin regex/comodines en la ventana.
+  El parser IPC conserva `path:`, `ext:`, `size:`, `dm:`, `rc:`, `file:`/`folder:` para Wiz/Sort.
+- Ventana vacía estilo Everything; tabla de resultados. Sin árbol/treemap (eso es Wiz).
 - CLI, MCP, GUI, `drives`, `bench`, `ask` (Groq).
-- En progreso: delta USN, identidad `vol_serial`+`frn`, shim de exports, robustez de `serve`.
-- Residente para no perder el delta; ~156 MB según su medición.
-
-**A confirmar con Census:** si sus tareas pesadas también deben ser sólo manuales, y el contrato
-exacto de identidad por IPC (strings hex para no perder bits).
+- Residente sólo por el USN; MFT/`--rebuild`/relectura y replay largo son forzados. Replay corto
+  (≤ 1 s) se anuncia en `activity.json`; si hay otra tarea pesada, espera.
+- Pausa implementada (`pause.json`, `census pause --until 22:00 | --for 8h`, `census resume`);
+  en pausa reusa el snapshot viejo y las consultas siguen. Falta `nightly-state.json` (C4).
+- En progreso: C1 identidad `vol_serial`+`frn`, C2 delta USN, C4 checkpoint/docs, C5 nube
+  explícita, C6 locks/`activity.json`, robustez de `serve`. Shim diferido/opcional.
+- `index_all()` hoy incluye G:/H:; C5 debe excluir nube por defecto, marcar `virtual · no
+  indexable` en `census drives` y dejar `--include-cloud` sólo para enumeración metadata-only.
+- Capacidades: `PARTIAL_METADATA = 0x8000` cuando falta `run_count`; `ChangeWindowMessageFilterEx`
+  para `WM_COPYDATA`, `WM_USER+401` y `WM_USER+402` permite que un cliente no elevado consulte
+  un Census elevado (no al revés).
 
 ---
 
@@ -244,19 +300,30 @@ exacto de identidad por IPC (strings hex para no perder bits).
 | Extracción de texto: Wiz vs Sort | Ambos leen PDF/documentos | Índice compartido; Wiz extrae, Sort lee |
 | Snapshots: `.ecat` Wiz vs `.wcat` Census | Formatos y propósitos distintos | No unificar; distinto nivel (inventario vs MFT) |
 | Delta: snapshot diff Wiz vs USN Census | Wiz diffa inventarios; Census detecta cambios | Complementarios; no duplicar USN en Wiz |
-| Google Drive | Wiz lo detecta; Sort podría querer ordenarlo | Ambos metadata-only; sin hidratar |
+| Google Drive | Wiz lo detecta; Sort podría querer ordenarlo; Census hoy recorre G:/H: | Wiz/Sort metadata-only; C5 excluye nube de `index_all` por defecto y `--include-cloud` sólo enumera metadata |
 | Informes/HTML | Wiz exporta; Sort muestra planes | Wiz reporta análisis; Sort no reporta espacio |
 
 ---
 
-## 10. Preguntas abiertas
+## 10. Decisiones cerradas y preguntas abiertas
 
-1. ¿Census también debe ser “sólo cuando se fuerce”, o sigue residente para USN?
-2. ¿La mutación de Wiz (canasta/cuarentena/hardlink/WOF) se queda en Wiz o se mueve a Sort?
-3. ¿La búsqueda dentro de comprimidos es de Wiz, de Sort o del índice compartido?
-4. ¿Qué funciones de Wiz son “núcleo” y cuáles “experimentales” para la limpieza de alcance?
-5. ¿Se mantienen los 41 tools MCP o se agrupan en menos operaciones?
-6. ¿El shim `Everything64.dll` lo usa sólo Sort o también Wiz?
+### Cerradas
+
+- **Census residente sólo por el USN**; MFT/`--rebuild`/relectura y replay largo son forzados.
+- **Búsqueda de Census**: fragmentos en nombre/extensión/carpetas; sin regex/comodines en la UI.
+  El IPC sigue aceptando operadores porque Wiz/Sort los mandan.
+- **Identidad**: capacidad `IDENTITY`, 16 B por ítem en binario, hex en JSON/MCP, `frn=0` fallback.
+- **Shim `Everything64.dll`**: diferido/opcional; Sort no lo necesita.
+- **Nube**: C5, excluida por defecto; `--include-cloud` metadata-only.
+- **Pausa**: Census ya la tiene; Wiz la implementa en P0; falta `nightly-state` de Census (C4).
+- **Locks/`activity.json`**: C6; todavía no implementados.
+
+### Abiertas
+
+1. ¿La mutación de Wiz (canasta/cuarentena/hardlink/WOF) se queda en Wiz o se mueve a Sort?
+2. ¿La búsqueda dentro de comprimidos es de Wiz, de Sort o del índice compartido?
+3. ¿Qué funciones de Wiz son “núcleo” y cuáles “experimentales” para la limpieza de alcance?
+4. ¿Se mantienen los 41 tools MCP o se agrupan en menos operaciones?
 
 ---
 
