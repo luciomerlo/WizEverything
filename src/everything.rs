@@ -106,7 +106,8 @@ fn target() -> Option<(HWND, &'static str)> {
 }
 
 pub fn status() -> Status {
-    status_of(engine())
+    let Some((hwnd, _)) = target() else { return Status::NotRunning };
+    if loaded(hwnd) { Status::Ready } else { Status::Loading }
 }
 
 /// Estado de un motor concreto, sin depender de la preferencia global.
