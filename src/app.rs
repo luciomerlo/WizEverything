@@ -534,6 +534,8 @@ pub struct App {
     setup_msg: Option<String>,
     setup_det: Option<crate::setup::Detection>,
     setup_det_at: Instant,
+    /// Objetivo del planificador de espacio.
+    plan_target_gb: u32,
 
     // incremental sync
     sync_rx: Option<Receiver<(u64, String, Result<Vec<Change>, String>)>>,
@@ -675,6 +677,7 @@ impl App {
             setup_msg: None,
             setup_det: None,
             setup_det_at: Instant::now() - Duration::from_secs(10),
+            plan_target_gb: 100,
             sync_rx: None,
             pending_changes: None,
             sync_stamp: String::new(),
@@ -798,6 +801,9 @@ impl App {
         if self.loading.is_some() {
             return;
         }
+        // Una carga completa puede volver a elegir Auto; los deltas de sync
+        // quedan fijados al motor que produjo este árbol.
+        crate::everything::reset_active();
         let (tx, rx) = channel();
         let progress = Arc::new(Progress::default());
         let p = progress.clone();
@@ -1209,6 +1215,8 @@ impl App {
     }
 
     fn quit(&mut self) -> ! {
+        // No perder una ruta de census.exe escrita y todavía no confirmada.
+        self.settings.save();
         // Drop the tray icon first so no ghost icon stays in the notification area.
         self.tray_icon.take();
         std::process::exit(0)
@@ -2045,6 +2053,69 @@ impl App {
                     self.timeline_sel = self.timeline_frames.len().saturating_sub(2);
                     self.timeline_open = true;
                 }
+                ui.collapsing(tr("Planificación (exp)", "Planning (exp)"), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(tr("Objetivo:", "Target:"));
+                        ui.add(
+                            egui::DragValue::new(&mut self.plan_target_gb)
+                                .range(1..=100_000)
+                                .suffix(" GB"),
+                        );
+                        if ui
+                            .button(tr("Planificar liberación", "Plan reclaim"))
+                            .on_hover_text(tr(
+                                "Elige archivos grandes hasta llegar al objetivo, con riesgo y edad. Dry-run: no borra nada. (Experimental)",
+                                "Picks large files until the target, with risk and age. Dry-run: deletes nothing. (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            let mut a = caps.clone();
+                            a["target_gb"] = serde_json::json!(self.plan_target_gb);
+                            self.set_report(
+                                tr("Planificador de espacio", "Space planner"),
+                                crate::mcp_tools::plan_100gb(tree, root, &a, 40),
+                            );
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(tr("Mapa de calor por edad", "Age heatmap"))
+                            .on_hover_text(tr(
+                                "Bytes y archivos por antigüedad; los más viejos y grandes primero. (Experimental)",
+                                "Bytes and files by age; oldest large files first. (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            self.set_report(
+                                tr("Mapa de calor por edad", "Age heatmap"),
+                                crate::mcp_tools::age_heatmap(tree, root, &caps, 20),
+                            );
+                        }
+                        if ui
+                            .button(tr("WSL / Docker", "WSL / Docker"))
+                            .on_hover_text(tr(
+                                "Discos virtuales de WSL y Docker: espacio recuperable por compactación, no borrando. (Experimental)",
+                                "WSL and Docker virtual disks: space recoverable by compaction, not deletion. (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            self.set_report(
+                                tr("WSL / Docker", "WSL / Docker"),
+                                crate::mcp_tools::wsl_docker(tree, root, &caps, 20),
+                            );
+                        }
+                        if ui
+                            .button(tr("Pronóstico de disco", "Disk forecast"))
+                            .on_hover_text(tr(
+                                "Días hasta llenarse según los snapshots guardados y el espacio libre actual. (Experimental)",
+                                "Days until full from saved snapshots and current free space. (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            self.set_report(tr("Pronóstico de disco", "Disk forecast"), crate::mcp_tools::forecast(tree, root, &caps));
+                        }
+                    });
+                });
             }
         });
     }
@@ -2085,6 +2156,17 @@ impl App {
                 ui.horizontal(|ui| {
                     if det.everything_ready {
                         ui.colored_label(Color32::from_rgb(90, 180, 100), tr("Todo listo", "Ready"));
+                        if ui.button(tr("Usar Everything", "Use Everything")).clicked() {
+                            self.settings.engine = IndexEngine::Everything;
+                            crate::everything::set_engine(IndexEngine::Everything);
+                            self.settings.save();
+                            self.setup_open = false;
+                            if self.loading.is_some() {
+                                self.reload_pending = true;
+                            } else {
+                                self.start_load(ctx);
+                            }
+                        }
                     } else if det.everything_running {
                         ui.label(RichText::new(tr("Cargando índice…", "Loading index…")).weak());
                     } else if let Some(p) = &det.everything_installed {
@@ -2132,13 +2214,28 @@ impl App {
                             .hint_text(r"C:\ruta\a\census.exe")
                             .desired_width(360.0),
                     );
-                    if r.lost_focus() {
+                    if r.changed() {
                         self.settings.save();
                         self.setup_det = None; // redetectar con la ruta nueva
+                    }
+                    if r.lost_focus() {
+                        self.settings.save();
+                        self.setup_det = None;
                     }
                     if let Some(p) = &det.census_installed {
                         if det.census_ready {
                             ui.colored_label(Color32::from_rgb(90, 180, 100), tr("En ejecución", "Running"));
+                            if ui.button(tr("Usar Census", "Use Census")).clicked() {
+                                self.settings.engine = IndexEngine::Census;
+                                crate::everything::set_engine(IndexEngine::Census);
+                                self.settings.save();
+                                self.setup_open = false;
+                                if self.loading.is_some() {
+                                    self.reload_pending = true;
+                                } else {
+                                    self.start_load(ctx);
+                                }
+                            }
                         } else if det.census_running {
                             ui.label(RichText::new(tr("Cargando índice…", "Loading index…")).weak());
                         } else if ui.button(tr("Iniciar Census", "Start Census")).clicked() {
@@ -4327,6 +4424,83 @@ impl App {
         }
     }
 
+    fn reclaim_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Planificador de espacio", "Space planner"));
+        ui.label(format!(
+            "{} / {} ({}%) · modo {} · {}",
+            fmt_size(v["selected_bytes"].as_u64().unwrap_or(0)),
+            fmt_size(v["target_bytes"].as_u64().unwrap_or(0)),
+            v["percent"].as_f64().unwrap_or(0.0),
+            mode_es(v),
+            if v["reached"].as_bool().unwrap_or(false) { tr("objetivo alcanzado", "target reached") } else { tr("parcial", "partial") },
+        ));
+        ui.label(RichText::new(v["note"].as_str().unwrap_or("")).weak());
+        ui.separator();
+        let empty: Vec<serde_json::Value> = Vec::new();
+        egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+            for it in v["items"].as_array().unwrap_or(&empty) {
+                let risk = it["risk"].as_str().unwrap_or("review");
+                let color = match risk {
+                    "safe" => Color32::from_rgb(90, 180, 100),
+                    "keep" => Color32::from_rgb(220, 90, 90),
+                    _ => Color32::from_rgb(220, 170, 70),
+                };
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, format!("{risk:>6}"));
+                    ui.label(format!("{:>9}", fmt_size(it["bytes"].as_u64().unwrap_or(0))));
+                    ui.label(RichText::new(it["path"].as_str().unwrap_or("")).size(10.0));
+                });
+            }
+        });
+    }
+
+    fn age_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Mapa de calor por edad", "Age heatmap"));
+        ui.label(format!("{} · {}", fmt_size(v["total_bytes"].as_u64().unwrap_or(0)), v["note"].as_str().unwrap_or("")));
+        let empty: Vec<serde_json::Value> = Vec::new();
+        for b in v["buckets"].as_array().unwrap_or(&empty) {
+            let label = b["bucket"].as_str().unwrap_or("?");
+            let frac = (b["pct"].as_f64().unwrap_or(0.0) / 100.0) as f32;
+            ui.horizontal(|ui| {
+                ui.add(egui::ProgressBar::new(frac).desired_width(180.0));
+                ui.label(format!("{label:>9}  {:>9}  {}", fmt_size(b["bytes"].as_u64().unwrap_or(0)), b["files"]));
+            });
+        }
+    }
+
+    fn wsl_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("WSL / Docker", "WSL / Docker"));
+        ui.label(format!(
+            "{} · {}",
+            tr("recuperable por compactación", "recoverable by compaction"),
+            fmt_size(v["reclaimable_candidate"].as_u64().unwrap_or(0))
+        ));
+        let empty: Vec<serde_json::Value> = Vec::new();
+        for it in v["items"].as_array().unwrap_or(&empty) {
+            ui.horizontal(|ui| {
+                ui.label(format!("{:>9}  {:>8}", fmt_size(it["bytes"].as_u64().unwrap_or(0)), it["kind"].as_str().unwrap_or("")));
+                ui.label(RichText::new(it["path"].as_str().unwrap_or("")).size(10.0));
+            });
+        }
+        for w in v["warnings"].as_array().unwrap_or(&empty) {
+            ui.colored_label(Color32::from_rgb(220, 170, 70), w.as_str().unwrap_or(""));
+        }
+    }
+
+    fn forecast_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Pronóstico de disco", "Disk forecast"));
+        if let Some(d) = v["days_to_full"].as_f64() {
+            ui.label(RichText::new(format!("≈ {d:.0} {} ", tr("días hasta llenarse", "days until full"))).size(22.0).strong());
+        }
+        ui.label(format!(
+            "{} / día · libre {} · {} snapshots · confianza {}",
+            fmt_size(v["per_day"].as_f64().unwrap_or(0.0).max(0.0) as u64),
+            fmt_size(v["free_bytes"].as_u64().unwrap_or(0)),
+            v["samples"],
+            v["confidence"].as_str().unwrap_or("?")
+        ));
+    }
+
     fn growth_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
         let net = v["net_bytes"].as_i64().unwrap_or(0);
         ui.heading(tr("¿Qué creció?", "What grew?"));
@@ -4861,6 +5035,10 @@ impl App {
             Some("addons") => self.addons_report_ui(ui, v),
             Some("content") => self.content_report_ui(ui, v),
             Some("content_estimate") => self.content_estimate_report_ui(ui, v),
+            Some("reclaim_plan") => self.reclaim_report_ui(ui, v),
+            Some("age_heatmap") => self.age_report_ui(ui, v),
+            Some("wsl_docker") => self.wsl_report_ui(ui, v),
+            Some("forecast") => self.forecast_report_ui(ui, v),
             _ => {
                 ui.add(
                     egui::Label::new(

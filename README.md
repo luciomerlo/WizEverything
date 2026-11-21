@@ -111,6 +111,10 @@ exposed both in the desktop app and through the MCP server.
   folder, so growth arrives as a ranked folder list. Snapshots see what the index sees: refresh (F5)
   before saving if files were just created.
 - **"Can I delete this?"** — second opinion for any file/folder: safe / caution / keep, with reasons
+- **100 GB reclaim planner** (exp) — pick a target (default 100 GB) and get the largest files that reach
+  it, with age and risk (safe / review / keep). Dry-run: nothing is deleted.
+- **Age heatmap, WSL/Docker and disk forecast** (exp) — bytes per age bucket, VHDX space recoverable by
+  compaction, and days until the drive is full from saved snapshots.
   (regenerable build output, git-tracked, hard links, cloud placeholder, system folder, personal data,
   age), the real reclaimable bytes and the action to stage it in the basket.
 - **"Is it backed up?"** — compares a folder against another copy by relative path and size: coverage %,
@@ -154,7 +158,7 @@ how long the fast one took and the estimated deep time, so the slower choice is 
 ## Use it from an AI (MCP server)
 
 `wizeverything.exe --mcp` runs a [Model Context Protocol](https://modelcontextprotocol.io) server on stdio,
-using the same Everything index. It can run alongside the desktop app.
+using the same active index (Everything or Census). It can run alongside the desktop app.
 
 Tools (all read-only except `snapshot_save`/`catalog_save`, which write only into `%LOCALAPPDATA%\WizEverything`):
 `drives`, `folder_sizes`, `largest_files`, `file_types`, `find_duplicates`, `dev_artifacts`,
@@ -162,8 +166,8 @@ Tools (all read-only except `snapshot_save`/`catalog_save`, which write only int
 `similar_images`, `similar_audio`, `github_mode`, `why_full`, `growth`, `advice`, `backup_check`,
 `snapshot_save`, `snapshot_diff`, `catalog_save`, `catalog_check`, `volumes`, `volume_duplicates`,
 `volume_lookup`, `provenance`, `timeline`, `quarantine_list`, `speed_test`, `content_search`,
-`content_estimate`, `addons`, `refresh`. Tools with a
-thorough variant accept `mode: "fast" | "deep"` (or `deep: true`).
+`content_estimate`, `addons`, `plan_100gb`, `age_heatmap`, `wsl_docker`, `forecast`, `refresh`.
+Tools with a thorough variant accept `mode: "fast" | "deep"` (or `deep: true`).
 
 Claude Code:
 

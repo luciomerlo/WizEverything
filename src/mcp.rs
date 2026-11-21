@@ -320,6 +320,10 @@ impl Server {
             "addons" => crate::mcp_tools::addons(&t, root, &a),
             "content_search" => crate::mcp_tools::content_search(&t, root, &a, limit),
             "content_estimate" => crate::mcp_tools::content_estimate(&t, root, &a),
+            "plan_100gb" => crate::mcp_tools::plan_100gb(&t, root, &a, limit),
+            "age_heatmap" => crate::mcp_tools::age_heatmap(&t, root, &a, limit),
+            "wsl_docker" => crate::mcp_tools::wsl_docker(&t, root, &a, limit),
+            "forecast" => crate::mcp_tools::forecast(&t, root, &a),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -481,7 +485,18 @@ pub fn tools() -> Value {
             "limit": limit }, "required": ["path", "query"] } },
         { "name": "content_estimate", "description": "Estimates how many text/PDF/image files are under a folder and how long a fast or deep content search would take, before running it. Read-only. Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": { "path": path } } },
-        { "name": "refresh", "description": "Reload the index from Everything.", "annotations": ro,
+        { "name": "plan_100gb", "description": "Dry-run planner: pick the largest files under 'path' until reaching target_gb (default 100), with risk labels (safe/review/keep) and age. Nothing is deleted. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path,
+            "target_gb": { "type": "integer", "description": "Goal in GB (default 100)." },
+            "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast scans 2000 candidates; deep 20000." },
+            "limit": limit }, "required": ["path"] } },
+        { "name": "age_heatmap", "description": "Disk usage by file age (<7d, 7-30d, 30-90d, 90-365d, >1y, unknown) and the oldest large files. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit }, "required": ["path"] } },
+        { "name": "wsl_docker", "description": "Finds WSL ext4.vhdx and Docker vhdx/data folders and estimates space recoverable by compaction (not deletion). Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit }, "required": ["path"] } },
+        { "name": "forecast", "description": "Projects days until the system drive is full from the first and last saved snapshots and current free space. Needs at least two snapshots. Read-only. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "refresh", "description": "Reload the index from the active engine (Everything or Census).", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])
 }

@@ -55,6 +55,40 @@ fn need_path(root: u32, a: &Value) -> Result<(), String> {
     Ok(())
 }
 
+
+/// Planificador: qué archivos elegir para liberar `target_gb` (dry-run).
+pub fn plan_100gb(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let gb = a.get("target_gb").and_then(Value::as_u64).unwrap_or(100).clamp(1, 100_000);
+    let deep = is_deep(a);
+    let mut v = crate::planner::plan_reclaim(t, root, gb.saturating_mul(1_000_000_000), limit, deep);
+    v["mode"] = json!(mode_name(deep));
+    v["target_gb"] = json!(gb);
+    v["root"] = json!(t.full_path(root));
+    Ok(v)
+}
+
+/// Mapa de calor por antigüedad (bytes y archivos por rango de fecha).
+pub fn age_heatmap(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let mut v = crate::planner::age_heatmap(t, root, limit);
+    v["root"] = json!(t.full_path(root));
+    Ok(v)
+}
+
+/// VHDX de WSL/Docker: espacio recuperable por compactación, no borrando.
+pub fn wsl_docker(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let mut v = crate::planner::wsl_docker(t, root, limit);
+    v["root"] = json!(t.full_path(root));
+    Ok(v)
+}
+
+/// Pronóstico de disco lleno a partir de los snapshots guardados.
+pub fn forecast(_t: &Tree, _root: u32, _a: &Value) -> Result<Value, String> {
+    crate::planner::forecast()
+}
+
 /// M2 — sparse / offline / reparse-point audit with logical vs physical size.
 pub fn cloud_audit(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
     need_path(root, a)?;

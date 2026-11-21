@@ -30,6 +30,7 @@ mod magic;
 mod noise;
 mod mcp;
 mod mcp_tools;
+mod planner;
 mod reparse;
 mod similar;
 mod setup;

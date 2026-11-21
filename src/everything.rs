@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::ptr::null_mut;
 use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, GetLastError, HWND, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -56,6 +56,9 @@ pub enum Status {
 
 /// Motor elegido en Opciones; se aplica sin reiniciar.
 static ENGINE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+/// Motor realmente fijado para esta sesión de índice (Auto deja de cambiar
+/// a mitad de sesión para no mezclar árbol y deltas de dos índices).
+static ACTIVE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
 pub fn set_engine(e: IndexEngine) {
     let v = match e {
@@ -64,6 +67,25 @@ pub fn set_engine(e: IndexEngine) {
         IndexEngine::Census => 2,
     };
     ENGINE.store(v, std::sync::atomic::Ordering::Relaxed);
+    ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Vuelve a decidir Auto en la próxima carga completa.
+pub fn reset_active() {
+    ACTIVE.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn runtime() -> IndexEngine {
+    match ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => IndexEngine::Everything,
+        2 => IndexEngine::Census,
+        _ => engine(),
+    }
+}
+
+fn pin_runtime(name: &str) {
+    let v = if name == "Census" { 2 } else { 1 };
+    ACTIVE.store(v, std::sync::atomic::Ordering::Relaxed);
 }
 
 pub fn engine() -> IndexEngine {
@@ -88,7 +110,7 @@ fn loaded(h: HWND) -> bool {
 /// Census listo; si ninguno está listo, cualquiera que exista para informar
 /// "cargando".
 fn target() -> Option<(HWND, &'static str)> {
-    match engine() {
+    match runtime() {
         IndexEngine::Everything => hwnd_for(IPC_CLASS).map(|h| (h, "Everything")),
         IndexEngine::Census => hwnd_for(CENSUS_CLASS).map(|h| (h, "Census")),
         IndexEngine::Auto => {
@@ -230,7 +252,17 @@ fn query_page(reply: &ReplyWindow, target: HWND, search: &str, offset: u32, max:
     REPLY.with(|r| *r.borrow_mut() = None);
     let ok = unsafe { SendMessageW(target, WM_COPYDATA, reply.0 as usize, &cds as *const _ as isize) };
     if ok == 0 {
-        return Err(tr("El motor de índice rechazó la consulta IPC", "The index engine rejected the IPC query").into());
+        let code = unsafe { GetLastError() };
+        if code == ERROR_ACCESS_DENIED {
+            return Err(tr(
+                "Windows bloqueó la consulta IPC (motores con distinto nivel de permisos). Ejecutá WizEverything como administrador o iniciá Census sin elevación.",
+                "Windows blocked the IPC query (engines at different privilege levels). Run WizEverything as administrator or start Census without elevation.",
+            ).into());
+        }
+        return Err(format!(
+            "{} (Windows {code})",
+            tr("El motor de índice rechazó la consulta IPC", "The index engine rejected the IPC query")
+        ));
     }
     let start = Instant::now();
     loop {
@@ -260,8 +292,16 @@ fn rd_u64(b: &[u8], at: usize) -> u64 {
 
 /// Lee una cadena IPC: DWORD longitud (en caracteres) + UTF-16 + terminador nulo.
 fn rd_str<'a>(b: &'a [u8], at: &mut usize) -> &'a [u16] {
+    if *at + 4 > b.len() {
+        *at = b.len();
+        return &[];
+    }
     let len = rd_u32(b, *at) as usize;
     *at += 4;
+    if len.saturating_mul(2).saturating_add(2) > b.len().saturating_sub(*at) {
+        *at = b.len();
+        return &[];
+    }
     let bytes = &b[*at..*at + len * 2];
     *at += len * 2 + 2;
     // El buffer viene de un Vec<u8>; puede no estar alineado a 2, así que lo
@@ -290,10 +330,11 @@ pub fn for_each_item(
         // Fijar el motor al empezar: si Auto cambia a mitad de carga (por ejemplo
         // Everything termina de cargar), mezclar páginas de dos índices rompería
         // el árbol. El motor elegido se usa hasta terminar esta carga.
-        let Some((target, _)) = target() else {
+        let Some((target, engine_name)) = target() else {
             let _ = tx.send(Err(missing_msg()));
             return;
         };
+        pin_runtime(engine_name);
         let reply = match ReplyWindow::new() {
             Ok(r) => r,
             Err(e) => {
@@ -339,6 +380,10 @@ fn parse_pages(
         let num = rd_u32(&data, 4);
         let request = rd_u32(&data, 12);
         progress(offset, total); // permite reservar memoria antes de procesar
+        let table_end = 20usize.saturating_add((num as usize).saturating_mul(8));
+        if table_end > data.len() {
+            return Err(tr("Respuesta IPC truncada", "Truncated IPC reply").into());
+        }
         for i in 0..num as usize {
             let flags = rd_u32(&data, 20 + i * 8);
             let mut at = rd_u32(&data, 20 + i * 8 + 4) as usize;
@@ -502,10 +547,11 @@ pub fn for_each_item_ext(
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<Vec<u8>, String>>(2);
     let search_owned = search.to_string();
     let fetcher = std::thread::spawn(move || {
-        let Some((target, _)) = target() else {
+        let Some((target, engine_name)) = target() else {
             let _ = tx.send(Err(missing_msg()));
             return;
         };
+        pin_runtime(engine_name);
         let reply = match ReplyWindow::new() {
             Ok(r) => r,
             Err(e) => {
@@ -616,5 +662,19 @@ mod ext_tests {
         let mut page = build_page("x", "y", 1, 0);
         page.truncate(page.len() / 2);
         assert!(parse_reply_ext(&page).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_auto_terminates() {
+        // Regresión: status() y status_of(Auto) no deben llamarse mutuamente.
+        let old = engine();
+        set_engine(IndexEngine::Auto);
+        let _ = status();
+        set_engine(old);
     }
 }
