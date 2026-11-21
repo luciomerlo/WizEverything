@@ -113,8 +113,9 @@ exposed both in the desktop app and through the MCP server.
 - **"Can I delete this?"** — second opinion for any file/folder: safe / caution / keep, with reasons
 - **100 GB reclaim planner** (exp) — pick a target (default 100 GB) and get the largest files that reach
   it, with age and risk (safe / review / keep). Dry-run: nothing is deleted.
-- **Age heatmap, WSL/Docker and disk forecast** (exp) — bytes per age bucket, VHDX space recoverable by
-  compaction, and days until the drive is full from saved snapshots.
+- **Age heatmap, WSL/Docker, disk forecast and GitHub multicopy** (exp) — bytes per age bucket,
+  VHDX space recoverable by compaction, days until the drive is full from saved snapshots, and
+  local Git clones grouped by remote with redundant bytes.
   (regenerable build output, git-tracked, hard links, cloud placeholder, system folder, personal data,
   age), the real reclaimable bytes and the action to stage it in the basket.
 - **"Is it backed up?"** — compares a folder against another copy by relative path and size: coverage %,
@@ -166,7 +167,7 @@ Tools (all read-only except `snapshot_save`/`catalog_save`, which write only int
 `similar_images`, `similar_audio`, `github_mode`, `why_full`, `growth`, `advice`, `backup_check`,
 `snapshot_save`, `snapshot_diff`, `catalog_save`, `catalog_check`, `volumes`, `volume_duplicates`,
 `volume_lookup`, `provenance`, `timeline`, `quarantine_list`, `speed_test`, `content_search`,
-`content_estimate`, `addons`, `plan_100gb`, `age_heatmap`, `wsl_docker`, `forecast`, `refresh`.
+`content_estimate`, `addons`, `plan_100gb`, `age_heatmap`, `wsl_docker`, `forecast`, `github_clones`, `refresh`.
 Tools with a thorough variant accept `mode: "fast" | "deep"` (or `deep: true`).
 
 Claude Code:

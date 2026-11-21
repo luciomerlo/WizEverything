@@ -324,6 +324,7 @@ impl Server {
             "age_heatmap" => crate::mcp_tools::age_heatmap(&t, root, &a, limit),
             "wsl_docker" => crate::mcp_tools::wsl_docker(&t, root, &a, limit),
             "forecast" => crate::mcp_tools::forecast(&t, root, &a),
+            "github_clones" => crate::mcp_tools::github_clones(&t, root, &a, limit),
             _ => Err(format!("Unknown tool: {name}")),
         }
     }
@@ -496,6 +497,8 @@ pub fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "path": path, "limit": limit }, "required": ["path"] } },
         { "name": "forecast", "description": "Projects days until the system drive is full from the first and last saved snapshots and current free space. Needs at least two snapshots. Read-only. Experimental.", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } },
+        { "name": "github_clones", "description": "Groups local Git clones by origin URL under 'path' and estimates redundant bytes. Read-only; no fetch, no delete. Experimental.", "annotations": ro,
+          "inputSchema": { "type": "object", "properties": { "path": path, "mode": { "type": "string", "enum": ["fast", "deep"], "description": "fast caps at 500 repos." }, "limit": limit }, "required": ["path"] } },
         { "name": "refresh", "description": "Reload the index from the active engine (Everything or Census).", "annotations": ro,
           "inputSchema": { "type": "object", "properties": {} } }
     ])

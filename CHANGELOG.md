@@ -19,7 +19,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Planificador de liberación, mapa de calor por edad, WSL/Docker y pronóstico de disco** (exp):
   `plan_100gb` elige los archivos más grandes hasta un objetivo configurable con riesgo y edad;
   `age_heatmap` agrupa bytes por antigüedad; `wsl_docker` detecta VHDX y estima compactación;
-  `forecast` proyecta días hasta llenarse con snapshots. Todo dry-run/sólo lectura.
+  `forecast` proyecta días hasta llenarse con snapshots; `github_clones` agrupa clones por remoto y
+  estima bytes redundantes. Todo dry-run/sólo lectura.
 - **FTS5 en el índice de contenido compartido** y limpieza de entradas de archivos que ya no existen.
 
 ### Changed

@@ -56,6 +56,17 @@ fn need_path(root: u32, a: &Value) -> Result<(), String> {
 }
 
 
+
+/// Multicopia: clones del mismo remoto Git bajo la ruta actual.
+pub fn github_clones(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
+    need_path(root, a)?;
+    let deep = is_deep(a);
+    let mut v = crate::github_clones::clones(t, root, limit, deep);
+    v["mode"] = json!(mode_name(deep));
+    v["root"] = json!(t.full_path(root));
+    Ok(v)
+}
+
 /// Planificador: qué archivos elegir para liberar `target_gb` (dry-run).
 pub fn plan_100gb(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
     need_path(root, a)?;

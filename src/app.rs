@@ -2105,6 +2105,19 @@ impl App {
                             );
                         }
                         if ui
+                            .button(tr("GitHub multicopia", "GitHub clones"))
+                            .on_hover_text(tr(
+                                "Agrupa clones del mismo repositorio por remoto y estima bytes redundantes. No hace fetch ni borra. (Experimental)",
+                                "Groups clones of the same repo by remote and estimates redundant bytes. No fetch, no delete. (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            self.set_report(
+                                tr("GitHub multicopia", "GitHub clones"),
+                                crate::mcp_tools::github_clones(tree, root, &caps, 20),
+                            );
+                        }
+                        if ui
                             .button(tr("Pronóstico de disco", "Disk forecast"))
                             .on_hover_text(tr(
                                 "Días hasta llenarse según los snapshots guardados y el espacio libre actual. (Experimental)",
@@ -4487,6 +4500,28 @@ impl App {
         }
     }
 
+    fn github_clones_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("GitHub multicopia", "GitHub clones"));
+        ui.label(format!(
+            "{} repos · {} grupos · {} redundantes · modo {}",
+            v["repos"],
+            v["groups"],
+            fmt_size(v["redundant_bytes"].as_u64().unwrap_or(0)),
+            mode_es(v)
+        ));
+        let empty: Vec<serde_json::Value> = Vec::new();
+        for g in v["items"].as_array().unwrap_or(&empty) {
+            ui.separator();
+            ui.label(RichText::new(g["remote"].as_str().unwrap_or("")).strong());
+            for c in g["copies"].as_array().unwrap_or(&empty) {
+                ui.horizontal(|ui| {
+                    ui.label(format!("{:>9}", fmt_size(c["bytes"].as_u64().unwrap_or(0))));
+                    ui.label(RichText::new(c["path"].as_str().unwrap_or("")).size(10.0));
+                });
+            }
+        }
+    }
+
     fn forecast_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
         ui.heading(tr("Pronóstico de disco", "Disk forecast"));
         if let Some(d) = v["days_to_full"].as_f64() {
@@ -5039,6 +5074,7 @@ impl App {
             Some("age_heatmap") => self.age_report_ui(ui, v),
             Some("wsl_docker") => self.wsl_report_ui(ui, v),
             Some("forecast") => self.forecast_report_ui(ui, v),
+            Some("github_clones") => self.github_clones_report_ui(ui, v),
             _ => {
                 ui.add(
                     egui::Label::new(
