@@ -11,8 +11,10 @@ use crate::i18n::IndexEngine;
 #[derive(Clone, Debug, Default)]
 pub struct Detection {
     pub everything_running: bool,
+    pub everything_ready: bool,
     pub everything_installed: Option<PathBuf>,
     pub census_running: bool,
+    pub census_ready: bool,
     pub census_installed: Option<PathBuf>,
     pub winget: bool,
 }
@@ -67,11 +69,14 @@ pub fn census_candidates(extra: &str) -> Vec<PathBuf> {
 pub fn detect(census_extra: &str) -> Detection {
     let ev = everything_candidates().into_iter().find_map(|p| exists_file(&p)).or_else(|| which("Everything.exe"));
     let ce = census_candidates(census_extra).into_iter().find_map(|p| exists_file(&p)).or_else(|| which("census.exe"));
+    let ev_status = crate::everything::status_of(IndexEngine::Everything);
+    let ce_status = crate::everything::status_of(IndexEngine::Census);
     Detection {
-        everything_running: crate::everything::status_of(IndexEngine::Everything)
-            == crate::everything::Status::Ready,
+        everything_running: !matches!(ev_status, crate::everything::Status::NotRunning),
+        everything_ready: ev_status == crate::everything::Status::Ready,
         everything_installed: ev,
-        census_running: crate::everything::status_of(IndexEngine::Census) == crate::everything::Status::Ready,
+        census_running: !matches!(ce_status, crate::everything::Status::NotRunning),
+        census_ready: ce_status == crate::everything::Status::Ready,
         census_installed: ce,
         winget: which("winget.exe").is_some(),
     }

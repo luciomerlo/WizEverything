@@ -2083,8 +2083,10 @@ impl App {
                 ));
                 ui.label(crate::setup::status_text(det.everything_running, det.everything_installed.as_deref()));
                 ui.horizontal(|ui| {
-                    if det.everything_running {
+                    if det.everything_ready {
                         ui.colored_label(Color32::from_rgb(90, 180, 100), tr("Todo listo", "Ready"));
+                    } else if det.everything_running {
+                        ui.label(RichText::new(tr("Cargando índice…", "Loading index…")).weak());
                     } else if let Some(p) = &det.everything_installed {
                         if ui.button(tr("Iniciar Everything", "Start Everything")).clicked() {
                             match crate::setup::start_everything(p) {
@@ -2135,8 +2137,10 @@ impl App {
                         self.setup_det = None; // redetectar con la ruta nueva
                     }
                     if let Some(p) = &det.census_installed {
-                        if det.census_running {
+                        if det.census_ready {
                             ui.colored_label(Color32::from_rgb(90, 180, 100), tr("En ejecución", "Running"));
+                        } else if det.census_running {
+                            ui.label(RichText::new(tr("Cargando índice…", "Loading index…")).weak());
                         } else if ui.button(tr("Iniciar Census", "Start Census")).clicked() {
                             match crate::setup::start_census(p) {
                                 Ok(()) => self.setup_msg = Some(tr(
