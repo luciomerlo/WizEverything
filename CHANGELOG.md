@@ -17,6 +17,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Límites de OCR por página/proceso**: `pdftotext`, `pdftoppm` y `tesseract` se cortan por tiempo
   para que un PDF o una imagen dañada no cuelguen la búsqueda.
 
+### Fixed
+- Carpetas duplicadas: el marcado de grupos anidados ya no es O(N²); los totales se calculan antes
+  del límite y las carpetas con un solo archivo grande también entran.
+- Correo: se descartan adjuntos (`Content-Disposition: attachment`) y partes que no son texto; se
+  decodifican charset y encabezados RFC 2047.
+- OCR: directorio temporal único por búsqueda y limpieza de procesos colgados; se evita dejar
+  archivos temporales si falla el lanzamiento.
+- `machine_compare`: avisa cuando menos del 5% de las rutas coinciden (otra unidad/usuario/raíz) y
+  limita el tamaño de snapshots y la descompresión de `.ecat`.
+
 ### Changed
 - Los snapshots nuevos incluyen marcadores de directorio (`ATTR_DIRECTORY`) para reconstruir rutas
   completas; el diff los ignora, así que los totales de archivos no cambian.

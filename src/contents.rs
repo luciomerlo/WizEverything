@@ -78,13 +78,23 @@ fn run_stdout_timeout(mut cmd: Command, secs: u64) -> Option<String> {
     let out_path = temp_file("out");
     let file = std::fs::File::create(&out_path).ok()?;
     cmd.stdout(Stdio::from(file)).stderr(Stdio::null());
-    let mut child = cmd.spawn().ok()?;
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = std::fs::remove_file(&out_path);
+            return None;
+        }
+    };
     let deadline = Instant::now() + Duration::from_secs(secs);
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
             Ok(None) => {}
-            Err(_) => break None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -109,7 +119,11 @@ fn status_timeout(mut cmd: Command, secs: u64) -> bool {
         match child.try_wait() {
             Ok(Some(st)) => return st.success(),
             Ok(None) => {}
-            Err(_) => return false,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -218,14 +232,30 @@ fn decode_base64(s: &str) -> Vec<u8> {
 }
 
 fn strip_html(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    // Quita script/style completos y después las etiquetas, dejando un espacio
+    // para no pegar palabras que estaban en líneas o celdas distintas.
+    let mut cleaned = s.to_string();
+    for tag in ["script", "style"] {
+        loop {
+            let lower = cleaned.to_ascii_lowercase();
+            let Some(start) = lower.find(&format!("<{tag}")) else { break };
+            let Some(rel_end) = lower[start..].find(&format!("</{tag}>")) else { break };
+            let end = start + rel_end + tag.len() + 3;
+            cleaned.replace_range(start..end, " ");
+        }
+    }
+    let mut out = String::with_capacity(cleaned.len());
     let mut in_tag = false;
-    for c in s.chars() {
+    for c in cleaned.chars() {
         match c {
             '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+            '>' => {
+                in_tag = false;
+                // Cualquier etiqueta separa palabras: <b>mundo</b> no es "Holamundo".
+                out.push(' ');
+            }
+            _ if in_tag => {}
+            _ => out.push(c),
         }
     }
     unescape(&out.split_whitespace().collect::<Vec<_>>().join(" "))
@@ -243,10 +273,100 @@ fn header(body: &str, name: &str) -> Option<String> {
     None
 }
 
-fn eml_part(raw: &str) -> String {
+/// Decodifica `=?charset?B|Q?texto?=` de un encabezado MIME.
+fn decode_words(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("=?") {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i + 2..];
+        let Some(j) = tail.find("?=") else {
+            out.push_str("=?");
+            rest = tail;
+            continue;
+        };
+        let inner = &tail[..j];
+        let mut parts = inner.splitn(3, '?');
+        let charset = parts.next().unwrap_or("");
+        let enc = parts.next().unwrap_or("").to_ascii_uppercase();
+        let text = parts.next().unwrap_or("");
+        let bytes = if enc == "B" {
+            decode_base64(text)
+        } else {
+            decode_qp(&text.replace('_', " "))
+        };
+        out.push_str(&decode_charset(&bytes, charset));
+        rest = &tail[j + 2..];
+    }
+    out.push_str(rest);
+    out
+}
+
+fn cp1252(b: u8) -> char {
+    match b {
+        0x80 => '€', 0x82 => '‚', 0x83 => 'ƒ', 0x84 => '„', 0x85 => '…', 0x86 => '†',
+        0x87 => '‡', 0x88 => 'ˆ', 0x89 => '‰', 0x8A => 'Š', 0x8B => '‹', 0x8C => 'Œ',
+        0x8E => 'Ž', 0x91 => '‘', 0x92 => '’', 0x93 => '“', 0x94 => '”', 0x95 => '•',
+        0x96 => '–', 0x97 => '—', 0x98 => '˜', 0x99 => '™', 0x9A => 'š', 0x9B => '›',
+        0x9C => 'œ', 0x9E => 'ž', 0x9F => 'Ÿ',
+        _ => char::from_u32(b as u32).unwrap_or('\u{FFFD}'),
+    }
+}
+
+fn decode_charset(bytes: &[u8], charset: &str) -> String {
+    let cs = charset.to_ascii_lowercase();
+    if cs.contains("utf-16") || bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        let be = cs.contains("be") || bytes.starts_with(&[0xFE, 0xFF]);
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|w| if be { u16::from_be_bytes([w[0], w[1]]) } else { u16::from_le_bytes([w[0], w[1]]) })
+            .collect();
+        return String::from_utf16_lossy(&units);
+    }
+    if cs.contains("iso-8859-1") || cs.contains("latin1") || cs.contains("windows-1252") || cs.contains("cp1252") {
+        return bytes.iter().map(|&b| cp1252(b)).collect();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn boundary_of(ctype: &str) -> Option<String> {
+    ctype
+        .split(';')
+        .find_map(|p| p.trim().strip_prefix("boundary="))
+        .map(|b| b.trim_matches('"').to_string())
+}
+
+fn eml_multipart(raw: &str, ctype: &str, depth: usize) -> String {
+    if depth > 4 {
+        return String::new();
+    }
+    let Some(b) = boundary_of(ctype) else { return String::new() };
+    let mut out = String::new();
+    for part in raw.split(&format!("--{b}")) {
+        let p = part.trim_start_matches('\n');
+        if p.starts_with("--") || p.trim().is_empty() {
+            continue;
+        }
+        let t = eml_part(p, depth + 1);
+        if !t.trim().is_empty() {
+            out.push_str(&t);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+fn eml_part(raw: &str, depth: usize) -> String {
     let (head, body) = raw.split_once("\n\n").unwrap_or((raw, ""));
-    let enc = header(head, "content-transfer-encoding").unwrap_or_default().to_ascii_lowercase();
+    let disp = header(head, "content-disposition").unwrap_or_default().to_ascii_lowercase();
+    if disp.contains("attachment") || disp.contains("filename=") {
+        return String::new();
+    }
     let ctype = header(head, "content-type").unwrap_or_default().to_ascii_lowercase();
+    if !ctype.is_empty() && !ctype.contains("text/") && !ctype.contains("multipart/") {
+        return String::new();
+    }
+    let enc = header(head, "content-transfer-encoding").unwrap_or_default().to_ascii_lowercase();
     let bytes = if enc.contains("quoted-printable") {
         decode_qp(body)
     } else if enc.contains("base64") {
@@ -254,7 +374,10 @@ fn eml_part(raw: &str) -> String {
     } else {
         body.as_bytes().to_vec()
     };
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let text = decode_charset(&bytes, &ctype);
+    if ctype.contains("multipart/") {
+        return eml_multipart(&text, &ctype, depth);
+    }
     if ctype.contains("text/html") { strip_html(&text) } else { text }
 }
 
@@ -265,33 +388,12 @@ fn eml_text(raw: &str) -> String {
         if let Some(v) = header(&norm, h) {
             out.push_str(h);
             out.push_str(": ");
-            out.push_str(&v);
+            out.push_str(&decode_words(&v));
             out.push('\n');
         }
     }
     out.push('\n');
-    let ctype = header(&norm, "content-type").unwrap_or_default();
-    if ctype.to_ascii_lowercase().contains("multipart/") {
-        let boundary = ctype
-            .split(';')
-            .find_map(|p| p.trim().strip_prefix("boundary="))
-            .map(|b| b.trim_matches('"').to_string());
-        if let Some(b) = boundary {
-            for part in norm.split(&format!("--{b}")) {
-                let p = part.trim_start_matches('\n');
-                if p.starts_with("--") || p.trim().is_empty() {
-                    continue;
-                }
-                let t = eml_part(p);
-                if !t.trim().is_empty() {
-                    out.push_str(&t);
-                    out.push('\n');
-                }
-            }
-            return out;
-        }
-    }
-    out.push_str(&eml_part(&norm));
+    out.push_str(&eml_part(&norm, 0));
     out
 }
 
@@ -408,8 +510,9 @@ fn ocr_pdf(path: &Path, tools: &Tools, deep: bool) -> Option<Extracted> {
     if !tools.pdftotext || !tools.tesseract {
         return None;
     }
-    // pdftoppm genera una imagen temporal por página; se OCR-ea la primera.
-    let dir = std::env::temp_dir().join(format!("wzocr-{}", std::process::id()));
+    // Directorio único por llamada: dos búsquedas simultáneas no comparten PNGs.
+    let dir = temp_file("ocr");
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
     let out = dir.join("page");
     let max_pages = if deep { 20 } else { 1 };
@@ -460,6 +563,7 @@ fn unescape(s: &str) -> String {
             "gt" => Some('>'),
             "quot" => Some('"'),
             "apos" => Some('\''),
+            "nbsp" => Some(' '),
             _ => ent
                 .strip_prefix("#x")
                 .and_then(|h| u32::from_str_radix(h, 16).ok())
@@ -710,9 +814,13 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
             }
             None => {
                 let Some(ex) = extract(path, deep, &tools) else { continue };
+                if !ex.note.is_empty() && notes.len() < 30 {
+                    notes.push(format!("{}: {}", p, ex.note));
+                }
                 if owner
                     && let Some(c) = &index
                     && !ex.text.is_empty()
+                    && ex.note.is_empty()
                     && crate::content_index::put(c, &p, size, modified, ex.kind, &ex.text).is_ok()
                 {
                     index_writes += 1;
@@ -866,8 +974,38 @@ continuaci=C3=B3n
 ";
         let text = eml_text(raw);
         assert!(text.contains("Subject:"));
+        assert!(text.contains("abril"), "RFC 2047 subject is decoded");
         assert!(text.contains("Hola mundo"));
         assert!(text.contains("continuación"));
+    }
+
+    #[test]
+    fn eml_multipart_skips_attachments() {
+        let raw = r#"Content-Type: multipart/mixed; boundary="b"
+
+--b
+Content-Type: text/plain; charset=utf-8
+
+Hola mundo
+--b
+Content-Type: application/pdf; name=a.pdf
+Content-Disposition: attachment; filename=a.pdf
+Content-Transfer-Encoding: base64
+
+JVBERi0xLjQ=
+--b--
+"#;
+        let text = eml_text(raw);
+        assert!(text.contains("Hola mundo"));
+        assert!(!text.contains("JVBERi"), "el adjunto no debe indexarse");
+    }
+
+    #[test]
+    fn html_tags_do_not_glue_words() {
+        let text = strip_html("<p>Hola<b>mundo</b><br>otra</p><script>x()</script>");
+        assert!(text.contains("Hola mundo"));
+        assert!(text.contains("otra"));
+        assert!(!text.contains("x()"));
     }
 
     #[test]

@@ -14,17 +14,37 @@ use crate::tree::{ROOT, Tree};
 const FAST_DIRS: usize = 20_000;
 const DEEP_DIRS: usize = 200_000;
 
-fn ancestor(a: &str, b: &str) -> bool {
-    let (a, b) = (a.to_lowercase(), b.to_lowercase());
-    b.len() > a.len() && b.starts_with(&a) && b.as_bytes().get(a.len()) == Some(&b'\\')
+fn is_drive_child(t: &Tree, id: u32) -> bool {
+    let p = t.nodes[id as usize].parent;
+    p != ROOT && t.nodes[p as usize].parent == ROOT
 }
 
-fn skip_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case(".git")
+fn skip_id(t: &Tree, id: u32) -> bool {
+    let name = t.name(id);
+    if name.eq_ignore_ascii_case(".git")
         || name.eq_ignore_ascii_case("$RECYCLE.BIN")
         || name.eq_ignore_ascii_case("System Volume Information")
-        || name.eq_ignore_ascii_case("Windows")
-        || name.eq_ignore_ascii_case("WinSxS")
+    {
+        return true;
+    }
+    // Windows/WinSxS sólo en la raíz de una unidad, no en una carpeta de usuario
+    // llamada "Windows".
+    is_drive_child(t, id)
+        && (name.eq_ignore_ascii_case("Windows") || name.eq_ignore_ascii_case("WinSxS"))
+}
+
+fn ancestor_owner(path: &str, map: &HashMap<String, usize>) -> Option<usize> {
+    let mut s = path;
+    while let Some(i) = s.rfind('\\') {
+        s = &s[..i];
+        if s.is_empty() {
+            break;
+        }
+        if let Some(&g) = map.get(&s.to_lowercase()) {
+            return Some(g);
+        }
+    }
+    None
 }
 
 fn hash_dir(t: &Tree, id: u32, memo: &mut HashMap<u32, u64>) -> u64 {
@@ -36,7 +56,7 @@ fn hash_dir(t: &Tree, id: u32, memo: &mut HashMap<u32, u64>) -> u64 {
         let n = &t.nodes[c as usize];
         let name = t.name(c).to_ascii_lowercase();
         if n.is_dir() {
-            if skip_name(&name) {
+            if skip_id(t, c) {
                 continue;
             }
             let h = hash_dir(t, c, memo);
@@ -61,14 +81,16 @@ pub fn duplicate_folders(t: &Tree, root: u32, limit: usize, deep: bool) -> Value
     let mut groups: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut stack = vec![root];
     let mut scanned = 0usize;
+    let mut skipped = 0usize;
     while let Some(id) = stack.pop() {
         if id != ROOT && t.nodes[id as usize].is_dir() {
-            let name = t.name(id);
-            if skip_name(name) {
+            if skip_id(t, id) {
+                skipped += 1;
                 continue;
             }
             let n = &t.nodes[id as usize];
-            if n.files >= 2 && n.size > 0 {
+            // Una carpeta con un solo archivo grande también puede ser una copia.
+            if n.files >= 1 && n.size > 0 {
                 let h = hash_dir(t, id, &mut memo);
                 groups.entry(h).or_default().push(id);
                 scanned += 1;
@@ -120,43 +142,95 @@ pub fn duplicate_folders(t: &Tree, root: u32, limit: usize, deep: bool) -> Value
         })
         .collect();
 
-    // Una carpeta dentro de otra duplicada duplicaría los bytes. Se marca el
-    // grupo anidado y se le pone redundancia 0 para no inflar el total.
-    let all_paths: Vec<String> = out
-        .iter()
-        .flat_map(|g| g["items"].as_array().into_iter().flatten())
-        .filter_map(|i| i["path"].as_str().map(|s| s.to_string()))
-        .collect();
-    for g in &mut out {
-        let Some(items) = g["items"].as_array() else { continue };
-        let nested = items.iter().any(|i| {
-            let p = i["path"].as_str().unwrap_or("");
-            all_paths.iter().any(|q| q != p && ancestor(q, p))
-        });
-        if nested {
-            g["nested"] = json!(true);
-            g["redundant_bytes"] = json!(0u64);
+    // Resolver anidamientos con un mapa de rutas, no comparando todos contra
+    // todos: con 20.000 carpetas eso era O(N²) y congelaba la UI.
+    let mut path_group: HashMap<String, usize> = HashMap::new();
+    for (gi, g) in out.iter().enumerate() {
+        if let Some(items) = g["items"].as_array() {
+            for item in items {
+                if let Some(p) = item["path"].as_str() {
+                    path_group.insert(p.to_lowercase(), gi);
+                }
+            }
         }
     }
+    for gi in 0..out.len() {
+        let paths: Vec<String> = out[gi]["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|i| i["path"].as_str().map(|s| s.to_string()))
+            .collect();
+        let owners: Vec<Option<usize>> = paths
+            .iter()
+            .map(|p| ancestor_owner(p, &path_group).filter(|&o| o != gi))
+            .collect();
+        let nested_count = owners.iter().filter(|o| o.is_some()).count();
+        let all_nested = nested_count == paths.len() && paths.len() > 1;
+        let same_owner = owners.iter().flatten().copied().collect::<std::collections::HashSet<_>>().len() == 1;
+        let suppressed = all_nested && same_owner;
+
+        let (mut effective_total, mut effective_max, mut effective_n) = (0u64, 0u64, 0usize);
+        if let Some(items) = out[gi]["items"].as_array() {
+            for (i, item) in items.iter().enumerate() {
+                if suppressed || owners.get(i).and_then(|o| *o).is_none() {
+                    let b = item["bytes"].as_u64().unwrap_or(0);
+                    effective_total += b;
+                    effective_max = effective_max.max(b);
+                    effective_n += 1;
+                }
+            }
+        }
+        let redundant = if suppressed { 0 } else { effective_total.saturating_sub(effective_max) };
+        if let Some(items) = out[gi]["items"].as_array_mut() {
+            for (i, item) in items.iter_mut().enumerate() {
+                item["nested"] = json!(owners.get(i).and_then(|o| *o).is_some());
+            }
+        }
+        out[gi]["nested"] = json!(suppressed);
+        out[gi]["nested_copies"] = json!(nested_count);
+        out[gi]["effective_copies"] = json!(if suppressed { 0 } else { effective_n });
+        out[gi]["redundant_bytes"] = json!(redundant);
+    }
+
     out.sort_by(|a, b| b["redundant_bytes"].as_u64().cmp(&a["redundant_bytes"].as_u64()));
-    let shown = out.len().min(limit);
-    out.truncate(limit);
+    let total_groups = out.len();
     let redundant: u64 = out.iter().map(|g| g["redundant_bytes"].as_u64().unwrap_or(0)).sum();
+    let shown = total_groups.min(limit);
+    out.truncate(limit);
 
     json!({
         "kind": "duplicate_folders",
         "path": t.full_path(root),
         "folders": scanned,
-        "groups": shown,
+        "groups": total_groups,
+        "shown": shown,
         "items": out,
         "redundant_bytes": redundant,
         "partial": scanned >= cap,
+        "truncated": total_groups > shown,
+        "skipped_folders": skipped,
         "mode": if deep { "deep" } else { "fast" },
         "elapsed_ms": started.elapsed().as_millis() as u64,
         "note": "Comparación estructural (nombres + tamaños). No borra nada.",
         "notes": [
-            "Se ignoran .git, Papelera, System Volume Information, Windows y WinSxS.",
+            "Se ignoran .git, Papelera, System Volume Information y Windows/WinSxS en la raíz de una unidad.",
+            "Los grupos anidados dentro de otro grupo se marcan nested y no suman bytes redundantes.",
             "Dos carpetas pueden coincidir en estructura y no en contenido: revisá antes de actuar.",
         ],
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ancestor_owner_uses_nearest_path() {
+        let mut map = HashMap::new();
+        map.insert(r"c:\a".to_string(), 0);
+        map.insert(r"c:\a\sub".to_string(), 1);
+        assert_eq!(ancestor_owner(r"C:\a\sub\f.bin", &map), Some(1));
+        assert_eq!(ancestor_owner(r"C:\b\f.bin", &map), None);
+    }
 }

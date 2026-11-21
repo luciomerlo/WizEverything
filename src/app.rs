@@ -4539,9 +4539,31 @@ impl App {
             mode_es(v)
         ));
         ui.label(RichText::new(v["note"].as_str().unwrap_or("")).weak());
+        if v["partial"].as_bool().unwrap_or(false) {
+            ui.colored_label(
+                Color32::from_rgb(220, 160, 70),
+                tr(
+                    "Parcial: se alcanzó el tope de carpetas analizadas.",
+                    "Partial: the folder-analysis cap was reached.",
+                ),
+            );
+        }
+        if v["truncated"].as_bool().unwrap_or(false) {
+            ui.label(RichText::new(format!(
+                "Mostrando {} de {} grupos.",
+                v["shown"],
+                v["groups"]
+            )).weak());
+        }
         let empty: Vec<serde_json::Value> = Vec::new();
         for g in v["items"].as_array().unwrap_or(&empty) {
             ui.separator();
+            if g["nested"].as_bool().unwrap_or(false) {
+                ui.colored_label(
+                    Color32::from_rgb(220, 160, 70),
+                    tr("Anidada dentro de otro grupo: no suma bytes.", "Nested inside another group: not counted."),
+                );
+            }
             ui.label(RichText::new(format!(
                 "{} copias · {} redundantes · conservar: {}",
                 g["copies"],
@@ -4553,6 +4575,13 @@ impl App {
                     ui.label(format!("{:>9}", fmt_size(c["bytes"].as_u64().unwrap_or(0))));
                     ui.label(RichText::new(c["path"].as_str().unwrap_or("")).size(10.0));
                 });
+            }
+        }
+        if let Some(notes) = v["notes"].as_array() {
+            for n in notes {
+                if let Some(n) = n.as_str() {
+                    ui.label(RichText::new(format!("• {n}")).weak().size(10.0));
+                }
             }
         }
     }

@@ -22,6 +22,8 @@ use crate::snapshot::{self, Entry, Snapshot};
 
 const MAGIC: &[u8; 8] = b"WZECAT1\0";
 const ZSTD_LEVEL: i32 = 19; // alto: el catálogo se escribe una vez y se lee muchas
+const MAX_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
+const MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Catálogo de un volumen externo.
 #[derive(Clone, Debug, Default)]
@@ -119,11 +121,18 @@ impl Catalog {
         let volume_serial = read_u64(&mut r)?;
         let created = read_i64(&mut r)?;
         let pay_len = read_u32(&mut r)? as usize;
+        if pay_len > bytes.len() || pay_len > MAX_PAYLOAD_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "payload .ecat absurdo"));
+        }
         let mut payload = vec![0u8; pay_len];
         r.read_exact(&mut payload)?;
 
         let mut decompressed = Vec::new();
-        zstd::Decoder::new(&payload[..])?.read_to_end(&mut decompressed)?;
+        let mut limited = zstd::Decoder::new(&payload[..])?.take(MAX_DECOMPRESSED_BYTES + 1);
+        let n = limited.read_to_end(&mut decompressed)?;
+        if n as u64 > MAX_DECOMPRESSED_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "catálogo descomprimido demasiado grande"));
+        }
         let snap = snapshot::decode(&decompressed)?;
 
         Ok(Catalog::new(volume_name, volume_serial, created, snap.entries))

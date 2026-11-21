@@ -40,7 +40,7 @@ fn render(v: &Value, out: &mut String, depth: usize) {
                 out.push_str("<span class=null>—</span>");
             } else if a.iter().all(|x| x.is_object()) {
                 let mut keys: Vec<String> = Vec::new();
-                for x in a.iter().take(20) {
+                for x in a.iter() {
                     if let Some(o) = x.as_object() {
                         for k in o.keys() {
                             if !keys.contains(k) {
@@ -161,6 +161,9 @@ fn reports_dir() -> PathBuf {
 
 /// Guarda el reporte y devuelve la ruta del HTML.
 pub fn save(title: &str, v: &Value) -> Result<PathBuf, String> {
+    if v.get("error").is_some() {
+        return Err("No se guarda un reporte con error.".to_string());
+    }
     let dir = reports_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("No pude crear {}: {e}", dir.display()))?;
     let stamp = std::time::SystemTime::now()
