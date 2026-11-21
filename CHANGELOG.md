@@ -26,6 +26,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   archivos temporales si falla el lanzamiento.
 - `machine_compare`: avisa cuando menos del 5% de las rutas coinciden, acepta `strip_a`/`strip_b`
   para quitar raíces distintas y limita el tamaño de snapshots y la descompresión de `.ecat`.
+  También se puede lanzar desde **Planificación → A:/B:** en la app.
 - El presupuesto de `content_search` ahora se reparte entre `pdftotext`, rasterización y cada página
   de OCR, en vez de comprobarse sólo entre archivos.
 

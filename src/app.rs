@@ -536,6 +536,9 @@ pub struct App {
     setup_det_at: Instant,
     /// Objetivo del planificador de espacio.
     plan_target_gb: u32,
+    /// Snapshots/catálogos para comparar dos máquinas.
+    machine_a: String,
+    machine_b: String,
 
     // incremental sync
     sync_rx: Option<Receiver<(u64, String, Result<Vec<Change>, String>)>>,
@@ -678,6 +681,8 @@ impl App {
             setup_det: None,
             setup_det_at: Instant::now() - Duration::from_secs(10),
             plan_target_gb: 100,
+            machine_a: String::new(),
+            machine_b: String::new(),
             sync_rx: None,
             pending_changes: None,
             sync_stamp: String::new(),
@@ -2155,6 +2160,34 @@ impl App {
                             .clicked()
                         {
                             self.set_report(tr("Pronóstico de disco", "Disk forecast"), crate::mcp_tools::forecast(tree, root, &caps));
+                        }
+                    });
+                    ui.separator();
+                    ui.label(RichText::new(tr(
+                        "Comparar dos máquinas o volúmenes (.wzsnap/.ecat)",
+                        "Compare two machines or volumes (.wzsnap/.ecat)",
+                    )).strong());
+                    ui.horizontal(|ui| {
+                        ui.label("A:");
+                        ui.add(egui::TextEdit::singleline(&mut self.machine_a).desired_width(260.0).hint_text(tr("snapshot o .ecat", "snapshot or .ecat")));
+                        ui.label("B:");
+                        ui.add(egui::TextEdit::singleline(&mut self.machine_b).desired_width(260.0));
+                        if ui
+                            .button(tr("Comparar", "Compare"))
+                            .on_hover_text(tr(
+                                "Cruza dos snapshots por ruta. Si las máquinas usan distinta unidad o usuario, usá el MCP con strip_a/strip_b. (Experimental)",
+                                "Crosses two snapshots by path. If the machines use a different drive/user, use MCP with strip_a/strip_b. (Experimental)",
+                            ))
+                            .clicked()
+                        {
+                            let args = serde_json::json!({
+                                "a": self.machine_a.trim(),
+                                "b": self.machine_b.trim(),
+                            });
+                            self.set_report(
+                                tr("Comparar máquinas (exp)", "Compare machines (exp)"),
+                                crate::mcp_tools::machine_compare(&args, 20),
+                            );
                         }
                     });
                 });
@@ -4529,6 +4562,46 @@ impl App {
         }
     }
 
+    fn machine_compare_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
+        ui.heading(tr("Comparar máquinas", "Compare machines"));
+        ui.label(format!(
+            "A: {} ({} archivos)  ·  B: {} ({} archivos)",
+            v["a"]["label"].as_str().unwrap_or("?"),
+            v["a"]["entries"],
+            v["b"]["label"].as_str().unwrap_or("?"),
+            v["b"]["entries"]
+        ));
+        ui.label(format!(
+            "{} neto · {}% de rutas en común",
+            fmt_size(v["net_bytes"].as_i64().unwrap_or(0).unsigned_abs()),
+            v["overlap_pct"].as_f64().unwrap_or(0.0)
+        ));
+        let empty: Vec<serde_json::Value> = Vec::new();
+        for w in v["warnings"].as_array().unwrap_or(&empty) {
+            ui.colored_label(Color32::from_rgb(220, 160, 70), w.as_str().unwrap_or(""));
+        }
+        for (key, title) in [
+            ("only_a", tr("Sólo en A", "Only in A")),
+            ("only_b", tr("Sólo en B", "Only in B")),
+            ("grown", tr("Crecieron", "Grew")),
+            ("shrunk", tr("Se achicaron", "Shrank")),
+        ] {
+            let sec = &v[key];
+            if sec["files"].as_u64().unwrap_or(0) == 0 {
+                continue;
+            }
+            ui.separator();
+            ui.label(RichText::new(format!("{title}: {} archivos · {}", sec["files"], fmt_size(sec["bytes"].as_u64().unwrap_or(0)))).strong());
+            for it in sec["top"].as_array().unwrap_or(&empty) {
+                ui.horizontal(|ui| {
+                    let b = it["bytes"].as_u64().unwrap_or(0);
+                    ui.label(format!("{:>9}", fmt_size(b)));
+                    ui.label(RichText::new(it["path"].as_str().unwrap_or("")).size(10.0));
+                });
+            }
+        }
+    }
+
     fn duplicate_folders_report_ui(&mut self, ui: &mut egui::Ui, v: &serde_json::Value) {
         ui.heading(tr("Carpetas duplicadas", "Duplicate folders"));
         ui.label(format!(
@@ -5161,6 +5234,7 @@ impl App {
             Some("forecast") => self.forecast_report_ui(ui, v),
             Some("github_clones") => self.github_clones_report_ui(ui, v),
             Some("duplicate_folders") => self.duplicate_folders_report_ui(ui, v),
+            Some("machine_compare") => self.machine_compare_report_ui(ui, v),
             _ => {
                 ui.add(
                     egui::Label::new(
