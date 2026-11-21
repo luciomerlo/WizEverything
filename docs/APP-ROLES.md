@@ -1,6 +1,6 @@
 # Reparto de funciones — WizEverything / SortEverything / Census
 
-**Estado:** borrador vivo. Última actualización: 2026-11-21 (revisión de Census).
+**Estado:** borrador vivo. Última actualización: 2026-11-21 (revisión Census + Sort).
 **Fuente única de este documento:** `C:\Users\Lucio\Downloads\WizEverything\docs\APP-ROLES.md`.
 Si otra app necesita corregir algo, que lo pida; no se duplica el documento en tres repos.
 
@@ -88,8 +88,8 @@ tengan límites claros y para detectar solapamientos antes de que se conviertan 
   (≤ 1 s de journal) y se anuncia en `activity-Census.json`.
 - Pausa implementada: `%LOCALAPPDATA%\Census\pause.json`, `census pause --until 22:00 | --for 8h`,
   `census resume`; en pausa reusa el snapshot aunque esté viejo y las consultas siguen respondiendo.
-- En progreso: C1 identidad `vol_serial`+`frn`, C2 delta USN, C4 `nightly-state`, C5 nube explícita,
-  C6 locks/actividad, robustez de `serve`.
+- En progreso: C2 delta USN, C4 `nightly-state`, C5 nube explícita, C6 locks/actividad,
+  robustez de `serve`. C1 identidad ya está implementada en Census (`c476239`).
 - El shim `Everything64.dll` está **diferido/opcional**: Sort no lo necesita; usa `WM_COPYDATA`
   para Census y la DLL real sólo para Everything 1.4.
 - Capacidades: `reply.flags` anuncia sólo los campos que viajan, con
@@ -153,13 +153,22 @@ Reglas vigentes acordadas con las tres apps:
    checkpoint y libera el lock. Nunca deja SQLite a medias.
 6. **Wiz tiene prioridad** si el usuario fuerza varias apps a la vez. Sort/Census pausan en el
    próximo punto seguro y avisan “pausado por WizEverything”.
-7. **Pausa persistente** por app: `pause.json` con `paused`, `resume_at`, `reason`.
-   El trabajo pesado se corta en límites seguros; las consultas siguen respondiendo con lo indexado.
-   Census ya la implementó; Wiz la hace en P0; Sort la implementa en su próxima tanda.
+7. **Pausa persistente** por app: `pause.json` en la carpeta de datos de cada app, con
+   `paused`, `resume_at` (epoch ms; `null` si es indefinida), `reason` y `updated`.
+   Escritura `tmp` + `rename`; el trabajo pesado se corta en límites seguros y las consultas siguen
+   respondiendo con lo indexado. Census ya la implementó y sigue leyendo el formato viejo
+   `clave=valor`; Wiz la hace en P0; Sort la implementa en su próxima tanda.
 8. **Google Drive/streaming**: metadata-only. No se hidrata, no se hashea, no se hace OCR,
    no se abren comprimidos, no se copia entre volúmenes. Hidratar es una acción explícita aparte.
    Census además excluye las unidades de nube de `index_all` por defecto (C5); `--include-cloud`
    sólo enumera directorios y metadata, nunca abre archivos.
+
+Formato compartido de `pause.json`:
+```json
+{"paused":true,"resume_at":1795314600000,"reason":"manual","updated":1795300387000}
+```
+`resume_at` es epoch ms y puede ser `null` si la pausa es indefinida. Census sigue leyendo el
+formato viejo `clave=valor` para no romper instalaciones existentes.
 
 ### Actividad y locks (contrato; Sort ya lo implementó, Wiz/Census pendientes)
 
@@ -185,9 +194,9 @@ Reglas vigentes acordadas con las tres apps:
 - `%LOCALAPPDATA%\WizeShared\locks\cloud-<provider>.lock` y `gpu-<n>.lock` quedan disponibles
   para quien pueda identificar el recurso; si no, aplica el aviso por raíces.
 
-### Identidad IPC (C1, acordada; aún no implementada)
+### Identidad IPC (C1 implementada en Census; Wiz aún no la consume)
 
-- Capacidad nueva: `IDENTITY = 0x0001_0000` en `WM_USER+402`.
+- Capacidad nueva: `IDENTITY = 0x0001_0000` en `WM_USER+402`. `census probe` la muestra.
 - En la respuesta binaria, al final: **16 bytes por ítem**, dos `u64` little-endian
   (`vol_serial`, `frn`). Siempre presente si el cliente anunció la capacidad; no altera el
   `offset` de 8 B por ítem de la respuesta base.
@@ -196,6 +205,8 @@ Reglas vigentes acordadas con las tres apps:
 - `frn = 0` = sin identidad → fallback `path + size + mtime`.
 - `reply.flags` sólo anuncia los campos que realmente viajan; `PARTIAL_METADATA = 0x8000`
   cuando falta `run_count`. Sin ese bit, Wiz leería `run_count = 0` como “nunca ejecutado”.
+- Census corrigió además el parser para avanzar al leer `run_count`, que desalineaba los campos
+  posteriores.
 
 ---
 
@@ -204,8 +215,8 @@ Reglas vigentes acordadas con las tres apps:
 - Ruta única: `%LOCALAPPDATA%\WizeShared\content-index.sqlite3` (env `WIZE_SHARED_INDEX`).
 - SQLite WAL, `busy_timeout` 5 s, lease de 300 s con heartbeat.
 - **Wiz escribe si está vivo.** Si no, Sort puede reclamar el lease y escribir. Nunca dos escritores.
-- **Census no escribe** el SQLite: aporta identidad (`vol_serial`+`frn`) y, cuando exista, el
-  stream de cambios.
+- **Census no escribe** el SQLite: aporta identidad (`vol_serial`+`frn`, ya implementada en
+  `c476239`) y, cuando exista, el stream de cambios.
 - **Sort es lector por defecto.** En modo standalone extrae su propio texto de PDF/Office y no
   depende de Wiz; en modo compartido lee lo que Wiz ya indexó.
 - Esquema v2: `vol_serial`, `frn` (64 bits), `source`; `frn=0` = sin identidad y fallback a
@@ -371,17 +382,19 @@ desbloquean el trabajo de las tres apps.
 - Índice MFT+USN multiunidad; arrays planos; arena UTF-16.
 - Snapshot `C.wcat` por volumen, cabecera versionada, checksum, escritura atómica.
 - IPC `QUERY2W` registrado en `CENSUS_IPC` y `EVERYTHING_TASKBAR_NOTIFICATION`; capacidad
-  `IDENTITY` (C1) pendiente.
+  `IDENTITY` (C1) **implementada** en `c476239` (`census probe` la muestra).
 - **Búsqueda por fragmentos** en nombre, extensión y carpetas; sin regex/comodines en la ventana.
   El parser IPC conserva `path:`, `ext:`, `size:`, `dm:`, `rc:`, `file:`/`folder:` para Wiz/Sort.
 - Ventana vacía estilo Everything; tabla de resultados. Sin árbol/treemap (eso es Wiz).
 - CLI, MCP, GUI, `drives`, `bench`, `ask` (Groq).
 - Residente sólo por el USN; MFT/`--rebuild`/relectura y replay largo son forzados. Replay corto
   (≤ 1 s) se anuncia en `activity-Census.json`; si hay otra tarea pesada, espera.
-- Pausa implementada (`pause.json`, `census pause --until 22:00 | --for 8h`, `census resume`);
-  en pausa reusa el snapshot viejo y las consultas siguen. Falta `nightly-state.json` (C4).
-- En progreso: C1 identidad `vol_serial`+`frn`, C2 delta USN, C4 checkpoint/docs, C5 nube
-  explícita, C6 locks/actividad, robustez de `serve`. Shim diferido/opcional.
+- Pausa implementada (`pause.json` JSON compartido, `census pause --until 22:00 | --for 8h`,
+  `census resume`); en pausa reusa el snapshot viejo y las consultas siguen. Falta
+  `nightly-state.json` (C4).
+- En progreso: C2 delta USN, C4 checkpoint/docs, C5 nube explícita, C6 locks/actividad, robustez
+  de `serve`. C1 identidad ya está; shim diferido/opcional.
+- Estado medido: **113 tests verdes, clippy limpio**, commit `c476239`.
 - `index_all()` hoy incluye G:/H:; C5 debe excluir nube por defecto, marcar `virtual · no
   indexable` en `census drives` y dejar `--include-cloud` sólo para enumeración metadata-only.
 - Capacidades: `PARTIAL_METADATA = 0x8000` cuando falta `run_count`; `ChangeWindowMessageFilterEx`
@@ -411,7 +424,8 @@ desbloquean el trabajo de las tres apps.
 - **Census residente sólo por el USN**; MFT/`--rebuild`/relectura y replay largo son forzados.
 - **Búsqueda de Census**: fragmentos en nombre/extensión/carpetas; sin regex/comodines en la UI.
   El IPC sigue aceptando operadores porque Wiz/Sort los mandan.
-- **Identidad**: capacidad `IDENTITY`, 16 B por ítem en binario, hex en JSON/MCP, `frn=0` fallback.
+- **Identidad**: capacidad `IDENTITY` implementada en Census (`c476239`), 16 B por ítem en
+  binario, hex en JSON/MCP, `frn=0` fallback. Wiz todavía no la consume.
 - **Shim `Everything64.dll`**: diferido/opcional; Sort no lo necesita.
 - **Nube**: C5, excluida por defecto; `--include-cloud` metadata-only.
 - **Pausa**: Census ya la tiene; Wiz la implementa en P0; falta `nightly-state` de Census (C4).
