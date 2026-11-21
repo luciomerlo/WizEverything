@@ -5,7 +5,7 @@
 //! archivo conserva su ruta y se lee normal; Windows lo descomprime al vuelo.
 //!
 //! El buffer de entrada es `WOF_EXTERNAL_INFO` seguido de
-//! `FILE_PROVIDER_EXTERNAL_INFO_V1` (versión + algoritmo).
+//! `FILE_PROVIDER_EXTERNAL_INFO_V1` (versión + algoritmo + flags).
 
 #![cfg(windows)]
 
@@ -82,11 +82,12 @@ fn open_rw(path: &Path) -> io::Result<Owned> {
 
 /// Buffer `WOF_EXTERNAL_INFO` + `FILE_PROVIDER_EXTERNAL_INFO_V1`.
 fn wof_file_buffer(algorithm: u32) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(16);
+    let mut buf = Vec::with_capacity(20);
     buf.extend_from_slice(&WOF_CURRENT_VERSION.to_le_bytes()); // WOF_EXTERNAL_INFO.Version
     buf.extend_from_slice(&WOF_PROVIDER_FILE.to_le_bytes()); //   WOF_EXTERNAL_INFO.Provider
     buf.extend_from_slice(&FILE_PROVIDER_CURRENT_VERSION.to_le_bytes()); // info.Version
     buf.extend_from_slice(&algorithm.to_le_bytes()); // info.Algorithm
+    buf.extend_from_slice(&0u32.to_le_bytes()); // info.Flags
     buf
 }
 
@@ -137,7 +138,13 @@ pub fn decompress(path: &Path) -> io::Result<()> {
         )
     };
     if ok == 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        // WOF puede borrar el respaldo y devolver ERROR_NOT_EXTERNALLY_BACKED
+        // (342); el archivo queda normal, que es el resultado buscado.
+        if e.raw_os_error() == Some(342) {
+            return Ok(());
+        }
+        return Err(e);
     }
     Ok(())
 }
@@ -179,8 +186,13 @@ mod tests {
                     phys < logical,
                     "esperaba consumo fisico menor: phys={phys} logical={logical}"
                 );
-                // Limpieza: quitar la compresión.
-                let _ = decompress(&p);
+                // La compresión debe ser reversible con el mismo IOCTL corregido.
+                decompress(&p).expect("WOF decompress");
+                let restored = crate::winphys::physical_size(&p).unwrap_or(0);
+                assert!(
+                    restored >= logical,
+                    "la descompresión debía devolver el tamaño físico: {restored}/{logical}"
+                );
             }
             Err(e) => {
                 std::fs::remove_file(&p).ok();
