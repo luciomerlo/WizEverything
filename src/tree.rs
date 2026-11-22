@@ -518,6 +518,22 @@ fn hsv(h: f32, s: f32, v: f32) -> [u8; 3] {
     [((r + m) * 255.0) as u8, ((g + m) * 255.0) as u8, ((b + m) * 255.0) as u8]
 }
 
+/// Case-insensitive substring search without allocating a lowercase copy of the
+/// name. ASCII is the common case in Windows paths; Unicode falls back to the
+/// full lowercase comparison.
+fn contains_ci(hay: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if needle_lower.is_ascii() {
+        hay.as_bytes()
+            .windows(needle_lower.len())
+            .any(|w| w.eq_ignore_ascii_case(needle_lower.as_bytes()))
+    } else {
+        hay.to_lowercase().contains(needle_lower)
+    }
+}
+
 impl Tree {
     pub fn name(&self, id: u32) -> &str {
         let n = &self.nodes[id as usize];
@@ -642,20 +658,26 @@ impl Tree {
     }
 
     /// Per-extension totals (ext, size, count) restricted to a subtree.
+    ///
+    /// Extension ids are dense (one per known extension), so a Vec beats a
+    /// HashMap here: no hashing per file on a million-node scan.
     pub fn ext_stats(&self, root: u32) -> Vec<(u32, u64, u64)> {
-        let mut acc: HashMap<u32, (u64, u64)> = HashMap::new();
+        let mut acc = vec![(0u64, 0u64); self.exts.len()];
         let mut stack = vec![root];
         while let Some(id) = stack.pop() {
             let n = &self.nodes[id as usize];
             if n.is_dir() {
                 stack.extend_from_slice(self.children(id));
-            } else {
-                let e = acc.entry(n.ext).or_default();
+            } else if let Some(e) = acc.get_mut(n.ext as usize) {
                 e.0 += n.size;
                 e.1 += 1;
             }
         }
-        acc.into_iter().map(|(k, (s, c))| (k, s, c)).collect()
+        acc.iter()
+            .enumerate()
+            .filter(|(_, (_, c))| *c > 0)
+            .map(|(k, (s, c))| (k as u32, *s, *c))
+            .collect()
     }
 
     /// The `limit` largest files of a subtree (optionally name-filtered).
@@ -669,7 +691,7 @@ impl Tree {
                 stack.extend_from_slice(self.children(id));
                 continue;
             }
-            if !filter.is_empty() && !self.name(id).to_lowercase().contains(&filter) {
+            if !filter.is_empty() && !contains_ci(self.name(id), &filter) {
                 continue;
             }
             heap.push(std::cmp::Reverse((n.size, id)));

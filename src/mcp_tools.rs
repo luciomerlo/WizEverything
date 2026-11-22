@@ -392,7 +392,14 @@ pub fn snapshot_save(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let file = dir.join(format!("snap_{stamp}.wzsnap"));
-    std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
+    // Escritura atómica: un corte a mitad no deja un snapshot truncado que luego
+    // rompa la línea de tiempo o el pronóstico.
+    let tmp = file.with_extension("wzsnap.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
     Ok(json!({
         "path": file.to_string_lossy(),
         "entries": snap.entries.len(),
@@ -452,7 +459,14 @@ pub fn catalog_save(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
         .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect();
     let file = dir.join(format!("{safe}.ecat"));
-    std::fs::write(&file, &bytes).map_err(|e| e.to_string())?;
+    // Igual que los snapshots: escribir a temporal y renombrar para no dejar un
+    // catálogo truncado si se corta la luz o se cierra la app.
+    let tmp = file.with_extension("ecat.tmp");
+    std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &file).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        e.to_string()
+    })?;
     Ok(json!({
         "path": file.to_string_lossy(),
         "volume_name": name,
@@ -464,8 +478,9 @@ pub fn catalog_save(t: &Tree, root: u32, a: &Value) -> Result<Value, String> {
 /// M7 — cruza archivos locales contra un catálogo de un disco desconectado.
 pub fn catalog_check(t: &Tree, root: u32, a: &Value, limit: usize) -> Result<Value, String> {
     let cat_path = a.get("catalog").and_then(Value::as_str).ok_or("missing 'catalog' (.ecat path)")?;
-    let cat = crate::catalog::Catalog::decode(&std::fs::read(cat_path).map_err(|e| e.to_string())?)
+    let bytes = crate::snapshot::read_bounded(Path::new(cat_path), crate::snapshot::MAX_FILE_BYTES)
         .map_err(|e| e.to_string())?;
+    let cat = crate::catalog::Catalog::decode(&bytes).map_err(|e| e.to_string())?;
     need_path(root, a)?;
     let max = a.get("max_entries").and_then(Value::as_u64).unwrap_or(500_000).clamp(1, 5_000_000) as usize;
     let mut checked = 0usize;

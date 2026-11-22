@@ -392,6 +392,20 @@ struct ExportJob {
     done: Arc<AtomicU64>,
 }
 
+/// A read-only analysis running off the UI thread. Results computed for an old
+/// tree are dropped instead of overwriting the report of a newer load.
+struct ReportJob {
+    rx: Receiver<Result<serde_json::Value, String>>,
+    title: String,
+    epoch: u64,
+    /// `true` renders pretty JSON in the analysis window, `false` uses the
+    /// structured report renderer.
+    text: bool,
+    /// Optional Fast/Deep ETA key to remember when a fast run finishes.
+    eta: Option<&'static str>,
+    started: Instant,
+}
+
 struct VolumeJob {
     rx: Receiver<Result<crate::volumes::VolumeRecord, String>>,
     progress: Arc<crate::volumes::CaptureProgress>,
@@ -555,6 +569,7 @@ pub struct App {
     real_queue: Option<u32>,
 
     export_job: Option<ExportJob>,
+    report_job: Option<ReportJob>,
     exclusion_dirty: bool,
     dups: Dups,
     ctx_menu: Option<(MenuTarget, egui::Pos2)>,
@@ -584,6 +599,9 @@ pub struct App {
     highlight_ext: Option<u32>,
     /// Extension/category filter applied to the left panel.
     type_filter: Option<u32>,
+    /// Last edit of the Files filter; its recompute is debounced so typing in a
+    /// large index doesn't run a full scan on every keystroke.
+    file_filter_at: Option<Instant>,
     /// Report shown in the Analysis window (title, text).
     analysis: Option<(String, String)>,
     /// Structured report (similar files / GitHub mode) rendered as tables, not JSON.
@@ -696,6 +714,7 @@ impl App {
             real_done: HashSet::new(),
             real_queue: None,
             export_job: None,
+            report_job: None,
             exclusion_dirty: false,
             dups: Dups::default(),
             ctx_menu: None,
@@ -719,6 +738,7 @@ impl App {
             ext_open: HashSet::new(),
             highlight_ext: None,
             type_filter: None,
+            file_filter_at: None,
             analysis: None,
             report: None,
             thumbs: HashMap::new(),
@@ -810,6 +830,8 @@ impl App {
         if self.loading.is_some() {
             return;
         }
+        // A reload invalidates the tree an analysis was reading.
+        self.report_job = None;
         // Una carga completa puede volver a elegir Auto; los deltas de sync
         // quedan fijados al motor que produjo este árbol.
         crate::everything::reset_active();
@@ -1059,6 +1081,35 @@ impl App {
                 Ok((path, rows)) => self.set_info(format!("{} {} → {path}", fmt_int(rows), tr("filas exportadas", "rows exported"))),
                 Err(e) if e.is_empty() => {}
                 Err(e) => self.set_error(e),
+            }
+        }
+        if self.report_job.is_some() {
+            // Keep the spinner alive while the worker scans.
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        if let Some(job) = self.report_job.take() {
+            match job.rx.try_recv() {
+                Ok(r) => {
+                    // A full reload may have happened while the analysis ran.
+                    if job.epoch == self.epoch {
+                        if let Some(kind) = job.eta {
+                            self.remember_eta(kind, job.started.elapsed().as_millis() as u64, &r);
+                        }
+                        if job.text {
+                            let text = match r {
+                                Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_default(),
+                                Err(e) => format!("Error: {e}"),
+                            };
+                            self.analysis = Some((job.title, text));
+                        } else {
+                            self.set_report(&job.title, r);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => self.report_job = Some(job),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.set_error(tr("El análisis se cortó inesperadamente.", "The analysis stopped unexpectedly.").to_string());
+                }
             }
         }
 
@@ -1506,7 +1557,7 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_size([640.0, 220.0])
                 .show(&ctx, |ui| {
-                    self.content_ui(ui, &tree);
+                    self.content_ui(ui);
                 });
             self.content_open = open;
         }
@@ -1517,7 +1568,7 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_size([680.0, 460.0])
                 .show(&ctx, |ui| {
-                    self.timeline_ui(ui, &tree);
+                    self.timeline_ui(ui);
                 });
             self.timeline_open = open;
         }
@@ -1845,10 +1896,16 @@ impl App {
             ui.separator();
             if let Some(tree) = tree {
                 ui.label(RichText::new(tr("Análisis del espacio", "Space analysis")).strong());
-                let fmt = |r: Result<serde_json::Value, String>| match r {
-                    Ok(v) => serde_json::to_string_pretty(&v).unwrap_or_default(),
-                    Err(e) => format!("Error: {e}"),
-                };
+                if let Some(job) = &self.report_job {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(RichText::new(format!(
+                            "{}: {}",
+                            tr("Analizando", "Analyzing"),
+                            job.title
+                        )).weak());
+                    });
+                }
                 let root = self.view_root;
                 let caps = serde_json::json!({
                     "all_drives": true,
@@ -1857,6 +1914,9 @@ impl App {
                     "min_score": 40,
                     "max_entries": 20000
                 });
+                // Analyses run in a worker thread; the Arc keeps the tree alive
+                // and makes the closure independent from this borrow.
+                let report_tree = self.tree.clone();
                 if ui
                     .button(tr("Modo GitHub (carpeta actual) (exp)", "GitHub mode (current folder) (exp)"))
                     .on_hover_text(tr(
@@ -1865,12 +1925,12 @@ impl App {
                     ))
                     .clicked()
                 {
-                    let res = crate::mcp_tools::github_mode(tree, root, &caps, 30);
-                    let title = match &res {
-                        Ok(v) => v.get("title_es").and_then(|x| x.as_str()).unwrap_or("Modo GitHub").to_string(),
-                        Err(_) => "Modo GitHub".to_string(),
-                    };
-                    self.set_report(&format!("GitHub (exp) · {title}"), res);
+                    if let Some(t) = report_tree.clone() {
+                        let c = caps.clone();
+                        self.spawn_report(ctx, "Modo GitHub (exp)", false, move || {
+                            crate::mcp_tools::github_mode(&t, root, &c, 30)
+                        });
+                    }
                 }
                 if ui
                     .button(tr("Auditoría cloud / sparse", "Cloud / sparse audit"))
@@ -1880,7 +1940,12 @@ impl App {
                     ))
                     .clicked()
                 {
-                    self.analysis = Some(("Cloud / sparse audit".into(), fmt(crate::mcp_tools::cloud_audit(tree, root, &caps, 30))));
+                    if let Some(t) = report_tree.clone() {
+                        let c = caps.clone();
+                        self.spawn_report(ctx, "Cloud / sparse audit", true, move || {
+                            crate::mcp_tools::cloud_audit(&t, root, &c, 30)
+                        });
+                    }
                 }
                 if ui
                     .button(tr("Archivos fríos", "Cold files"))
@@ -1890,7 +1955,12 @@ impl App {
                     ))
                     .clicked()
                 {
-                    self.analysis = Some(("Cold files".into(), fmt(crate::mcp_tools::cold_files(tree, root, &caps, 30))));
+                    if let Some(t) = report_tree.clone() {
+                        let c = caps.clone();
+                        self.spawn_report(ctx, "Cold files", true, move || {
+                            crate::mcp_tools::cold_files(&t, root, &c, 30)
+                        });
+                    }
                 }
                 if ui
                     .button(tr("Carpetas frías", "Cold folders"))
@@ -1900,7 +1970,12 @@ impl App {
                     ))
                     .clicked()
                 {
-                    self.analysis = Some(("Cold folders".into(), fmt(crate::mcp_tools::cold_folders(tree, root, &caps, 30))));
+                    if let Some(t) = report_tree.clone() {
+                        let c = caps.clone();
+                        self.spawn_report(ctx, "Cold folders", true, move || {
+                            crate::mcp_tools::cold_folders(&t, root, &c, 30)
+                        });
+                    }
                 }
                 if let Some(deep) = analysis_pair(
                     ui,
@@ -1913,12 +1988,15 @@ impl App {
                 ) {
                     let mut a = caps.clone();
                     a["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
-                    let t0 = Instant::now();
-                    let res = crate::mcp_tools::similar_images(tree, root, &a, 30);
-                    if !deep {
-                        self.remember_eta("images", t0.elapsed().as_millis() as u64, &res);
+                    if let Some(t) = report_tree.clone() {
+                        let title = tr("Imágenes parecidas (exp)", "Similar images (exp)");
+                        let run = move || crate::mcp_tools::similar_images(&t, root, &a, 30);
+                        if deep {
+                            self.spawn_report(ctx, title, false, run);
+                        } else {
+                            self.spawn_report_eta(ctx, title, "images", run);
+                        }
                     }
-                    self.set_report(tr("Imágenes parecidas (exp)", "Similar images (exp)"), res);
                 }
                 if let Some(deep) = analysis_pair(
                     ui,
@@ -1931,12 +2009,15 @@ impl App {
                 ) {
                     let mut a = caps.clone();
                     a["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
-                    let t0 = Instant::now();
-                    let res = crate::mcp_tools::similar_audio(tree, root, &a, 30);
-                    if !deep {
-                        self.remember_eta("audio", t0.elapsed().as_millis() as u64, &res);
+                    if let Some(t) = report_tree.clone() {
+                        let title = tr("Audio parecido (exp)", "Similar audio (exp)");
+                        let run = move || crate::mcp_tools::similar_audio(&t, root, &a, 30);
+                        if deep {
+                            self.spawn_report(ctx, title, false, run);
+                        } else {
+                            self.spawn_report_eta(ctx, title, "audio", run);
+                        }
                     }
-                    self.set_report(tr("Audio parecido (exp)", "Similar audio (exp)"), res);
                 }
                 if let Some(deep) = analysis_pair(
                     ui,
@@ -1950,10 +2031,11 @@ impl App {
                     let mut a = caps.clone();
                     a["path"] = serde_json::json!(tree.full_path(root));
                     a["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
-                    self.set_report(
-                        tr("Velocidad y ETA (exp)", "Speed and ETA (exp)"),
-                        crate::mcp_tools::speed_test(tree, root, &a),
-                    );
+                    if let Some(t) = report_tree.clone() {
+                        self.spawn_report(ctx, tr("Velocidad y ETA (exp)", "Speed and ETA (exp)"), false, move || {
+                            crate::mcp_tools::speed_test(&t, root, &a)
+                        });
+                    }
                 }
                 if ui
                     .button(tr("Addons / Google Photos (exp)", "Addons / Google Photos (exp)"))
@@ -1986,7 +2068,12 @@ impl App {
                     ))
                     .clicked()
                 {
-                    self.analysis = Some(("Compression candidates".into(), fmt(crate::mcp_tools::compression_candidates(tree, root, &caps, 30))));
+                    if let Some(t) = report_tree.clone() {
+                        let c = caps.clone();
+                        self.spawn_report(ctx, "Compression candidates", true, move || {
+                            crate::mcp_tools::compression_candidates(&t, root, &c, 30)
+                        });
+                    }
                 }
                 if ui
                     .button(tr("Plan de hardlinks", "Hardlink plan"))
@@ -1996,7 +2083,12 @@ impl App {
                     ))
                     .clicked()
                 {
-                    self.analysis = Some(("Hardlink plan".into(), fmt(crate::mcp_tools::hardlink_plan(tree, root, &caps, 30))));
+                    if let Some(t) = report_tree.clone() {
+                        let c = caps.clone();
+                        self.spawn_report(ctx, "Hardlink plan", true, move || {
+                            crate::mcp_tools::hardlink_plan(&t, root, &c, 30)
+                        });
+                    }
                 }
                 if ui
                     .button(tr("Canasta de acciones (exp)", "Action basket (exp)"))
@@ -2016,10 +2108,12 @@ impl App {
                     ))
                     .clicked()
                 {
-                    self.set_report(
-                        tr("¿Por qué está lleno?", "Why is it full?"),
-                        crate::mcp_tools::why_full(tree, root, &caps, 10),
-                    );
+                    if let Some(t) = report_tree.clone() {
+                        let c = caps.clone();
+                        self.spawn_report(ctx, tr("¿Por qué está lleno?", "Why is it full?"), false, move || {
+                            crate::mcp_tools::why_full(&t, root, &c, 10)
+                        });
+                    }
                 }
                 if let Some(deep) = analysis_pair(
                     ui,
@@ -2032,12 +2126,15 @@ impl App {
                 ) {
                     let mut a = caps.clone();
                     a["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
-                    let t0 = Instant::now();
-                    let res = crate::mcp_tools::growth_report(tree, root, &a, 12);
-                    if !deep {
-                        self.remember_eta("growth", t0.elapsed().as_millis() as u64, &res);
+                    if let Some(t) = report_tree.clone() {
+                        let title = tr("¿Qué creció?", "What grew?");
+                        let run = move || crate::mcp_tools::growth_report(&t, root, &a, 12);
+                        if deep {
+                            self.spawn_report(ctx, title, false, run);
+                        } else {
+                            self.spawn_report_eta(ctx, title, "growth", run);
+                        }
                     }
-                    self.set_report(tr("¿Qué creció?", "What grew?"), res);
                 }
                 if let Some(deep) = analysis_pair(
                     ui,
@@ -2064,7 +2161,12 @@ impl App {
                     ))
                     .clicked()
                 {
-                    self.analysis = Some(("Snapshot".into(), fmt(crate::mcp_tools::snapshot_save(tree, root, &caps))));
+                    if let Some(t) = report_tree.clone() {
+                        let c = caps.clone();
+                        self.spawn_report(ctx, "Snapshot", true, move || {
+                            crate::mcp_tools::snapshot_save(&t, root, &c)
+                        });
+                    }
                 }
                 if ui
                     .button(tr("Línea de tiempo (exp)", "Timeline (exp)"))
@@ -2096,10 +2198,11 @@ impl App {
                         {
                             let mut a = caps.clone();
                             a["target_gb"] = serde_json::json!(self.plan_target_gb);
-                            self.set_report(
-                                tr("Planificador de espacio", "Space planner"),
-                                crate::mcp_tools::plan_100gb(tree, root, &a, 40),
-                            );
+                            if let Some(t) = report_tree.clone() {
+                                self.spawn_report(ctx, tr("Planificador de espacio", "Space planner"), false, move || {
+                                    crate::mcp_tools::plan_100gb(&t, root, &a, 40)
+                                });
+                            }
                         }
                     });
                     ui.horizontal(|ui| {
@@ -2111,10 +2214,12 @@ impl App {
                             ))
                             .clicked()
                         {
-                            self.set_report(
-                                tr("Mapa de calor por edad", "Age heatmap"),
-                                crate::mcp_tools::age_heatmap(tree, root, &caps, 20),
-                            );
+                            if let Some(t) = report_tree.clone() {
+                                let c = caps.clone();
+                                self.spawn_report(ctx, tr("Mapa de calor por edad", "Age heatmap"), false, move || {
+                                    crate::mcp_tools::age_heatmap(&t, root, &c, 20)
+                                });
+                            }
                         }
                         if ui
                             .button(tr("WSL / Docker", "WSL / Docker"))
@@ -2124,10 +2229,12 @@ impl App {
                             ))
                             .clicked()
                         {
-                            self.set_report(
-                                tr("WSL / Docker", "WSL / Docker"),
-                                crate::mcp_tools::wsl_docker(tree, root, &caps, 20),
-                            );
+                            if let Some(t) = report_tree.clone() {
+                                let c = caps.clone();
+                                self.spawn_report(ctx, tr("WSL / Docker", "WSL / Docker"), false, move || {
+                                    crate::mcp_tools::wsl_docker(&t, root, &c, 20)
+                                });
+                            }
                         }
                         if ui
                             .button(tr("Carpetas duplicadas", "Duplicate folders"))
@@ -2137,10 +2244,12 @@ impl App {
                             ))
                             .clicked()
                         {
-                            self.set_report(
-                                tr("Carpetas duplicadas (exp)", "Duplicate folders (exp)"),
-                                crate::mcp_tools::duplicate_folders(tree, root, &caps, 20),
-                            );
+                            if let Some(t) = report_tree.clone() {
+                                let c = caps.clone();
+                                self.spawn_report(ctx, tr("Carpetas duplicadas (exp)", "Duplicate folders (exp)"), false, move || {
+                                    crate::mcp_tools::duplicate_folders(&t, root, &c, 20)
+                                });
+                            }
                         }
                         if ui
                             .button(tr("GitHub multicopia", "GitHub clones"))
@@ -2150,10 +2259,12 @@ impl App {
                             ))
                             .clicked()
                         {
-                            self.set_report(
-                                tr("GitHub multicopia", "GitHub clones"),
-                                crate::mcp_tools::github_clones(tree, root, &caps, 20),
-                            );
+                            if let Some(t) = report_tree.clone() {
+                                let c = caps.clone();
+                                self.spawn_report(ctx, tr("GitHub multicopia", "GitHub clones"), false, move || {
+                                    crate::mcp_tools::github_clones(&t, root, &c, 20)
+                                });
+                            }
                         }
                         if ui
                             .button(tr("Pronóstico de disco", "Disk forecast"))
@@ -2163,7 +2274,12 @@ impl App {
                             ))
                             .clicked()
                         {
-                            self.set_report(tr("Pronóstico de disco", "Disk forecast"), crate::mcp_tools::forecast(tree, root, &caps));
+                            if let Some(t) = report_tree.clone() {
+                                let c = caps.clone();
+                                self.spawn_report(ctx, tr("Pronóstico de disco", "Disk forecast"), false, move || {
+                                    crate::mcp_tools::forecast(&t, root, &c)
+                                });
+                            }
                         }
                     });
                     ui.separator();
@@ -2194,10 +2310,9 @@ impl App {
                             if !self.machine_strip_b.trim().is_empty() {
                                 args["strip_b"] = serde_json::json!(self.machine_strip_b.trim());
                             }
-                            self.set_report(
-                                tr("Comparar máquinas (exp)", "Compare machines (exp)"),
-                                crate::mcp_tools::machine_compare(&args, 20),
-                            );
+                            self.spawn_report(ctx, tr("Comparar máquinas (exp)", "Compare machines (exp)"), false, move || {
+                                crate::mcp_tools::machine_compare(&args, 20)
+                            });
                         }
                     });
                     ui.horizontal(|ui| {
@@ -2382,7 +2497,7 @@ impl App {
     }
 
     /// Ventana para buscar dentro de archivos, con estimación previa.
-    fn content_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
+    fn content_ui(&mut self, ui: &mut egui::Ui) {
         ui.label(tr("Texto a buscar (sin distinguir mayúsculas)", "Text to find (case-insensitive)"));
         ui.text_edit_singleline(&mut self.content_query);
         ui.checkbox(&mut self.content_deep, tr(
@@ -2395,12 +2510,19 @@ impl App {
                 .clicked()
             {
                 let q = self.content_query.trim().to_string();
-                let budget = if self.content_deep { 15_000 } else { 2_500 };
-                let rep = crate::contents::search(tree, self.view_root, &q, self.content_deep, 20_000, budget, 100);
-                let mut v = rep.to_json(&q, 100);
-                v["mode"] = serde_json::json!(if self.content_deep { "deep" } else { "fast" });
-                v["root"] = serde_json::json!(tree.full_path(self.view_root));
-                self.set_report(tr("Buscar dentro de archivos (exp)", "Search inside files (exp)"), Ok(v));
+                let deep = self.content_deep;
+                let budget = if deep { 15_000 } else { 2_500 };
+                let root = self.view_root;
+                if let Some(t) = self.tree.clone() {
+                    let title = tr("Buscar dentro de archivos (exp)", "Search inside files (exp)");
+                    self.spawn_report(ui.ctx(), title, false, move || {
+                        let rep = crate::contents::search(&t, root, &q, deep, 20_000, budget, 100);
+                        let mut v = rep.to_json(&q, 100);
+                        v["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
+                        v["root"] = serde_json::json!(t.full_path(root));
+                        Ok(v)
+                    });
+                }
             }
             if ui
                 .button(tr("Estimar antes", "Estimate first"))
@@ -2410,9 +2532,15 @@ impl App {
                 ))
                 .clicked()
             {
-                let mut v = crate::contents::estimate(tree, self.view_root);
-                v["root"] = serde_json::json!(tree.full_path(self.view_root));
-                self.set_report(tr("Estimación de búsqueda (exp)", "Search estimate (exp)"), Ok(v));
+                let root = self.view_root;
+                if let Some(t) = self.tree.clone() {
+                    let title = tr("Estimación de búsqueda (exp)", "Search estimate (exp)");
+                    self.spawn_report(ui.ctx(), title, false, move || {
+                        let mut v = crate::contents::estimate(&t, root);
+                        v["root"] = serde_json::json!(t.full_path(root));
+                        Ok(v)
+                    });
+                }
             }
         });
         ui.separator();
@@ -2502,7 +2630,7 @@ impl App {
     }
 
     /// Línea de tiempo: elegir dos snapshots y compararlos.
-    fn timeline_ui(&mut self, ui: &mut egui::Ui, tree: &Tree) {
+    fn timeline_ui(&mut self, ui: &mut egui::Ui) {
         let frames = self.timeline_frames.clone();
         if frames.is_empty() {
             ui.label(tr(
@@ -2529,11 +2657,16 @@ impl App {
         ));
         ui.horizontal(|ui| {
             if ui.button(tr("Comparar este intervalo", "Compare this interval")).clicked() {
-                let res = crate::timeline::compare(tree, &old, &new, 20, self.timeline_deep).map(|mut v| {
-                    v["mode"] = serde_json::json!(if self.timeline_deep { "deep" } else { "fast" });
-                    v
-                });
-                self.set_report(tr("Línea de tiempo (exp)", "Timeline (exp)"), res);
+                let deep = self.timeline_deep;
+                if let Some(t) = self.tree.clone() {
+                    let (o, n) = (old.clone(), new.clone());
+                    self.spawn_report(ui.ctx(), tr("Línea de tiempo (exp)", "Timeline (exp)"), false, move || {
+                        crate::timeline::compare(&t, &o, &n, 20, deep).map(|mut v| {
+                            v["mode"] = serde_json::json!(if deep { "deep" } else { "fast" });
+                            v
+                        })
+                    });
+                }
             }
             ui.checkbox(&mut self.timeline_deep, tr("Profundo", "Deep"));
         });
@@ -2545,11 +2678,15 @@ impl App {
                     ui.label(RichText::new(format!("{} {}", fmt_int(f.entries as u64), tr("entradas", "entries"))).weak().size(10.0));
                     if i > 0 && ui.small_button(tr("vs anterior", "vs previous")).clicked() {
                         let prev = frames[i - 1].clone();
-                        let res = crate::timeline::compare(tree, &prev, f, 20, false).map(|mut v| {
-                            v["mode"] = serde_json::json!("fast");
-                            v
-                        });
-                        self.set_report(tr("Línea de tiempo (exp)", "Timeline (exp)"), res);
+                        let cur = f.clone();
+                        if let Some(t) = self.tree.clone() {
+                            self.spawn_report(ui.ctx(), tr("Línea de tiempo (exp)", "Timeline (exp)"), false, move || {
+                                crate::timeline::compare(&t, &prev, &cur, 20, false).map(|mut v| {
+                                    v["mode"] = serde_json::json!("fast");
+                                    v
+                                })
+                            });
+                        }
                     }
                 });
             }
@@ -3091,19 +3228,18 @@ impl App {
                         "path": path,
                         "mode": if deep { "deep" } else { "fast" },
                     });
-                    let t0 = Instant::now();
-                    let res = crate::mcp_tools::advice(&tree, self.view_root, &a);
-                    if !deep {
-                        self.remember_eta("advice", t0.elapsed().as_millis() as u64, &res);
+                    let root = self.view_root;
+                    let title = if deep {
+                        tr("¿Puedo borrar esto? (profundo)", "Can I delete this? (deep)")
+                    } else {
+                        tr("¿Puedo borrar esto? (rápido)", "Can I delete this? (fast)")
+                    };
+                    let run = move || crate::mcp_tools::advice(&tree, root, &a);
+                    if deep {
+                        self.spawn_report(ctx, title, false, run);
+                    } else {
+                        self.spawn_report_eta(ctx, title, "advice", run);
                     }
-                    self.set_report(
-                        if deep {
-                            tr("¿Puedo borrar esto? (profundo)", "Can I delete this? (deep)")
-                        } else {
-                            tr("¿Puedo borrar esto? (rápido)", "Can I delete this? (fast)")
-                        },
-                        res,
-                    );
                 }
             }
             MenuAction::Provenance(path, deep) => {
@@ -3112,15 +3248,15 @@ impl App {
                         "path": path,
                         "mode": if deep { "deep" } else { "fast" },
                     });
-                    let res = crate::mcp_tools::provenance(&tree, self.view_root, &a);
-                    self.set_report(
-                        if deep {
-                            tr("Procedencia (profundo)", "Provenance (deep)")
-                        } else {
-                            tr("Procedencia (rápido)", "Provenance (fast)")
-                        },
-                        res,
-                    );
+                    let root = self.view_root;
+                    let title = if deep {
+                        tr("Procedencia (profundo)", "Provenance (deep)")
+                    } else {
+                        tr("Procedencia (rápido)", "Provenance (fast)")
+                    };
+                    self.spawn_report(ctx, title, false, move || {
+                        crate::mcp_tools::provenance(&tree, root, &a)
+                    });
                 }
             }
             MenuAction::Quarantine(path) => {
@@ -3174,12 +3310,25 @@ impl App {
     }
 
     fn files_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tree: &Tree) {
+        let mut filter_changed = false;
         ui.horizontal(|ui| {
             ui.label(tr("Filtrar:", "Filter:"));
-            ui.text_edit_singleline(&mut self.file_filter);
+            filter_changed = ui.text_edit_singleline(&mut self.file_filter).changed();
             ui.label(RichText::new(tr("los 1000 archivos más grandes de la vista", "the 1000 largest files in view")).weak());
         });
-        let key = (self.view_root, self.revision, self.file_filter.clone(), self.files_sort, self.type_filter);
+        // Typing must not run a full 1000-file scan on every keystroke. Commit
+        // the filter after a short pause; keep showing the previous result.
+        if filter_changed {
+            self.file_filter_at = Some(Instant::now());
+        }
+        let filter_ready = self.file_filter_at.is_none_or(|t| t.elapsed() >= Duration::from_millis(180));
+        if filter_ready {
+            self.file_filter_at = None;
+        } else if self.file_filter != self.files_key.2 {
+            ui.ctx().request_repaint_after(Duration::from_millis(80));
+        }
+        let filter = if filter_ready { self.file_filter.clone() } else { self.files_key.2.clone() };
+        let key = (self.view_root, self.revision, filter, self.files_sort, self.type_filter);
         if key != self.files_key {
             if (key.0, key.1, &key.2, key.4) != (self.files_key.0, self.files_key.1, &self.files_key.2, self.files_key.4) {
                 let cap = if self.type_filter.is_some() { 20_000 } else { 1000 };
@@ -4948,17 +5097,22 @@ impl App {
             .add_enabled(!self.backup_target.trim().is_empty(), egui::Button::new(tr("Comparar", "Compare")))
             .clicked()
         {
+            let deep = self.backup_deep;
             let a = serde_json::json!({
                 "source": self.backup_source,
                 "target": self.backup_target,
-                "mode": if self.backup_deep { "deep" } else { "fast" },
+                "mode": if deep { "deep" } else { "fast" },
             });
-            let t0 = Instant::now();
-            let res = crate::mcp_tools::backup_check(tree, self.view_root, &a, 30);
-            if !self.backup_deep {
-                self.remember_eta("backup", t0.elapsed().as_millis() as u64, &res);
+            let root = self.view_root;
+            if let Some(t) = self.tree.clone() {
+                let title = tr("¿Está respaldado? (exp)", "Is it backed up? (exp)");
+                let run = move || crate::mcp_tools::backup_check(&t, root, &a, 30);
+                if deep {
+                    self.spawn_report(ui.ctx(), title, false, run);
+                } else {
+                    self.spawn_report_eta(ui.ctx(), title, "backup", run);
+                }
             }
-            self.set_report(tr("¿Está respaldado? (exp)", "Is it backed up? (exp)"), res);
         }
         if ui.button(tr("Usar la carpeta actual como origen", "Use current folder as source")).clicked() {
             self.backup_source = tree.full_path(self.view_root);
@@ -5194,6 +5348,52 @@ impl App {
                 "{hi} tiene más resolución: a este zoom {lo} se ve más blanda (esa es la diferencia real)."
             )).weak());
         }
+    }
+
+    /// Run a read-only analysis in a worker thread. The tree is shared with the
+    /// UI through `Arc`, so no copies and no blocking paint while it scans.
+    fn spawn_report<F>(&mut self, ctx: &egui::Context, title: &str, text: bool, f: F)
+    where
+        F: FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
+    {
+        self.spawn_report_impl(ctx, title, text, None, f);
+    }
+
+    /// Same as [`Self::spawn_report`], remembering the Fast/Deep ETA when done.
+    fn spawn_report_eta<F>(&mut self, ctx: &egui::Context, title: &str, kind: &'static str, f: F)
+    where
+        F: FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
+    {
+        self.spawn_report_impl(ctx, title, false, Some(kind), f);
+    }
+
+    fn spawn_report_impl<F>(&mut self, ctx: &egui::Context, title: &str, text: bool, eta: Option<&'static str>, f: F)
+    where
+        F: FnOnce() -> Result<serde_json::Value, String> + Send + 'static,
+    {
+        if let Some(job) = &self.report_job {
+            self.set_info(format!(
+                "{}: {}",
+                tr("Ya hay un análisis en curso", "An analysis is already running"),
+                job.title
+            ));
+            return;
+        }
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = f();
+            let _ = tx.send(r);
+            ctx.request_repaint();
+        });
+        self.report_job = Some(ReportJob {
+            rx,
+            title: title.to_string(),
+            epoch: self.epoch,
+            text,
+            eta,
+            started: Instant::now(),
+        });
     }
 
     fn set_report(&mut self, title: &str, r: Result<serde_json::Value, String>) {

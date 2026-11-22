@@ -42,9 +42,26 @@ pub fn db_path() -> PathBuf {
     base.join("WizeShared").join("content-index.sqlite3")
 }
 
-const SCHEMA: &str = r#"
+/// PRAGMAs por conexión, baratos y sin escritura propia.
+///
+/// - `journal_mode=WAL` queda grabado en el archivo; el resto se aplica en cada conexión.
+/// - `synchronous=NORMAL` es la durabilidad del contrato compartido: en WAL no se hace
+///   `fsync` por commit, pero el archivo no se corrompe ante un corte. **No se baja más**
+///   (nunca `OFF`): perder commits recientes ya no está cubierto por el lease.
+/// - `cache_size=-16000` acota la caché de páginas a ~16 MB por conexión, lo que reduce
+///   lectura de páginas en indexaciones largas sin crecer sin límite.
+/// - `temp_store=MEMORY` **no** se fija a propósito: las fusiones de FTS5 sobre índices
+///   grandes usan tablas temporales y podrían consumir RAM sin techo. El valor por
+///   defecto de SQLite (temporal en disco, con caché) es más seguro en máquinas modestas.
+const PRAGMAS: &str = r#"
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
+PRAGMA cache_size=-16000;
+"#;
+
+/// Esquema idempotente (sin PRAGMAs). Corre sólo cuando la base no está lista;
+/// si en el futuro cambia el esquema, subir el marcador de `meta` para que se aplique.
+const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -82,14 +99,28 @@ CREATE TABLE IF NOT EXISTS lease (
 INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', '1');
 "#;
 
-/// Abre (y crea si hace falta) la base compartida. Seguro con dos procesos.
-pub fn open() -> Result<Connection, String> {
-    let path = db_path();
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+/// `true` si la base ya tiene esquema y FTS poblado (v1 o v2).
+///
+/// Se comprueba por presencia de claves, no por su valor: una base escrita por
+/// una versión futura (v2) también se acepta sin degradarla.
+fn is_ready(conn: &Connection) -> bool {
+    conn.query_row(
+        "SELECT (SELECT COUNT(*) FROM meta WHERE key IN ('schema_version', 'fts_ready')) = 2",
+        [],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|v| v == 1)
+    .unwrap_or(false)
+}
+
+/// Pragmas + esquema idempotente. Si la base ya está lista no ejecuta DDL ni
+/// escribe: sólo pragmas de conexión y un `SELECT` (evita tomar el lock de
+/// escritura en cada búsqueda, que competiría con la otra app).
+fn ensure_schema(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(PRAGMAS).map_err(|e| e.to_string())?;
+    if is_ready(conn) {
+        return Ok(());
     }
-    let conn = Connection::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
     conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
     // Bases creadas antes de FTS5: poblar una sola vez.
     let ready: Option<String> = conn
@@ -107,6 +138,18 @@ pub fn open() -> Result<Connection, String> {
         conn.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('fts_ready', '1')", [])
             .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+/// Abre (y crea si hace falta) la base compartida. Seguro con dos procesos.
+pub fn open() -> Result<Connection, String> {
+    let path = db_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    let conn = Connection::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(|e| e.to_string())?;
+    ensure_schema(&conn)?;
     Ok(conn)
 }
 
@@ -178,38 +221,101 @@ pub fn lease_status(conn: &Connection) -> serde_json::Value {
 
 /// Texto cacheado para una versión exacta del archivo.
 pub fn get(conn: &Connection, path: &str, size: u64, mtime: i64) -> Option<(String, String)> {
-    conn.query_row(
-        "SELECT kind, text FROM docs WHERE path = ?1 AND size = ?2 AND mtime = ?3",
-        params![path, size as i64, mtime],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
-    .ok()
-    .flatten()
+    // Sentencia cacheada: se busca una vez por archivo durante la indexación.
+    let mut st = conn
+        .prepare_cached("SELECT kind, text FROM docs WHERE path = ?1 AND size = ?2 AND mtime = ?3")
+        .ok()?;
+    st.query_row(params![path, size as i64, mtime], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .ok()
+        .flatten()
+}
+
+/// Trunca al tope compartido (48.000 caracteres) sin cortar un char por la mitad.
+pub fn cap_text(text: &str) -> &str {
+    match text.char_indices().nth(MAX_TEXT_CHARS) {
+        Some((i, _)) => &text[..i],
+        None => text,
+    }
+}
+
+const UPSERT: &str = "INSERT INTO docs(path, size, mtime, kind, text, updated)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+     ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, kind=excluded.kind,
+         text=excluded.text, updated=excluded.updated";
+
+/// Un documento listo para escribir en el índice compartido.
+#[derive(Clone, Copy, Debug)]
+pub struct Doc<'a> {
+    pub path: &'a str,
+    pub size: u64,
+    pub mtime: i64,
+    pub kind: &'a str,
+    pub text: &'a str,
+}
+
+/// Escribe varios documentos en **una** transacción con una sentencia preparada.
+///
+/// Equivalente a llamar `put` N veces (mismo `ON CONFLICT(path) DO UPDATE`, mismo
+/// tope de 48.000 caracteres, mismos triggers de FTS porque el upsert sigue siendo
+/// un `INSERT`/`UPDATE` sobre `docs`), pero con un solo commit y sin recompilar SQL.
+/// Si la conexión ya está dentro de una transacción, respeta la del llamador.
+/// Sólo el dueño del lease debería llamar.
+pub fn put_many<'a, I>(conn: &Connection, docs: I) -> Result<usize, String>
+where
+    I: IntoIterator<Item = Doc<'a>>,
+{
+    if conn.is_autocommit() {
+        let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+        let n = write_docs(&tx, docs)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(n)
+    } else {
+        write_docs(conn, docs)
+    }
+}
+
+fn write_docs<'a, I>(conn: &Connection, docs: I) -> Result<usize, String>
+where
+    I: IntoIterator<Item = Doc<'a>>,
+{
+    let updated = now();
+    let mut st = conn.prepare_cached(UPSERT).map_err(|e| e.to_string())?;
+    let mut n = 0usize;
+    for d in docs {
+        st.execute(params![d.path, d.size as i64, d.mtime, d.kind, cap_text(d.text), updated])
+            .map_err(|e| e.to_string())?;
+        n += 1;
+    }
+    Ok(n)
 }
 
 /// Guarda/actualiza el texto extraído. Sólo el dueño del lease debería llamar.
 pub fn put(conn: &Connection, path: &str, size: u64, mtime: i64, kind: &str, text: &str) -> Result<(), String> {
-    let text: String = if text.chars().count() > MAX_TEXT_CHARS {
-        text.chars().take(MAX_TEXT_CHARS).collect()
-    } else {
-        text.to_string()
-    };
-    conn.execute(
-        "INSERT INTO docs(path, size, mtime, kind, text, updated) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime=excluded.mtime, kind=excluded.kind,
-             text=excluded.text, updated=excluded.updated",
-        params![path, size as i64, mtime, kind, text, now()],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    put_many(conn, [Doc { path, size, mtime, kind, text }]).map(|_| ())
 }
 
 /// Borra textos de archivos que ya no existen (barrido de mantenimiento).
+/// Un solo commit para toda la lista; si el llamador ya abrió una transacción,
+/// se respeta la suya.
 pub fn prune(conn: &Connection, missing: &[String]) -> Result<usize, String> {
+    if missing.is_empty() {
+        return Ok(0);
+    }
+    if !conn.is_autocommit() {
+        return delete_docs(conn, missing);
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let n = delete_docs(&tx, missing)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(n)
+}
+
+fn delete_docs(conn: &Connection, missing: &[String]) -> Result<usize, String> {
+    let mut st = conn.prepare_cached("DELETE FROM docs WHERE path = ?1").map_err(|e| e.to_string())?;
     let mut n = 0;
     for p in missing {
-        n += conn.execute("DELETE FROM docs WHERE path = ?1", params![p]).map_err(|e| e.to_string())?;
+        n += st.execute(params![p]).map_err(|e| e.to_string())?;
     }
     Ok(n)
 }
@@ -253,13 +359,10 @@ pub fn prune_missing(conn: &Connection, max: usize) -> Result<usize, String> {
         .filter_map(|r| r.ok())
         .collect();
     drop(st);
-    let mut n = 0;
-    for p in paths {
-        if !Path::new(&p).exists() {
-            n += conn.execute("DELETE FROM docs WHERE path = ?1", params![p]).map_err(|e| e.to_string())?;
-        }
-    }
-    Ok(n)
+    // Se comprueba el disco antes de abrir la transacción: no conviene retener
+    // el lock de escritura mientras se consultan miles de rutas.
+    let missing: Vec<String> = paths.into_iter().filter(|p| !Path::new(p).exists()).collect();
+    prune(conn, &missing)
 }
 
 pub fn stats(conn: &Connection) -> serde_json::Value {
@@ -293,14 +396,24 @@ mod tests {
         std::env::temp_dir().join(format!("wzshared-{}-{nanos}.sqlite3", std::process::id()))
     }
 
+    fn test_conn(p: &Path) -> Connection {
+        let c = Connection::open(p).unwrap();
+        ensure_schema(&c).unwrap();
+        c
+    }
+
+    fn count(c: &Connection, sql: &str) -> i64 {
+        c.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
     #[test]
     fn schema_is_idempotent_and_cache_round_trips() {
         let p = temp_db();
         let _ = std::fs::remove_file(&p);
         // Todas las funciones usan db_path(); este test sólo valida SQL directo.
-        let c = Connection::open(&p).unwrap();
-        c.execute_batch(SCHEMA).unwrap();
-        c.execute_batch(SCHEMA).unwrap();
+        let c = test_conn(&p);
+        ensure_schema(&c).unwrap();
+        assert!(is_ready(&c));
         put(&c, r"C:\a.pdf", 10, 20, "pdf", "hola mundo").unwrap();
         let (kind, text) = get(&c, "C:\\a.pdf", 10, 20).unwrap();
         assert_eq!(kind, "pdf");
@@ -323,8 +436,7 @@ mod tests {
     fn lease_can_be_taken_when_stale() {
         let p = temp_db();
         let _ = std::fs::remove_file(&p);
-        let c = Connection::open(&p).unwrap();
-        c.execute_batch(SCHEMA).unwrap();
+        let c = test_conn(&p);
         assert!(claim(&c, APP_SORT).unwrap());
         // La otra app no puede mientras el latido esté fresco.
         assert!(!claim(&c, APP_WIZ).unwrap());
@@ -334,6 +446,94 @@ mod tests {
         put(&c, r"C:\long.txt", 1, 1, "text", &long).unwrap();
         let (_, stored) = get(&c, r"C:\long.txt", 1, 1).unwrap();
         assert_eq!(stored.chars().count(), MAX_TEXT_CHARS);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn put_many_batches_insert_and_upsert_in_one_commit() {
+        let p = temp_db();
+        let _ = std::fs::remove_file(&p);
+        let c = test_conn(&p);
+        let n = put_many(
+            &c,
+            [
+                Doc { path: r"C:\a.txt", size: 1, mtime: 10, kind: "text", text: "alfa" },
+                Doc { path: r"C:\b.txt", size: 2, mtime: 20, kind: "text", text: "beta" },
+            ],
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM docs"), 2);
+        assert_eq!(get(&c, r"C:\a.txt", 1, 10).unwrap().1, "alfa");
+        assert_eq!(search(&c, "beta", 10).unwrap().len(), 1);
+
+        // El mismo path en otro lote es un UPDATE, no una fila nueva.
+        let n = put_many(&c, [Doc { path: r"C:\a.txt", size: 5, mtime: 30, kind: "pdf", text: "gamma" }]).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM docs"), 2);
+        // La versión vieja ya no se sirve.
+        assert!(get(&c, r"C:\a.txt", 1, 10).is_none());
+        let (kind, text) = get(&c, r"C:\a.txt", 5, 30).unwrap();
+        assert_eq!(kind, "pdf");
+        assert_eq!(text, "gamma");
+        // Los triggers de FTS reflejan el texto nuevo.
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM docs_fts"), 2);
+        assert!(search(&c, "alfa", 10).unwrap().is_empty());
+        assert_eq!(search(&c, "gamma", 10).unwrap().len(), 1);
+
+        // Lote vacío: no escribe nada ni falla.
+        assert_eq!(put_many(&c, Vec::<Doc<'static>>::new()).unwrap(), 0);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM docs"), 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn put_many_truncates_to_the_shared_cap() {
+        let p = temp_db();
+        let _ = std::fs::remove_file(&p);
+        let c = test_conn(&p);
+        // Multibyte: el tope es en caracteres, no en bytes, y no debe partir un char.
+        let long = "é".repeat(MAX_TEXT_CHARS * 2);
+        let exact = "x".repeat(MAX_TEXT_CHARS);
+        put_many(
+            &c,
+            [
+                Doc { path: r"C:\long.txt", size: 1, mtime: 1, kind: "text", text: &long },
+                Doc { path: r"C:\exact.txt", size: 1, mtime: 1, kind: "text", text: &exact },
+            ],
+        )
+        .unwrap();
+        let (_, stored) = get(&c, r"C:\long.txt", 1, 1).unwrap();
+        assert_eq!(stored.chars().count(), MAX_TEXT_CHARS);
+        assert!(stored.chars().all(|ch| ch == 'é'));
+        assert_eq!(stored.len(), MAX_TEXT_CHARS * 2); // UTF-8 de 'é'
+        let (_, stored) = get(&c, r"C:\exact.txt", 1, 1).unwrap();
+        assert_eq!(stored.chars().count(), MAX_TEXT_CHARS);
+        // Texto por debajo del tope: intacto.
+        put(&c, r"C:\short.txt", 1, 1, "text", "corto").unwrap();
+        assert_eq!(get(&c, r"C:\short.txt", 1, 1).unwrap().1, "corto");
+        assert_eq!(cap_text(&exact), exact.as_str());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn prune_removes_rows_in_one_pass() {
+        let p = temp_db();
+        let _ = std::fs::remove_file(&p);
+        let c = test_conn(&p);
+        put_many(
+            &c,
+            [
+                Doc { path: r"C:\gone1.txt", size: 1, mtime: 1, kind: "text", text: "uno" },
+                Doc { path: r"C:\gone2.txt", size: 1, mtime: 1, kind: "text", text: "dos" },
+            ],
+        )
+        .unwrap();
+        let n = prune(&c, &[r"C:\gone1.txt".to_string(), r"C:\gone2.txt".to_string()]).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM docs"), 0);
+        assert_eq!(count(&c, "SELECT COUNT(*) FROM docs_fts"), 0);
+        assert_eq!(prune(&c, &[]).unwrap(), 0);
         let _ = std::fs::remove_file(&p);
     }
 }

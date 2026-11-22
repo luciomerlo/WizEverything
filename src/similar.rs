@@ -379,6 +379,13 @@ fn cluster_images(sigs: &[ImgSig], threshold: u32) -> Vec<Vec<usize>> {
     groups.into_values().filter(|g| g.len() >= 2).collect()
 }
 
+/// Cloud placeholders must never be opened by the similarity scanner: opening
+/// them hydrates the file and downloads it from Google Drive/OneDrive. Checking
+/// attributes is metadata-only and keeps the "no hydration" contract.
+fn is_cloud_placeholder(path: &Path) -> bool {
+    crate::winphys::is_cloud_placeholder(path)
+}
+
 pub fn scan_images(files: Vec<FileInfo>, max_files: usize, threshold: u32, budget_ms: u64) -> Report {
     let scan_start = std::time::Instant::now();
     let budget = std::time::Duration::from_millis(budget_ms.clamp(200, 120_000));
@@ -401,6 +408,7 @@ pub fn scan_images(files: Vec<FileInfo>, max_files: usize, threshold: u32, budge
         .clamp(1, 8);
     let cursor = std::sync::atomic::AtomicUsize::new(0);
     let skipped_n = std::sync::atomic::AtomicUsize::new(0);
+    let cloud_n = std::sync::atomic::AtomicUsize::new(0);
     let partial_n = std::sync::atomic::AtomicBool::new(false);
     let collected: std::sync::Mutex<Vec<(usize, ImgSig, Option<Value>)>> =
         std::sync::Mutex::new(Vec::with_capacity(files.len()));
@@ -417,6 +425,12 @@ pub fn scan_images(files: Vec<FileInfo>, max_files: usize, threshold: u32, budge
                 }
                 let f = &files[i];
                 let ext = ext_of(&f.path);
+                if is_cloud_placeholder(&f.path) {
+                    // Metadata-only: never open a cloud placeholder here.
+                    cloud_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    skipped_n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 let decoded = image::ImageReader::open(&f.path)
                     .ok()
                     .and_then(|r| r.with_guessed_format().ok())
@@ -470,6 +484,7 @@ pub fn scan_images(files: Vec<FileInfo>, max_files: usize, threshold: u32, budge
         sigs.push(s);
     }
     let skipped = skipped_n.load(std::sync::atomic::Ordering::Relaxed);
+    let cloud = cloud_n.load(std::sync::atomic::Ordering::Relaxed);
     let partial = partial_n.load(std::sync::atomic::Ordering::Relaxed)
         || cursor.load(std::sync::atomic::Ordering::Relaxed) < files.len();
     // Las imágenes planas (capturas de un color, iconos) generan falsos positivos.
@@ -538,6 +553,11 @@ pub fn scan_images(files: Vec<FileInfo>, max_files: usize, threshold: u32, budge
         notes.push(format!("Se analizaron las {} imágenes más grandes de {total}.", files.len()));
     }
     notes.push("Puntaje = megapíxeles + formato + bytes por píxel + biblioteca de fotos.".into());
+    if cloud > 0 {
+        notes.push(format!(
+            "{cloud} imágenes son placeholders de nube y no se abrieron (no se descargaron)."
+        ));
+    }
     if partial {
         let pct = if files.is_empty() {
             100.0
@@ -941,7 +961,19 @@ pub fn scan_audio(files: Vec<FileInfo>, max_files: usize, deep: bool) -> Report 
 
     let mut sigs = Vec::with_capacity(files.len());
     let mut skipped = 0usize;
+    let mut cloud = 0usize;
+    let mut meta_partial = false;
     for f in &files {
+        // Tag reading can dominate the fast budget on slow/network volumes.
+        if scan_start.elapsed() >= budget {
+            meta_partial = true;
+            break;
+        }
+        if is_cloud_placeholder(&f.path) {
+            skipped += 1;
+            cloud += 1;
+            continue;
+        }
         let Ok(tagged) = lofty::read_from_path(&f.path) else {
             skipped += 1;
             continue;
@@ -1168,6 +1200,11 @@ pub fn scan_audio(files: Vec<FileInfo>, max_files: usize, deep: bool) -> Report 
     notes.push("Agrupación difusa por tokens del título (o nombre de archivo) + duración; no exige etiquetas iguales.".into());
     notes.push("Puntaje = sin pérdida > bitrate > sample rate > bit depth > estéreo > carátula/álbum; en vivo/TV resta.".into());
     notes.push(format!("Se omiten audios de menos de {MIN_TRACK_SECS:.0} s (sonidos de sistema)."));
+    if cloud > 0 {
+        notes.push(format!(
+            "{cloud} audios son placeholders de nube y no se abrieron (no se descargaron)."
+        ));
+    }
     if decoded > 0 {
         notes.push(format!(
             "Análisis de sonido: {noise_groups}/{group_count} grupos ({decoded} archivos) en {} ms, con ventanas de hasta {window:.0} s. El resto usa metadatos y porcentajes para no frenar.",
@@ -1175,6 +1212,9 @@ pub fn scan_audio(files: Vec<FileInfo>, max_files: usize, deep: bool) -> Report 
         ));
     } else {
         notes.push("No se decodificó audio (WMA/APE/WV no soportados o presupuesto de tiempo): el puntaje usa solo metadatos.".into());
+    }
+    if meta_partial {
+        notes.push("Presupuesto de tiempo alcanzado leyendo etiquetas: se analizaron sólo los primeros audios.".into());
     }
     if noise_partial {
         notes.push("Presupuesto de tiempo alcanzado: el análisis acústico es parcial; los porcentajes lo indican.".into());
@@ -1197,7 +1237,7 @@ pub fn scan_audio(files: Vec<FileInfo>, max_files: usize, deep: bool) -> Report 
         notes,
         ai_images: Vec::new(),
         elapsed_ms: scan_start.elapsed().as_millis() as u64,
-        partial: noise_partial,
+        partial: noise_partial || meta_partial,
     }
 }
 

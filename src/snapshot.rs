@@ -20,10 +20,17 @@
 //! ```
 
 use std::collections::HashMap;
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
 
 const MAGIC: &[u8; 8] = b"WZSNAP1\0";
+
+/// Tope duro para leer un snapshot/catálogo completo en memoria (512 MB).
+pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Tamaño mínimo de una fila serializada: hashes (16) + name_len (4) +
+/// tamaños (24) + atributos (4). Se usa para validar `count` antes de reservar.
+const MIN_ENTRY_BYTES: usize = 48;
 
 /// Marca una entrada de directorio (tamaño 0). Los snapshots nuevos la incluyen
 /// para reconstruir rutas completas al comparar dos máquinas.
@@ -97,11 +104,18 @@ impl Snapshot {
 
 /// Serializa a formato binario compacto.
 pub fn encode(snap: &Snapshot) -> Vec<u8> {
-    let mut out = Vec::with_capacity(16 + snap.entries.len() * 48);
+    encode_entries(snap.created, &snap.entries)
+}
+
+/// Igual que [`encode`], pero sobre un slice de entradas ya existente. Permite
+/// escribir un catálogo sin clonar todas sus entradas en un [`Snapshot`].
+pub fn encode_entries(created: i64, entries: &[Entry]) -> Vec<u8> {
+    let names: usize = entries.iter().map(|e| e.name.len()).sum();
+    let mut out = Vec::with_capacity(20 + entries.len() * MIN_ENTRY_BYTES + names);
     out.extend_from_slice(MAGIC);
-    out.extend_from_slice(&snap.created.to_le_bytes());
-    out.extend_from_slice(&(snap.entries.len() as u32).to_le_bytes());
-    for e in &snap.entries {
+    out.extend_from_slice(&created.to_le_bytes());
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
         out.extend_from_slice(&e.path_hash.to_le_bytes());
         out.extend_from_slice(&e.parent_hash.to_le_bytes());
         let name = e.name.as_bytes();
@@ -151,8 +165,9 @@ pub fn decode(bytes: &[u8]) -> io::Result<Snapshot> {
     }
     let created = c.i64()?;
     let count = c.u32()? as usize;
-    // Cota defensiva: cada entrada ocupa al menos 40 bytes.
-    if count > bytes.len() / 40 + 1 {
+    // Cota defensiva antes de reservar: cada entrada ocupa al menos 48 bytes.
+    let remaining = bytes.len().saturating_sub(c.pos);
+    if count > remaining / MIN_ENTRY_BYTES {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "count absurdo"));
     }
     let mut entries = Vec::with_capacity(count);
@@ -176,6 +191,51 @@ pub fn decode(bytes: &[u8]) -> io::Result<Snapshot> {
         });
     }
     Ok(Snapshot { created, entries })
+}
+
+/// Lee un archivo completo con tope estricto. Valida el tamaño del encabezado
+/// antes de asignar y reserva exactamente esa capacidad, evitando copias por
+/// reallocación; un archivo que crezca durante la lectura tampoco supera el tope.
+pub fn read_bounded(path: &Path, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    if len > max_bytes {
+        return Err(too_large(len, max_bytes));
+    }
+    let cap = usize::try_from(len).map_err(|_| too_large(len, max_bytes))?;
+    let mut buf = Vec::with_capacity(cap);
+    // Leemos por bloques hacia la capacidad ya reservada: nunca reasigna ni
+    // duplica el buffer (read_to_end reserva de más al final).
+    let mut chunk = [0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let want = max_bytes.saturating_sub(total).min(chunk.len() as u64) as usize;
+        if want == 0 {
+            break;
+        }
+        let n = file.read(&mut chunk[..want])?;
+        if n == 0 {
+            return Ok(buf);
+        }
+        total += n as u64;
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    // Llegamos justo al tope: cualquier byte extra lo convierte en demasiado grande.
+    if file.read(&mut chunk[..1])? != 0 {
+        return Err(too_large(max_bytes + 1, max_bytes));
+    }
+    Ok(buf)
+}
+
+fn too_large(len: u64, max_bytes: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "archivo demasiado grande ({} MB); límite {} MB",
+            len / (1024 * 1024),
+            max_bytes / (1024 * 1024)
+        ),
+    )
 }
 
 /// Cambio detectado en un archivo presente en ambos snapshots.
@@ -308,6 +368,52 @@ mod tests {
         let mut bytes = encode(&snap);
         bytes.truncate(bytes.len() - 3);
         assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_absurd_count_before_allocating() {
+        // Cabecera válida con count enorme y sin filas: debe fallar por la cota.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = decode(&bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        // Un count que entra en la cota pero con una fila truncada falla al leer
+        // (name_len=8 sin los 8 bytes de nombre, y sin los campos fijos finales).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&0i64.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        let mut row = vec![0u8; MIN_ENTRY_BYTES];
+        row[16..20].copy_from_slice(&8u32.to_le_bytes());
+        bytes.extend(row);
+        assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn encode_entries_matches_encode() {
+        let entries = vec![e("C:\\b\\1.bin", 1), e("C:\\b\\2.bin", 2)];
+        assert_eq!(encode_entries(77, &entries), encode(&Snapshot::new(77, entries)));
+    }
+
+    #[test]
+    fn read_bounded_reads_exact_size_and_rejects_oversize() {
+        let dir = std::env::temp_dir().join(format!("wz_snap_bounded_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.wzsnap");
+        let bytes = encode(&Snapshot::new(1, vec![e("C:\\a\\b.bin", 3)]));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let read = read_bounded(&path, MAX_FILE_BYTES).unwrap();
+        assert_eq!(read, bytes);
+        assert_eq!(read.capacity(), bytes.len());
+
+        let err = read_bounded(&path, (bytes.len() - 1) as u64).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("demasiado grande"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

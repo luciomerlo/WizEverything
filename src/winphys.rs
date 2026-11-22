@@ -41,6 +41,15 @@ pub const ATTR_UNPINNED: u32 = 0x0010_0000;
 pub const ATTR_RECALL_ON_DATA_ACCESS: u32 = 0x0040_0000;
 pub const ATTR_RECALL_ON_OPEN: u32 = 0x0004_0000;
 
+/// `true` si el archivo es un *placeholder* de nube (OneDrive/Google Drive):
+/// abrirlo descarga el contenido. Consultar atributos no lo hidrata, así que
+/// los scanners pueden saltarlo antes de llamar a `open` o a un decodificador.
+pub fn is_cloud_placeholder(path: &Path) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const MASK: u32 = ATTR_RECALL_ON_OPEN | ATTR_RECALL_ON_DATA_ACCESS | ATTR_OFFLINE;
+    std::fs::metadata(path).map(|m| m.file_attributes() & MASK != 0).unwrap_or(false)
+}
+
 /// Identidad física de un archivo dentro de un volumen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FileId {
@@ -366,6 +375,13 @@ mod tests {
         let attrs = attributes(&p).unwrap();
         assert_eq!(attrs & ATTR_REPARSE_POINT, 0);
         assert_eq!(attrs & ATTR_SPARSE_FILE, 0);
+        std::fs::remove_file(&p).ok();
+    }
+
+    #[test]
+    fn a_normal_file_is_not_a_cloud_placeholder() {
+        let p = temp_file(b"local, no nube");
+        assert!(!is_cloud_placeholder(&p));
         std::fs::remove_file(&p).ok();
     }
 

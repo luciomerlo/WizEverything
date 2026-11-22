@@ -3,6 +3,29 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.19.0] - 2026-11-21
+
+### Changed
+- **La UI deja de bloquearse durante los análisis**: GitHub, carpetas duplicadas, archivos/carpetas
+  frías, planificador, mapa de edad, WSL/Docker, pronóstico, comparación de máquinas, línea de
+  tiempo, respaldo, búsqueda de contenido/OCR, imágenes/audio parecidos, velocidad y
+  consejo/procedencia corren en un hilo de trabajo con indicador y ETA. Un resultado de un árbol
+  viejo se descarta si hubo una recarga.
+- **Búsqueda de archivos con debounce**: el filtro de la pestaña Archivos espera 180 ms antes de
+  recalcular los 1000 más grandes, en vez de escanear el árbol en cada tecla.
+- **Duplicados de carpetas**: el hash estructural ya no crea un `String` por archivo hijo; usa
+  claves `u64` con nombre normalizado y ordena sin asignaciones extra.
+- **Tipos de archivo**: los totales por extensión usan un vector denso en vez de un `HashMap`, y el
+  filtro de nombres compara sin asignar minúsculas en el caso ASCII.
+- **Índice compartido**: `put_many` escribe lotes de 32 documentos en una transacción con sentencia
+  preparada; `prune` borra en lote y `open` aplica `synchronous=NORMAL` sin reejecutar DDL cuando la
+  base ya está lista.
+- **Snapshots/catálogos**: lectura acotada a 512 MB antes de reservar, descompresión Zstd por
+  bloques con tope estricto, escritura atómica (temporal + rename) y menos copias al comparar.
+- **Placeholders de nube**: la búsqueda de contenido y los scanners de imágenes/audio consultan los
+  atributos y **no abren** archivos de OneDrive/Google Drive, evitando hidratarlos.
+- **PDF**: si `pdftotext` ya devuelve texto suficiente, se omite rasterizar y hacer OCR.
+
 ## [0.18.0] - 2026-11-21
 
 ### Added

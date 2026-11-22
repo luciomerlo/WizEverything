@@ -24,6 +24,8 @@ const MAGIC: &[u8; 8] = b"WZECAT1\0";
 const ZSTD_LEVEL: i32 = 19; // alto: el catálogo se escribe una vez y se lee muchas
 const MAX_PAYLOAD_BYTES: usize = 512 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
+/// Cabecera fija posterior al nombre: serial (8) + created (8) + pay_len (4).
+const TAIL_BYTES: usize = 20;
 
 /// Catálogo de un volumen externo.
 #[derive(Clone, Debug, Default)]
@@ -85,14 +87,14 @@ impl Catalog {
 
     /// Serializa a bytes `.ecat` comprimidos.
     pub fn encode(&self) -> io::Result<Vec<u8>> {
-        let snap = Snapshot::new(self.created, self.entries.clone());
-        let raw = snapshot::encode(&snap);
+        let raw = snapshot::encode_entries(self.created, &self.entries);
         let mut enc = zstd::Encoder::new(Vec::new(), ZSTD_LEVEL)?;
         enc.write_all(&raw)?;
+        drop(raw);
         let payload = enc.finish()?;
 
         let name = self.volume_name.as_bytes();
-        let mut out = Vec::with_capacity(24 + name.len() + payload.len());
+        let mut out = Vec::with_capacity(32 + name.len() + payload.len());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&(name.len() as u32).to_le_bytes());
         out.extend_from_slice(name);
@@ -112,31 +114,82 @@ impl Catalog {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "magic .ecat inválido"));
         }
         let name_len = read_u32(&mut r)? as usize;
-        if name_len > bytes.len() {
+        // El nombre va seguido de serial + created + pay_len: validamos contra lo
+        // que realmente queda antes de asignar nada.
+        if name_len > r.len().saturating_sub(TAIL_BYTES) {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "name_len absurdo"));
         }
-        let mut name_buf = vec![0u8; name_len];
-        r.read_exact(&mut name_buf)?;
-        let volume_name = String::from_utf8_lossy(&name_buf).into_owned();
+        let name_bytes = take(&mut r, name_len)?;
+        let volume_name = match std::str::from_utf8(name_bytes) {
+            Ok(s) => s.to_owned(),
+            Err(_) => String::from_utf8_lossy(name_bytes).into_owned(),
+        };
         let volume_serial = read_u64(&mut r)?;
         let created = read_i64(&mut r)?;
         let pay_len = read_u32(&mut r)? as usize;
-        if pay_len > bytes.len() || pay_len > MAX_PAYLOAD_BYTES {
+        if pay_len > r.len() || pay_len > MAX_PAYLOAD_BYTES {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "payload .ecat absurdo"));
         }
-        let mut payload = vec![0u8; pay_len];
-        r.read_exact(&mut payload)?;
+        // Sin copia: el payload se descomprime directamente desde el slice leído.
+        let payload = &r[..pay_len];
 
         let mut decompressed = Vec::new();
-        let mut limited = zstd::Decoder::new(&payload[..])?.take(MAX_DECOMPRESSED_BYTES + 1);
-        let n = limited.read_to_end(&mut decompressed)?;
-        if n as u64 > MAX_DECOMPRESSED_BYTES {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "catálogo descomprimido demasiado grande"));
-        }
+        decompress_bounded(payload, &mut decompressed)?;
         let snap = snapshot::decode(&decompressed)?;
 
         Ok(Catalog::new(volume_name, volume_serial, created, snap.entries))
     }
+}
+
+/// Toma los próximos `n` bytes del slice sin copiarlos.
+fn take<'a>(r: &mut &'a [u8], n: usize) -> io::Result<&'a [u8]> {
+    if n > r.len() {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "catálogo truncado"));
+    }
+    let (head, tail) = r.split_at(n);
+    *r = tail;
+    Ok(head)
+}
+
+/// Descomprime `payload` (Zstd) en `out` con tope estricto. Si el frame declara
+/// su tamaño, se valida y reserva antes de descomprimir; si se supera el tope
+/// durante la lectura se aborta sin asignar el resto.
+fn decompress_bounded(payload: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+    decompress_with_cap(payload, out, MAX_DECOMPRESSED_BYTES)
+}
+
+fn decompress_with_cap(payload: &[u8], out: &mut Vec<u8>, cap: u64) -> io::Result<()> {
+    let declared = zstd::zstd_safe::get_frame_content_size(payload).ok().flatten();
+    if let Some(n) = declared {
+        if n > cap {
+            return Err(too_large(n, cap));
+        }
+        out.reserve_exact(n as usize);
+    }
+    let mut dec = zstd::Decoder::new(payload)?;
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = dec.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(());
+        }
+        let len = out
+            .len()
+            .checked_add(n)
+            .filter(|&len| len as u64 <= cap)
+            .ok_or_else(|| too_large(cap.saturating_add(1), cap))?;
+        out.reserve(len - out.len());
+        out.extend_from_slice(&chunk[..n]);    }
+}
+
+fn too_large(n: u64, cap: u64) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!(
+            "catálogo descomprimido demasiado grande ({n} bytes); límite {} MB",
+            cap / (1024 * 1024)
+        ),
+    )
 }
 
 fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
@@ -224,6 +277,56 @@ mod tests {
         let n = bytes.len();
         bytes.truncate(n - 5);
         assert!(Catalog::decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_absurd_lengths_before_allocating() {
+        // Cabecera cortada: ni siquiera hay name_len.
+        assert!(Catalog::decode(MAGIC).is_err());
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&100u32.to_le_bytes()); // name_len
+        bytes.extend_from_slice(&[0u8; TAIL_BYTES]); // relleno para el resto de la cabecera
+        let err = Catalog::decode(&bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("name_len"));
+
+        // pay_len por encima del límite duro: error sin reservar el payload.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&2i64.to_le_bytes());
+        bytes.extend_from_slice(&((MAX_PAYLOAD_BYTES as u32) + 1).to_le_bytes());
+        let err = Catalog::decode(&bytes).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("payload"));
+    }
+
+    #[test]
+    fn decompression_cap_is_enforced() {
+        let raw = vec![7u8; 4096];
+        // `bulk::compress` declara el tamaño del frame: se valida antes de descomprimir.
+        let declared = zstd::bulk::compress(&raw, 1).unwrap();
+        let mut out = Vec::new();
+        let err = decompress_with_cap(&declared, &mut out, 64).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(out.is_empty(), "no debe descomprimirse nada");
+
+        // Aun sin tamaño declarado, el tope se aplica durante el streaming.
+        let mut enc = zstd::Encoder::new(Vec::new(), 1).unwrap();
+        enc.write_all(&raw).unwrap();
+        let streaming = enc.finish().unwrap();
+        let mut out = Vec::new();
+        let err = decompress_with_cap(&streaming, &mut out, 64).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(out.len() <= 64);
+
+        // Con tope suficiente, descomprime completo.
+        let mut out = Vec::new();
+        decompress_with_cap(&streaming, &mut out, 4096).unwrap();
+        assert_eq!(out, raw);
     }
 
     #[test]

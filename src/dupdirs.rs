@@ -47,25 +47,39 @@ fn ancestor_owner(path: &str, map: &HashMap<String, usize>) -> Option<usize> {
     None
 }
 
+/// Hash of a child name + kind, without allocating a lowercased copy.
+///
+/// The previous version did `format!("d:{name}")` and sorted Strings for every
+/// child; with 100k files that was 100k+ allocations. Two u64s keep the same
+/// structural meaning (kind + case-insensitive name + size/child hash) and the
+/// same 64-bit collision profile as before.
+fn name_key(name: &str, dir: bool) -> u64 {
+    let mut h = DefaultHasher::new();
+    h.write_u8(if dir { b'd' } else { b'f' });
+    for b in name.bytes() {
+        h.write_u8(b.to_ascii_lowercase());
+    }
+    h.finish()
+}
+
 fn hash_dir(t: &Tree, id: u32, memo: &mut HashMap<u32, u64>) -> u64 {
     if let Some(&h) = memo.get(&id) {
         return h;
     }
-    let mut parts: Vec<(String, u64)> = Vec::new();
+    let mut parts: Vec<(u64, u64)> = Vec::with_capacity(t.children(id).len());
     for &c in t.children(id) {
         let n = &t.nodes[c as usize];
-        let name = t.name(c).to_ascii_lowercase();
+        let key = name_key(t.name(c), n.is_dir());
         if n.is_dir() {
             if skip_id(t, c) {
                 continue;
             }
-            let h = hash_dir(t, c, memo);
-            parts.push((format!("d:{name}"), h));
+            parts.push((key, hash_dir(t, c, memo)));
         } else {
-            parts.push((format!("f:{name}"), n.size));
+            parts.push((key, n.size));
         }
     }
-    parts.sort();
+    parts.sort_unstable();
     let mut hasher = DefaultHasher::new();
     parts.hash(&mut hasher);
     let h = hasher.finish();

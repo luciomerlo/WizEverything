@@ -42,7 +42,8 @@ fn has_tool(name: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Herramientas externas disponibles (se detectan una vez).
+/// Herramientas externas disponibles (se detectan una vez por proceso).
+#[derive(Clone, Copy, Debug)]
 pub struct Tools {
     pub pdftotext: bool,
     pub tesseract: bool,
@@ -50,8 +51,24 @@ pub struct Tools {
 
 impl Tools {
     pub fn detect() -> Self {
-        // Poppler usa -v; Tesseract usa --version.
-        Tools { pdftotext: has_tool("pdftotext", &["-v"]), tesseract: has_tool("tesseract", &["--version"]) }
+        // Cacheado: detectar cuesta dos procesos (`pdftotext -v`, `tesseract --version`)
+        // y antes se repetía en cada búsqueda y en cada estimación.
+        static CACHE: std::sync::OnceLock<Tools> = std::sync::OnceLock::new();
+        *CACHE.get_or_init(|| Tools {
+            // Poppler usa -v; Tesseract usa --version.
+            pdftotext: has_tool("pdftotext", &["-v"]),
+            tesseract: has_tool("tesseract", &["--version"]),
+        })
+    }
+
+    /// Sin herramientas externas: sólo formatos nativos. Útil para tests y para
+    /// razonar sobre lo que la app puede hacer por sí sola (no lanza procesos).
+    pub const fn none() -> Self {
+        Tools { pdftotext: false, tesseract: false }
+    }
+
+    fn ocr_pdf_ready(&self) -> bool {
+        self.pdftotext && self.tesseract
     }
 }
 
@@ -61,6 +78,33 @@ pub struct Extracted {
     /// `text`, `pdf` o `ocr`.
     pub kind: &'static str,
     pub note: String,
+    /// `true` si el texto es el mejor resultado que estas herramientas y este
+    /// modo pueden dar (vale la pena guardarlo en el índice). `false` cuando
+    /// conviene reintentar: falta `pdftotext`, falta OCR, o el PDF sólo tenía
+    /// una capa de texto insignificante.
+    pub cacheable: bool,
+}
+
+impl Extracted {
+    fn new(text: String, kind: &'static str, note: String) -> Self {
+        Extracted { text, kind, note, cacheable: true }
+    }
+
+    fn retry(text: String, kind: &'static str, note: String) -> Self {
+        Extracted { text, kind, note, cacheable: false }
+    }
+}
+
+/// Caracteres no blancos a partir de los cuales se considera que un PDF ya
+/// tiene capa de texto útil y no vale la pena rasterizar con `pdftoppm`+OCR.
+/// Muchos PDFs escaneados emiten un par de caracteres (números de página,
+/// sellos), así que "no vacío" no alcanza como criterio.
+const PDF_TEXT_MIN_CHARS: usize = 48;
+
+/// `true` si el texto del PDF ya es suficientemente bueno para no hacer OCR.
+fn pdf_text_is_enough(text: &str) -> bool {
+    text.chars().filter(|c| !c.is_whitespace() && !c.is_control()).take(PDF_TEXT_MIN_CHARS).count()
+        == PDF_TEXT_MIN_CHARS
 }
 
 fn temp_file(tag: &str) -> PathBuf {
@@ -151,20 +195,16 @@ fn extract_with_budget(path: &Path, deep: bool, tools: &Tools, budget_ms: u128) 
         let cap = if deep { 4 * 1024 * 1024 } else { 1024 * 1024 };
         let mut bytes = Vec::with_capacity(cap.min(256 * 1024));
         std::fs::File::open(path).ok()?.take(cap as u64).read_to_end(&mut bytes).ok()?;
-        return Some(Extracted {
-            text: String::from_utf8_lossy(&bytes).into_owned(),
-            kind: "text",
-            note: String::new(),
-        });
+        return Some(Extracted::new(String::from_utf8_lossy(&bytes).into_owned(), "text", String::new()));
     }
     if DOC_EXT.contains(&ext.as_str()) {
         if ext == "rtf" {
             let raw = std::fs::read_to_string(path).ok()?;
-            return Some(Extracted { text: rtf_text(&raw), kind: "document", note: String::new() });
+            return Some(Extracted::new(rtf_text(&raw), "document", String::new()));
         }
         if ext == "epub" {
             let text = read_zip(path, |n| n.ends_with(".xhtml") || n.ends_with(".html"), &["p"])?;
-            return Some(Extracted { text, kind: "document", note: String::new() });
+            return Some(Extracted::new(text, "document", String::new()));
         }
         let text = read_zip(
             path,
@@ -177,7 +217,7 @@ fn extract_with_budget(path: &Path, deep: bool, tools: &Tools, budget_ms: u128) 
             },
             &["t"],
         )?;
-        return Some(Extracted { text, kind: "document", note: String::new() });
+        return Some(Extracted::new(text, "document", String::new()));
     }
     if PPT_EXT.contains(&ext.as_str()) {
         let text = if ext == "pptx" {
@@ -185,7 +225,7 @@ fn extract_with_budget(path: &Path, deep: bool, tools: &Tools, budget_ms: u128) 
         } else {
             read_zip(path, |n| n == "content.xml", &["p"])
         }?;
-        return Some(Extracted { text, kind: "presentation", note: String::new() });
+        return Some(Extracted::new(text, "presentation", String::new()));
     }
     if SHEET_EXT.contains(&ext.as_str()) {
         let text = if ext == "xlsx" {
@@ -197,18 +237,18 @@ fn extract_with_budget(path: &Path, deep: bool, tools: &Tools, budget_ms: u128) 
         } else {
             read_zip(path, |n| n == "content.xml", &["p"])
         }?;
-        return Some(Extracted { text, kind: "sheet", note: String::new() });
+        return Some(Extracted::new(text, "sheet", String::new()));
     }
     if LEGACY_EXT.contains(&ext.as_str()) {
-        return Some(Extracted {
-            text: String::new(),
-            kind: "document",
-            note: format!(".{ext} es un formato binario antiguo: convertí a .{} para buscar dentro.", if ext == "doc" { "docx" } else if ext == "ppt" { "pptx" } else { "xlsx" }),
-        });
+        return Some(Extracted::retry(
+            String::new(),
+            "document",
+            format!(".{ext} es un formato binario antiguo: convertí a .{} para buscar dentro.", if ext == "doc" { "docx" } else if ext == "ppt" { "pptx" } else { "xlsx" }),
+        ));
     }
     if ext == "pdf" {
         if !tools.pdftotext {
-            return Some(Extracted { text: String::new(), kind: "pdf", note: "Falta pdftotext (poppler) para leer PDFs.".into() });
+            return Some(Extracted::retry(String::new(), "pdf", "Falta pdftotext (poppler) para leer PDFs.".into()));
         }
         let mut cmd = Command::new("pdftotext");
         cmd.arg("-q");
@@ -221,14 +261,24 @@ fn extract_with_budget(path: &Path, deep: bool, tools: &Tools, budget_ms: u128) 
             return None;
         }
         let text = run_stdout_timeout(cmd, left.min(if deep { 60 } else { 20 })).unwrap_or_default();
-        if text.trim().is_empty() {
-            if deep && tools.tesseract {
-                // PDF escaneado: se rasteriza con pdftoppm y se pasa a tesseract.
-                return ocr_pdf(path, tools, deep, budget_ms, started);
-            }
-            return Some(Extracted { text, kind: "pdf", note: "Sin capa de texto; probá profundo con OCR.".into() });
+        // Camino rápido: si la capa de texto alcanza, se devuelve ya. No se
+        // crea directorio temporal, no se lanza `pdftoppm` ni `tesseract`.
+        if pdf_text_is_enough(&text) {
+            return Some(Extracted::new(text, "pdf", String::new()));
         }
-        return Some(Extracted { text, kind: "pdf", note: String::new() });
+        if deep && tools.tesseract {
+            // PDF escaneado (o con capa casi vacía): se rasteriza con pdftoppm
+            // y se pasa a tesseract, dentro del presupuesto restante.
+            if let Some(ex) = ocr_pdf(path, tools, deep, budget_ms, started) {
+                return Some(ex);
+            }
+        }
+        if text.trim().is_empty() {
+            return Some(Extracted::retry(text, "pdf", "Sin capa de texto; probá profundo con OCR.".into()));
+        }
+        // Capa de texto mínima: se devuelve (puede haber coincidencias) pero no
+        // se cachea, para que un modo profundo posterior sí intente OCR.
+        return Some(Extracted::retry(text, "pdf", "Capa de texto mínima; probá profundo con OCR.".into()));
     }
     if deep && IMAGE_EXT.contains(&ext.as_str()) && tools.tesseract {
         let left = budget_secs(started, budget_ms);
@@ -238,35 +288,39 @@ fn extract_with_budget(path: &Path, deep: bool, tools: &Tools, budget_ms: u128) 
         let mut cmd = Command::new("tesseract");
         cmd.arg(path).arg("stdout").args(["-l", "spa+eng", "--psm", "3"]);
         if let Some(text) = run_stdout_timeout(cmd, left.min(25)) {
-            return Some(Extracted { text, kind: "ocr", note: String::new() });
+            return Some(Extracted::new(text, "ocr", String::new()));
         }
     }
     None
 }
 
 fn ocr_pdf(path: &Path, tools: &Tools, deep: bool, budget_ms: u128, started: Instant) -> Option<Extracted> {
-    if !tools.pdftotext || !tools.tesseract {
+    if !tools.ocr_pdf_ready() {
         return None;
     }
     // Directorio único por llamada: dos búsquedas simultáneas no comparten PNGs.
+    // Se limpia siempre al salir, incluso si algo falla a mitad de camino.
     let dir = temp_file("ocr");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
+    let result = ocr_pdf_inner(path, deep, budget_ms, started, &dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn ocr_pdf_inner(path: &Path, deep: bool, budget_ms: u128, started: Instant, dir: &Path) -> Option<Extracted> {
     let out = dir.join("page");
     let max_pages = if deep { 20 } else { 1 };
     let mut raster = Command::new("pdftoppm");
     raster.args(["-f", "1", "-l", &max_pages.to_string(), "-r", "200", "-png"]).arg(path).arg(&out);
     let left = budget_secs(started, budget_ms);
     if left == 0 {
-        let _ = std::fs::remove_dir_all(&dir);
         return None;
     }
-    let ok = status_timeout(raster, left.min(180));
-    if !ok {
-        let _ = std::fs::remove_dir_all(&dir);
+    if !status_timeout(raster, left.min(180)) {
         return None;
     }
-    let mut imgs: Vec<PathBuf> = std::fs::read_dir(&dir)
+    let mut imgs: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
@@ -275,17 +329,17 @@ fn ocr_pdf(path: &Path, tools: &Tools, deep: bool, budget_ms: u128, started: Ins
     imgs.sort();
     let mut text = String::new();
     for img in imgs.iter().take(max_pages) {
+        // Cada página respeta el presupuesto global, no sólo el tope por página.
+        let left = budget_secs(started, budget_ms);
+        if left == 0 {
+            break;
+        }
         let mut cmd = Command::new("tesseract");
         cmd.arg(img).arg("stdout").args(["-l", "spa+eng"]);
-        text.push_str(&run_stdout_timeout(cmd, 25).unwrap_or_default());
+        text.push_str(&run_stdout_timeout(cmd, left.min(25)).unwrap_or_default());
         text.push('\n');
     }
-    let _ = std::fs::remove_dir_all(&dir);
-    Some(Extracted {
-        text,
-        kind: "ocr",
-        note: format!("PDF sin texto: OCR de hasta {max_pages} páginas."),
-    })
+    Some(Extracted::new(text, "ocr", format!("PDF sin texto: OCR de hasta {max_pages} páginas.")))
 }
 
 fn unescape(s: &str) -> String {
@@ -482,6 +536,55 @@ pub struct Report {
     pub index_path: String,
 }
 
+/// Texto extraído pendiente de escribir en el índice compartido.
+struct PendingDoc {
+    path: String,
+    size: u64,
+    mtime: i64,
+    kind: &'static str,
+    text: String,
+}
+
+/// Documentos por transacción al indexar. Un commit por archivo costaba un
+/// ciclo de WAL/fsync por cada texto; lotes de 32 lo amortizan sin retener el
+/// lock de escritura durante toda la búsqueda.
+const INDEX_BATCH: usize = 32;
+
+/// Vuelca el lote pendiente en **una** transacción. Devuelve cuántos se
+/// escribieron (0 si no hay índice o si falla: el índice es una caché).
+fn flush_index(
+    index: Option<&rusqlite::Connection>,
+    pending: &mut Vec<PendingDoc>,
+    notes: &mut Vec<String>,
+) -> u64 {
+    if pending.is_empty() {
+        return 0;
+    }
+    let Some(c) = index else {
+        pending.clear();
+        return 0;
+    };
+    // Sin clonar textos: `Doc` sólo toma prestado de `pending`.
+    let docs = pending.iter().map(|d| crate::content_index::Doc {
+        path: &d.path,
+        size: d.size,
+        mtime: d.mtime,
+        kind: d.kind,
+        text: &d.text,
+    });
+    let n = match crate::content_index::put_many(c, docs) {
+        Ok(n) => n as u64,
+        Err(e) => {
+            if notes.len() < 30 {
+                notes.push(format!("Índice compartido: {e}"));
+            }
+            0
+        }
+    };
+    pending.clear();
+    n
+}
+
 /// Busca `query` dentro de los archivos bajo `root`.
 pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, budget_ms: u128, limit: usize) -> Report {
     let started = Instant::now();
@@ -512,6 +615,8 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
     let mut partial = false;
     let mut index_hits = 0u64;
     let mut index_writes = 0u64;
+    let mut cloud = 0u64;
+    let mut pending: Vec<PendingDoc> = Vec::with_capacity(INDEX_BATCH);
     for id in t.files_under(root) {
         if hits.len() >= limit || scanned as usize >= max_files || started.elapsed().as_millis() > budget_ms {
             partial = true;
@@ -530,6 +635,12 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
         if !supported {
             continue;
         }
+        // Nunca hidratar un placeholder de nube desde una búsqueda de contenido.
+        // Se consulta sólo metadata; el archivo cuenta como omitido.
+        if crate::winphys::is_cloud_placeholder(path) {
+            cloud += 1;
+            continue;
+        }
         scanned += 1;
         let size = t.nodes[id as usize].size;
         let modified = t.nodes[id as usize].modified as i64;
@@ -537,21 +648,20 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
         let cached = index
             .as_ref()
             .and_then(|c| crate::content_index::get(c, &p, size, modified));
-        let ex = match cached {
+        // `cacheable` sólo importa para escribir el índice; un hit del índice no
+        // se vuelve a escribir.
+        let (kind, text, cacheable) = match cached {
             Some((kind, text)) => {
                 index_hits += 1;
-                Extracted {
-                    text,
-                    kind: match kind.as_str() {
-                        "text" => "text",
-                        "ocr" => "ocr",
-                        "pdf" => "pdf",
-                        "presentation" => "presentation",
-                        "sheet" => "sheet",
-                        _ => "document",
-                    },
-                    note: String::new(),
-                }
+                let kind = match kind.as_str() {
+                    "text" => "text",
+                    "ocr" => "ocr",
+                    "pdf" => "pdf",
+                    "presentation" => "presentation",
+                    "sheet" => "sheet",
+                    _ => "document",
+                };
+                (kind, text, false)
             }
             None => {
                 let left = budget_ms.saturating_sub(started.elapsed().as_millis());
@@ -563,26 +673,34 @@ pub fn search(t: &Tree, root: u32, query: &str, deep: bool, max_files: usize, bu
                 if !ex.note.is_empty() && notes.len() < 30 {
                     notes.push(format!("{}: {}", p, ex.note));
                 }
-                if owner
-                    && let Some(c) = &index
-                    && !ex.text.is_empty()
-                    && ex.note.is_empty()
-                    && crate::content_index::put(c, &p, size, modified, ex.kind, &ex.text).is_ok()
-                {
-                    index_writes += 1;
-                }
-                ex
+                (ex.kind, ex.text, ex.cacheable)
             }
         };
-        if let Some(sn) = snippet(&ex.text, query) {
-            hits.push(Hit { path: p, size, kind: ex.kind, snippet: sn });
+        let found = snippet(&text, query);
+        // Se cachea también lo que no coincide: el índice sirve a futuras búsquedas.
+        if owner && cacheable && !text.trim().is_empty() {
+            pending.push(PendingDoc { path: p.clone(), size, mtime: modified, kind, text });
+            if pending.len() >= INDEX_BATCH {
+                index_writes += flush_index(index.as_ref(), &mut pending, &mut notes);
+            }
+        }
+        if let Some(sn) = found {
+            hits.push(Hit { path: p, size, kind, snippet: sn });
         }
     }
-    if owner
-        && let Some(c) = &index
-    {
-        let _ = crate::content_index::release(c, crate::content_index::APP_WIZ);
+    if owner {
+        index_writes += flush_index(index.as_ref(), &mut pending, &mut notes);
+        if let Some(c) = &index {
+            let _ = crate::content_index::release(c, crate::content_index::APP_WIZ);
+        }
     }
+    if cloud > 0 {
+        notes.push(format!(
+            "{cloud} archivos son placeholders de nube y no se abrieron (no se descargaron)."
+        ));
+    }
+    // Si no somos dueños no se escribió nada: se descarta el lote parcial.
+    pending.clear();
     Report {
         hits,
         scanned,
@@ -629,16 +747,18 @@ pub fn estimate(t: &Tree, root: u32) -> serde_json::Value {
     let mut pdf = (0u64, 0u64);
     let mut images = (0u64, 0u64);
     for id in t.files_under(root) {
-        let p = PathBuf::from(t.full_path(id));
-        let ext = ext_of(&p);
-        let size = t.nodes[id as usize].size;
-        if TEXT_EXT.contains(&ext.as_str()) {
+        let n = &t.nodes[id as usize];
+        // Extension ids are dense; no need to build the full path just to
+        // classify a million files before estimating.
+        let ext = t.exts.get(n.ext as usize).map(|e| e.name.as_str()).unwrap_or("");
+        let size = n.size;
+        if TEXT_EXT.contains(&ext) {
             text.0 += 1;
             text.1 += size;
         } else if ext == "pdf" {
             pdf.0 += 1;
             pdf.1 += size;
-        } else if IMAGE_EXT.contains(&ext.as_str()) {
+        } else if IMAGE_EXT.contains(&ext) {
             images.0 += 1;
             images.1 += size;
         }
@@ -688,10 +808,12 @@ mod tests {
         z.start_file("word/document.xml", zip::write::SimpleFileOptions::default()).unwrap();
         z.write_all(br#"<w:document><w:body><w:p><w:r><w:t>Hola documento</w:t></w:r></w:p></w:body></w:document>"#).unwrap();
         z.finish().unwrap();
-        let tools = Tools::detect();
+        // Sin herramientas externas: estos formatos son nativos.
+        let tools = Tools::none();
         let d = extract(&docx, false, &tools).unwrap();
         assert_eq!(d.kind, "document");
         assert!(d.text.contains("Hola documento"));
+        assert!(d.cacheable);
 
         let xlsx = dir.join("a.xlsx");
         let mut z = zip::ZipWriter::new(std::fs::File::create(&xlsx).unwrap());
@@ -707,5 +829,77 @@ mod tests {
     fn text_extensions_are_recognized() {
         assert_eq!(ext_of(Path::new("a.MD")), "md");
         assert!(TEXT_EXT.contains(&"rs"));
+    }
+
+    #[test]
+    fn pdf_text_layer_is_only_good_when_it_has_enough_content() {
+        // Nada o casi nada (número de página, sello) → conviene OCR.
+        assert!(!pdf_text_is_enough(""));
+        assert!(!pdf_text_is_enough("  \n\t \n"));
+        assert!(!pdf_text_is_enough("1"));
+        assert!(!pdf_text_is_enough(&"x".repeat(PDF_TEXT_MIN_CHARS - 1)));
+        // Los blancos no cuentan.
+        assert!(!pdf_text_is_enough(&" x \n".repeat(PDF_TEXT_MIN_CHARS - 1)));
+        assert!(pdf_text_is_enough(&"x".repeat(PDF_TEXT_MIN_CHARS)));
+        assert!(pdf_text_is_enough("Factura de enero\nTotal: 1234\nCliente: ACME S.A.\nVencimiento: 30/01"));
+    }
+
+    #[test]
+    fn pdf_without_pdftotext_does_not_spawn_anything_and_is_not_cached() {
+        let dir = std::env::temp_dir().join(format!("wzpdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("a.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4\n%%EOF").unwrap();
+        let ex = extract(&pdf, true, &Tools::none()).unwrap();
+        assert_eq!(ex.kind, "pdf");
+        assert!(ex.text.is_empty());
+        assert!(ex.note.contains("pdftotext"));
+        // `cacheable = false`: cuando aparezca poppler se reintenta solo.
+        assert!(!ex.cacheable);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_text_and_legacy_formats_have_the_expected_cache_policy() {
+        let dir = std::env::temp_dir().join(format!("wztxt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let txt = dir.join("a.txt");
+        std::fs::write(&txt, "hola índice compartido").unwrap();
+        let ex = extract(&txt, false, &Tools::none()).unwrap();
+        assert_eq!(ex.kind, "text");
+        assert!(ex.text.contains("compartido"));
+        assert!(ex.cacheable);
+
+        let doc = dir.join("viejo.doc");
+        std::fs::write(&doc, [0u8; 4]).unwrap();
+        let ex = extract(&doc, false, &Tools::none()).unwrap();
+        assert!(ex.text.is_empty());
+        assert!(!ex.cacheable);
+
+        // Formatos fuera de alcance: ni imagen en modo rápido ni correo.
+        let img = dir.join("a.png");
+        std::fs::write(&img, [0u8; 4]).unwrap();
+        assert!(extract(&img, false, &Tools::none()).is_none());
+        let mail = dir.join("a.eml");
+        std::fs::write(&mail, "Subject: hola").unwrap();
+        assert!(extract(&mail, true, &Tools::none()).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flushing_without_an_index_is_a_no_op() {
+        let mut pending = vec![PendingDoc {
+            path: r"C:\a.txt".into(),
+            size: 1,
+            mtime: 1,
+            kind: "text",
+            text: "alfa".into(),
+        }];
+        let mut notes = Vec::new();
+        assert_eq!(flush_index(None, &mut pending, &mut notes), 0);
+        assert!(pending.is_empty());
+        assert!(notes.is_empty());
     }
 }
