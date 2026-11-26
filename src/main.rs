@@ -178,11 +178,11 @@ fn main() -> eframe::Result {
         let settings = i18n::Settings::load();
         i18n::set_lang(settings.lang);
         everything::set_engine(settings.engine);
-        let Some(key) = ai::unprotect(&settings.groq_key_enc) else {
-            println!("No Groq key saved (Options → Enter Groq key).");
+        let providers = ai::providers(&settings);
+        if providers.is_empty() {
+            println!("No AI configured (Options → Enter Groq key / Manual AI endpoint).");
             return Ok(());
-        };
-        let groq = ai::Groq::new(key);
+        }
         let excluded = settings.excluded_drives.clone();
         let mut server = mcp::Server::new(Box::new(move || {
             let saved = volumes::Store::default().enabled_full();
@@ -191,7 +191,7 @@ fn main() -> eframe::Result {
                 .map(std::sync::Arc::new)
         }));
         let spanish = settings.lang == i18n::Lang::Es;
-        match ai::ask_auto(&groq, None, &question, &mut server, spanish, &|m: &str| eprintln!("[trying {m}]")) {
+        match ai::ask_chain(&providers, None, &question, &mut server, spanish, &|m: &str| eprintln!("[trying {m}]")) {
             Ok((model, answer)) => {
                 let q = ai::quota(&model);
                 println!("[{model} · requests left today: {:?} · tokens left this minute: {:?}]\n{answer}", q.and_then(|q| q.req_left), q.and_then(|q| q.tok_left));

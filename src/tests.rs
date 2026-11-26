@@ -716,6 +716,50 @@ fn groq_fails_over_to_a_model_with_quota() {
     assert_eq!(tried2.lock().unwrap()[0], "llama-3.3-70b-versatile", "no attempt wasted on the exhausted model");
 }
 
+/// Endpoint without `/models` (typical of local servers) that always errors.
+struct DeadEndpoint;
+
+impl crate::ai::Transport for DeadEndpoint {
+    fn get(&self, _path: &str) -> Result<(u16, serde_json::Value), String> {
+        Err("connection refused".into())
+    }
+    fn post(&self, _path: &str, _body: &serde_json::Value) -> Result<(u16, serde_json::Value), String> {
+        Err("connection refused".into())
+    }
+}
+
+#[test]
+fn manual_endpoint_falls_back_to_next_provider() {
+    use crate::ai::Provider;
+    let mut server = mcp_server();
+    let providers = vec![
+        Provider { name: "local".into(), transport: Box::new(DeadEndpoint), model: Some("my-local-model".into()) },
+        Provider { name: "Groq".into(), transport: Box::new(FakeGroq { calls: Default::default() }), model: None },
+    ];
+    let tried = std::sync::Mutex::new(Vec::new());
+    let (model, answer) = crate::ai::ask_chain(&providers, None, "¿unidades?", &mut server, true, &|m| tried.lock().unwrap().push(m.to_string())).unwrap();
+    assert_eq!(tried.lock().unwrap()[0], "my-local-model", "forced model is tried first even without /models");
+    assert_eq!(model, "llama-3.3-70b-versatile");
+    assert_eq!(answer, "ok true");
+    // Nothing configured / everything dead: a clear error naming each provider.
+    assert!(crate::ai::ask_chain(&[], None, "x", &mut server, true, &|_| {}).is_err());
+    let dead = vec![Provider { name: "local".into(), transport: Box::new(DeadEndpoint), model: None }];
+    assert!(crate::ai::ask_chain(&dead, None, "x", &mut server, true, &|_| {}).unwrap_err().contains("[local]"));
+}
+
+#[test]
+fn manual_endpoint_settings_roundtrip() {
+    let mut s = crate::i18n::Settings::parse("", crate::i18n::Lang::En);
+    s.ai_name = "Ollama".into();
+    s.ai_base = "http://localhost:11434/v1".into();
+    s.ai_model = "qwen2.5".into();
+    let back = crate::i18n::Settings::parse(&s.to_text(), crate::i18n::Lang::En);
+    assert_eq!((back.ai_name.as_str(), back.ai_base.as_str(), back.ai_model.as_str()), ("Ollama", "http://localhost:11434/v1", "qwen2.5"));
+    let p = crate::ai::providers(&back);
+    assert_eq!(p.len(), 1, "no key needed for a local endpoint");
+    assert_eq!(p[0].model.as_deref(), Some("qwen2.5"));
+}
+
 #[test]
 fn groq_model_ranking() {
     let ids: Vec<String> = ["llama-3.1-8b-instant", "whisper-large-v3", "some/new-200b", "openai/gpt-oss-120b", "meta-llama/llama-guard-4-12b"].iter().map(|s| s.to_string()).collect();

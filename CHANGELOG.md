@@ -3,6 +3,15 @@
 All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- **Endpoint de IA manual** (Opciones → Endpoint manual / IA local): nombre, base URL, API key
+  (cifrada con DPAPI, opcional) y modelo. Acepta cualquier API compatible con OpenAI, paga, gratuita o
+  local (Ollama, LM Studio). Con modelo vacío elige automáticamente y salta al siguiente modelo si uno
+  falla; con nombre, ese va primero aunque el endpoint no liste `/models`. Si el endpoint manual falla,
+  cae a Groq. `--ask` usa la misma cadena.
+
 ## [0.19.0] - 2026-11-21
 
 ### Changed

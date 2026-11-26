@@ -62,13 +62,25 @@ pub trait Transport {
     fn post(&self, path: &str, body: &Value) -> Result<(u16, Value), String>;
 }
 
+/// OpenAI-compatible endpoint (Groq by default; any `base_url` for manual/local ones).
 pub struct Groq {
+    base: String,
     key: String,
 }
 
 impl Groq {
     pub fn new(key: String) -> Self {
-        Self { key }
+        Self { base: API.to_string(), key }
+    }
+
+    /// Manual endpoint: any OpenAI-compatible `base_url` (e.g. `http://localhost:11434/v1`).
+    /// An empty key sends no `Authorization` header (typical for local servers).
+    pub fn custom(base: &str, key: String) -> Self {
+        Self { base: base.trim().trim_end_matches('/').to_string(), key }
+    }
+
+    fn auth(&self, req: ureq::Request) -> ureq::Request {
+        if self.key.is_empty() { req } else { req.set("Authorization", &format!("Bearer {}", self.key)) }
     }
 
     fn agent() -> ureq::Agent {
@@ -104,15 +116,10 @@ impl Groq {
 
 impl Transport for Groq {
     fn get(&self, path: &str) -> Result<(u16, Value), String> {
-        Self::reply(Self::agent().get(&format!("{API}{path}")).set("Authorization", &format!("Bearer {}", self.key)).call())
+        Self::reply(self.auth(Self::agent().get(&format!("{}{path}", self.base))).call())
     }
     fn post(&self, path: &str, body: &Value) -> Result<(u16, Value), String> {
-        Self::reply(
-            Self::agent()
-                .post(&format!("{API}{path}"))
-                .set("Authorization", &format!("Bearer {}", self.key))
-                .send_json(body.clone()),
-        )
+        Self::reply(self.auth(Self::agent().post(&format!("{}{path}", self.base))).send_json(body.clone()))
     }
 }
 
@@ -170,15 +177,41 @@ pub fn ask_auto(
     spanish: bool,
     on_model: &dyn Fn(&str),
 ) -> Result<(String, String), String> {
-    let mut order = list_models(t)?;
-    if let Some(p) = preferred
-        && let Some(i) = order.iter().position(|m| m == p)
-    {
-        let m = order.remove(i);
-        order.insert(0, m);
+    ask_with(t, preferred, false, question, server, spanish, on_model)
+}
+
+/// Like [`ask_auto`]. With `force`, `preferred` is tried first even if the
+/// endpoint does not list it (or has no `/models` at all, as many local servers).
+pub fn ask_with(
+    t: &dyn Transport,
+    preferred: Option<&str>,
+    force: bool,
+    question: &str,
+    server: &mut mcp::Server,
+    spanish: bool,
+    on_model: &dyn Fn(&str),
+) -> Result<(String, String), String> {
+    let mut order = match list_models(t) {
+        Ok(o) => o,
+        Err(e) if force && preferred.is_some() => {
+            let _ = e;
+            Vec::new()
+        }
+        Err(e) => return Err(e),
+    };
+    if let Some(p) = preferred {
+        match order.iter().position(|m| m == p) {
+            Some(i) => {
+                let m = order.remove(i);
+                order.insert(0, m);
+            }
+            None if force => order.insert(0, p.to_string()),
+            None => {}
+        }
     }
     // Models known to be out of quota go last instead of wasting an attempt.
-    order.sort_by_key(|m| exhausted(m));
+    let first = if force { preferred.map(String::from) } else { None };
+    order.sort_by_key(|m| exhausted(m) && first.as_deref() != Some(m));
     if order.is_empty() {
         return Err("No hay modelos de chat disponibles / No chat models available".into());
     }
@@ -192,6 +225,57 @@ pub fn ask_auto(
         }
     }
     Err(format!("Ningún modelo pudo responder / No model could answer:\n{}", errors.join("\n")))
+}
+
+/// One configured endpoint: its name, transport and an optional forced model
+/// (`None` = choose automatically from the endpoint's list).
+pub struct Provider {
+    pub name: String,
+    pub transport: Box<dyn Transport + Send + Sync>,
+    pub model: Option<String>,
+}
+
+/// Endpoints from the settings, in priority order: the manual one (if any),
+/// then Groq (if a key is saved). Falls over to the next one on any failure.
+pub fn providers(s: &crate::i18n::Settings) -> Vec<Provider> {
+    let mut v = Vec::new();
+    if !s.ai_base.trim().is_empty() {
+        let key = unprotect(&s.ai_key_enc).unwrap_or_default();
+        let name = if s.ai_name.trim().is_empty() { s.ai_base.trim().to_string() } else { s.ai_name.trim().to_string() };
+        let model = Some(s.ai_model.trim().to_string()).filter(|m| !m.is_empty());
+        v.push(Provider { name, transport: Box::new(Groq::custom(&s.ai_base, key)), model });
+    }
+    if let Some(key) = unprotect(&s.groq_key_enc).filter(|k| !k.is_empty()) {
+        v.push(Provider { name: "Groq".into(), transport: Box::new(Groq::new(key)), model: None });
+    }
+    v
+}
+
+/// Try each provider in order; the first that answers wins.
+/// `known` is the model that worked last time (used for automatic providers).
+pub fn ask_chain(
+    providers: &[Provider],
+    known: Option<&str>,
+    question: &str,
+    server: &mut mcp::Server,
+    spanish: bool,
+    on_model: &dyn Fn(&str),
+) -> Result<(String, String), String> {
+    if providers.is_empty() {
+        return Err("No hay IA configurada / No AI endpoint configured".into());
+    }
+    let mut errors = Vec::new();
+    for p in providers {
+        let (pref, force) = match &p.model {
+            Some(m) => (Some(m.as_str()), true),
+            None => (known, false),
+        };
+        match ask_with(p.transport.as_ref(), pref, force, question, server, spanish, on_model) {
+            Ok(r) => return Ok(r),
+            Err(e) => errors.push(format!("[{}] {e}", p.name)),
+        }
+    }
+    Err(errors.join("\n"))
 }
 
 fn system_prompt(spanish: bool) -> String {

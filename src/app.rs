@@ -59,6 +59,12 @@ struct Ai {
     rx: Option<Receiver<AiMsg>>,
     key_input: String,
     key_editing: bool,
+    /// Manual endpoint dialog (name, base URL, key, forced model).
+    ep_editing: bool,
+    ep_name: String,
+    ep_base: String,
+    ep_key: String,
+    ep_model: String,
 }
 
 /// Folders that rarely hold user duplicates worth deleting (system, programs, app data).
@@ -1401,6 +1407,7 @@ impl eframe::App for App {
         egui::Panel::top("toolbar").show(ui, |ui| self.toolbar(ui, &ctx, tree.as_deref()));
         egui::Panel::top("ask").show(ui, |ui| self.ask_bar(ui, &ctx));
         self.groq_key_dialog(&ctx);
+        self.endpoint_dialog(&ctx);
         egui::Panel::bottom("status").show(ui, |ui| self.status_bar(ui, tree.as_deref()));
 
         let Some(tree) = tree else {
@@ -3423,12 +3430,13 @@ impl App {
 
     // ------------------------------------------------------------ AI questions (Groq)
 
-    fn groq_key(&self) -> Option<String> {
-        crate::ai::unprotect(&self.settings.groq_key_enc).filter(|k| !k.is_empty())
+    fn ai_configured(&self) -> bool {
+        !self.settings.groq_key_enc.is_empty() || !self.settings.ai_base.trim().is_empty()
     }
 
     fn ask_ai(&mut self, ctx: &egui::Context) {
-        let (Some(key), Some(tree)) = (self.groq_key(), self.tree.clone()) else { return };
+        let (true, Some(tree)) = (self.ai_configured(), self.tree.clone()) else { return };
+        let providers = crate::ai::providers(&self.settings);
         let question = self.ai.question.trim().to_string();
         if question.is_empty() || self.ai.rx.is_some() {
             return;
@@ -3442,9 +3450,8 @@ impl App {
         let (tx, rx) = channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let groq = crate::ai::Groq::new(key);
             let mut server = crate::mcp::Server::new(Box::new(move || Ok(tree.clone())));
-            let r = crate::ai::ask_auto(&groq, known.as_deref(), &question, &mut server, spanish, &|m: &str| {
+            let r = crate::ai::ask_chain(&providers, known.as_deref(), &question, &mut server, spanish, &|m: &str| {
                 let _ = tx.send(AiMsg::Model(Ok(m.to_string())));
             })
             .map(|(_, answer)| answer);
@@ -3483,7 +3490,7 @@ impl App {
     /// Question bar under the toolbar; the chosen model is shown next to the button.
     fn ask_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         self.poll_ai();
-        let has_key = !self.settings.groq_key_enc.is_empty();
+        let has_key = self.ai_configured();
         ui.horizontal(|ui| {
             ui.label(tr("Preguntar:", "Ask:"));
             let w = (ui.available_width() - 330.0).max(160.0);
@@ -3502,7 +3509,7 @@ impl App {
                 ui.spinner();
             }
             let note = if !has_key {
-                tr("(cargá la clave de Groq en ⚙ Opciones)", "(add your Groq key in ⚙ Options)").to_string()
+                tr("(configurá la IA en ⚙ Opciones)", "(set up AI in ⚙ Options)").to_string()
             } else if self.ai.picking {
                 tr("(eligiendo modelo…)", "(choosing model…)").to_string()
             } else {
@@ -3533,8 +3540,8 @@ impl App {
             }
         });
         ui.label(RichText::new(tr(
-            "Responde con datos de tu índice usando herramientas de solo lectura; envía rutas y nombres de archivo a Groq.",
-            "Answers from your index with read-only tools; paths and file names are sent to Groq.",
+            "Responde con datos de tu índice usando herramientas de solo lectura; envía rutas y nombres de archivo al endpoint de IA configurado (Groq u otro).",
+            "Answers from your index with read-only tools; paths and file names are sent to the configured AI endpoint (Groq or other).",
         )).weak());
         ui.separator();
         egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
@@ -3583,6 +3590,89 @@ impl App {
             self.ai.key_editing = true;
             self.ai.key_input.clear();
             ui.close();
+        }
+        let label = if self.settings.ai_base.trim().is_empty() {
+            tr("Endpoint manual / IA local…", "Manual endpoint / local AI…")
+        } else {
+            tr("Endpoint manual: editar…", "Manual endpoint: edit…")
+        };
+        if ui.button(label).clicked() {
+            self.ai.ep_editing = true;
+            self.ai.ep_name = self.settings.ai_name.clone();
+            self.ai.ep_base = self.settings.ai_base.clone();
+            self.ai.ep_model = self.settings.ai_model.clone();
+            self.ai.ep_key.clear();
+            ui.close();
+        }
+    }
+
+    /// Dialog for a manual OpenAI-compatible endpoint (also local servers such as Ollama / LM Studio).
+    fn endpoint_dialog(&mut self, ctx: &egui::Context) {
+        if !self.ai.ep_editing {
+            return;
+        }
+        let resp = egui::Modal::new(egui::Id::unique("ai_endpoint")).show(ctx, |ui| {
+            ui.set_width(420.0);
+            ui.heading(tr("Endpoint de IA manual", "Manual AI endpoint"));
+            ui.label(tr(
+                "Cualquier API compatible con OpenAI (paga, gratuita o local). Se usa antes que Groq; si falla, pasa a Groq.",
+                "Any OpenAI-compatible API (paid, free or local). Used before Groq; falls back to Groq on failure.",
+            ));
+            ui.add_space(4.0);
+            egui::Grid::new("ep_grid").num_columns(2).show(ui, |ui| {
+                ui.label(tr("Nombre", "Name"));
+                ui.add(egui::TextEdit::singleline(&mut self.ai.ep_name).hint_text("Ollama").desired_width(f32::INFINITY));
+                ui.end_row();
+                ui.label("Base URL");
+                ui.add(egui::TextEdit::singleline(&mut self.ai.ep_base).hint_text("http://localhost:11434/v1").desired_width(f32::INFINITY));
+                ui.end_row();
+                ui.label("API key");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.ai.ep_key)
+                        .password(true)
+                        .hint_text(tr("vacío = sin cambios / sin clave", "empty = unchanged / none"))
+                        .desired_width(f32::INFINITY),
+                );
+                ui.end_row();
+                ui.label(tr("Modelo", "Model"));
+                ui.add(egui::TextEdit::singleline(&mut self.ai.ep_model).hint_text(tr("vacío = automático", "empty = automatic")).desired_width(f32::INFINITY));
+                ui.end_row();
+            });
+            ui.label(
+                RichText::new(tr(
+                    "Con modelo vacío se elige solo y hay respaldo entre modelos si uno da error. Con nombre, ese va primero.",
+                    "Empty model = auto-pick, with fallback between models on error. A name is tried first.",
+                ))
+                .weak()
+                .small(),
+            );
+            ui.add_space(6.0);
+            let mut close = false;
+            ui.horizontal(|ui| {
+                if ui.button(tr("Guardar", "Save")).clicked() {
+                    self.settings.ai_name = self.ai.ep_name.trim().to_string();
+                    self.settings.ai_base = self.ai.ep_base.trim().to_string();
+                    self.settings.ai_model = self.ai.ep_model.trim().to_string();
+                    if self.settings.ai_base.is_empty() {
+                        self.settings.ai_key_enc.clear();
+                    } else if !self.ai.ep_key.trim().is_empty()
+                        && let Some(enc) = crate::ai::protect(self.ai.ep_key.trim())
+                    {
+                        self.settings.ai_key_enc = enc;
+                    }
+                    self.settings.save();
+                    self.ai.model = None;
+                    close = true;
+                }
+                if ui.button(tr("Cancelar", "Cancel")).clicked() {
+                    close = true;
+                }
+            });
+            close
+        });
+        if resp.inner || resp.should_close() {
+            self.ai.ep_editing = false;
+            self.ai.ep_key.clear();
         }
     }
 

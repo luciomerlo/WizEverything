@@ -74,6 +74,12 @@ pub struct Settings {
     pub dup_prefer: String,
     /// Groq API key encrypted with DPAPI (hex); never stored in plain text.
     pub groq_key_enc: String,
+    /// Manual AI endpoint (OpenAI-compatible): display name, base URL (e.g. a local server),
+    /// API key encrypted with DPAPI (may be empty) and an optional forced model (empty = auto).
+    pub ai_name: String,
+    pub ai_base: String,
+    pub ai_key_enc: String,
+    pub ai_model: String,
     /// Ruta opcional a census.exe si no está en PATH.
     pub census_path: String,
 }
@@ -103,6 +109,10 @@ impl Settings {
             dup_exclude: Vec::new(),
             dup_exclude_init: false,
             groq_key_enc: String::new(),
+            ai_name: String::new(),
+            ai_base: String::new(),
+            ai_key_enc: String::new(),
+            ai_model: String::new(),
             census_path: String::new(),
             dup_prefer: String::new(),
         };
@@ -126,6 +136,10 @@ impl Settings {
                 ("dup_exclude", v) if !v.is_empty() => s.dup_exclude.push(v.to_string()),
                 ("dup_exclude_init", v) => s.dup_exclude_init = v != "0",
                 ("groq_key", v) => s.groq_key_enc = v.to_string(),
+                ("ai_name", v) => s.ai_name = v.to_string(),
+                ("ai_base", v) => s.ai_base = v.to_string(),
+                ("ai_key", v) => s.ai_key_enc = v.to_string(),
+                ("ai_model", v) => s.ai_model = v.to_string(),
                 ("census_path", v) => s.census_path = v.to_string(),
                 ("dup_prefer", v) => s.dup_prefer = v.to_string(),
                 ("excluded_drives", v) => {
@@ -158,6 +172,7 @@ impl Settings {
             self.close_to_tray as u8,
             self.excluded_drives.join(","),
         ) + &format!("census_path={}\ndup_exclude_init={}\ngroq_key={}\ndup_prefer={}\n", self.census_path, self.dup_exclude_init as u8, self.groq_key_enc, self.dup_prefer)
+            + &format!("ai_name={}\nai_base={}\nai_key={}\nai_model={}\n", self.ai_name, self.ai_base, self.ai_key_enc, self.ai_model)
             + &self.dup_exclude.iter().map(|d| format!("dup_exclude={d}\n")).collect::<String>()
     }
 
