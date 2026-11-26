@@ -1734,6 +1734,14 @@ impl App {
 
     fn options_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, tree: Option<&Tree>) {
         ui.menu_button(tr("⚙ Opciones", "⚙ Options"), |ui| {
+            // El menú creció con los análisis; sin ScrollArea las opciones de
+            // abajo quedan fuera de la pantalla y no se pueden alcanzar.
+            let max_h = (ui.ctx().content_rect().height() - 80.0).max(220.0);
+            egui::ScrollArea::vertical()
+                .max_height(max_h)
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
             ui.set_min_width(230.0);
             // Language
             ui.label(RichText::new(tr("Idioma", "Language")).strong());
@@ -2323,6 +2331,7 @@ impl App {
                     });
                 });
             }
+                });
         });
     }
 
